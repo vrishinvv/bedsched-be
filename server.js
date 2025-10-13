@@ -10,9 +10,7 @@ const app = express();
 
 // Configure CORS for production
 const corsOptions = {
-  origin: config.nodeEnv === 'production' 
-    ? [config.frontendUrl] 
-    : true, // Allow all origins in development
+  origin: ['http://localhost:3000', 'https://bedsched-fe.vercel.app'],
   credentials: true,
   optionsSuccessStatus: 200
 };
