@@ -7,11 +7,30 @@ import { getLocationsWithStats, getLocationDetail, validateBedWithinCapacity, to
 
 
 const app = express();
-app.use(cors());
+
+// Configure CORS for production
+const corsOptions = {
+  origin: config.nodeEnv === 'production' 
+    ? [config.frontendUrl] 
+    : true, // Allow all origins in development
+  credentials: true,
+  optionsSuccessStatus: 200
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
-app.use(morgan('dev'));
+
+// Only use morgan in development
+if (config.nodeEnv === 'development') {
+  app.use(morgan('dev'));
+}
 
 /* -------------------------------- Routes -------------------------------- */
+
+// Health check route
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
 
 // Seed quick convenience (optional)
 app.post('/api/seed', async (req, res) => {
