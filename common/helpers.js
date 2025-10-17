@@ -19,6 +19,7 @@ export async function getLocationsWithStats() {
         COUNT(*) FILTER (WHERE end_date >= ${todaySQL}) AS alloc_today,
         COUNT(*) FILTER (WHERE end_date = (CURRENT_DATE + INTERVAL '1 day')::date) AS free_tomorrow
       FROM allocations
+      WHERE deleted_at IS NULL
       GROUP BY location_id
     ) a ON a.location_id = l.id
     ORDER BY l.id ASC;
@@ -46,6 +47,7 @@ export async function getLocationDetail(locationId) {
     FROM allocations
     WHERE location_id = $1
       AND end_date >= ${todaySQL}
+      AND deleted_at IS NULL
     `,
     [locationId]
   );
@@ -108,6 +110,7 @@ export async function getLocationTents(locationId) {
         COUNT(*) FILTER (WHERE end_date >= ${todaySQL}) AS allocated,
         COUNT(*) FILTER (WHERE end_date = (CURRENT_DATE + INTERVAL '1 day')::date) AS freeing_tomorrow
       FROM allocations
+      WHERE deleted_at IS NULL
       GROUP BY tent_id
     ) a ON a.tent_id = t.id
     WHERE t.location_id = $1
@@ -156,6 +159,7 @@ export async function getTentBlocks(locationId, tentIndex) {
         COUNT(*) FILTER (WHERE end_date >= ${todaySQL}) AS allocated,
         COUNT(*) FILTER (WHERE end_date = (CURRENT_DATE + INTERVAL '1 day')::date) AS freeing_tomorrow
       FROM allocations
+      WHERE deleted_at IS NULL
       GROUP BY block_id
     ) a ON a.block_id = b.id
     WHERE b.tent_id = $1
@@ -197,7 +201,7 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
   const allocRes = await execQuery(`
     SELECT bed_number, name, phone, gender, start_date, end_date
     FROM allocations
-    WHERE block_id = $1 AND end_date >= ${todaySQL}
+    WHERE block_id = $1 AND end_date >= ${todaySQL} AND deleted_at IS NULL
   `, [block.id]);
 
   // Build beds object

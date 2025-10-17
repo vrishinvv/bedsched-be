@@ -172,7 +172,7 @@ app.post('/api/seed', async (req, res) => {
     // Prepare allocation data
     const allocationData = [];
     const names = ['Rajesh Kumar', 'Priya Sharma', 'Amit Patel', 'Sunita Devi', 'Vikash Singh', 'Meera Gupta'];
-    const genders = ['Male', 'Female', 'Other'];
+    const genders = ['Male', 'Female', 'Other']; // Use full words that match the check constraint
 
     for (const block of blocks.rows) {
       const bedsToAllocate = Math.floor(block.size * 0.1); // 10% occupancy
@@ -310,6 +310,12 @@ app.post('/api/locations/:id/beds/:bedNumber/allocate', async (req, res) => {
       return res.status(400).json({ error: 'missing_required_fields' });
     }
 
+    // Validate and normalize gender
+    const validGenders = ['Male', 'Female', 'Other'];
+    const normalizedGender = gender && gender.trim() && validGenders.includes(gender.trim()) 
+      ? gender.trim() 
+      : 'Other';
+
     // Insert allocation; exclusion constraint prevents overlaps
     const q = `
       INSERT INTO allocations(location_id, bed_number, name, phone, gender, start_date, end_date)
@@ -321,7 +327,7 @@ app.post('/api/locations/:id/beds/:bedNumber/allocate', async (req, res) => {
       bedNumber,
       name,
       phone || null,
-      gender || 'Other',
+      normalizedGender,
       startDate,
       endDate,
     ]);
@@ -338,49 +344,72 @@ app.post('/api/locations/:id/beds/:bedNumber/allocate', async (req, res) => {
 
 // PATCH /api/locations/:id/beds/:bedNumber
 // body: partial { name, phone, gender, startDate, endDate }
-// edits the CURRENT active allocation (today) for that bed
+// soft deletes current allocation and creates new one (preserves history)
 app.patch('/api/locations/:id/beds/:bedNumber', async (req, res) => {
   try {
     const id = Number(req.params.id);
     const bedNumber = Number(req.params.bedNumber);
     await validateBedWithinCapacity(id, bedNumber);
 
-    // find today's active allocation
+    // find current active allocation
     const findQ = `
-      SELECT id FROM allocations
+      SELECT id, name, phone, gender, start_date, end_date FROM allocations
       WHERE location_id = $1
-        AND bed_number  = $2
-        AND ${todaySQL} BETWEEN start_date AND end_date
+        AND bed_number = $2
+        AND deleted_at IS NULL
+        AND end_date >= CURRENT_DATE
+      ORDER BY created_at DESC
       LIMIT 1
     `;
     const active = await execQuery(findQ, [id, bedNumber]);
     if (!active.rowCount) return res.status(404).json({ error: 'no_active_allocation' });
 
-    const allocId = active.rows[0].id;
-
-    // Build dynamic update
-    const fields = [];
-    const values = [];
-    let idx = 1;
-
-    function push(col, val) {
-      fields.push(`${col} = $${idx++}`);
-      values.push(val);
-    }
-
+    const current = active.rows[0];
     const { name, phone, gender, startDate, endDate } = req.body || {};
-    if (name !== undefined) push('name', name);
-    if (phone !== undefined) push('phone', phone);
-    if (gender !== undefined) push('gender', gender);
-    if (startDate !== undefined) push('start_date', startDate);
-    if (endDate !== undefined) push('end_date', endDate);
-    push('updated_at', new Date());
 
-    if (fields.length === 1) return res.json({ ok: true }); // only updated_at
+    // Use current values as defaults for missing fields
+    const newName = name !== undefined ? name : current.name;
+    const newPhone = phone !== undefined ? phone : current.phone;
+    const newGender = gender !== undefined ? (
+      gender && gender.trim() && ['Male', 'Female', 'Other'].includes(gender.trim()) 
+        ? gender.trim() 
+        : 'Other'
+    ) : current.gender;
+    const newStartDate = startDate !== undefined ? startDate : current.start_date.toISOString().split('T')[0];
+    const newEndDate = endDate !== undefined ? endDate : current.end_date.toISOString().split('T')[0];
 
-    const q = `UPDATE allocations SET ${fields.join(', ')} WHERE id = $${idx} RETURNING id`;
-    await execQuery(q, [...values, allocId]);
-    res.json({ ok: true });
+    // Begin transaction
+    await execQuery('BEGIN');
+
+    try {
+      // Soft delete current allocation
+      await execQuery(
+        `UPDATE allocations SET deleted_at = NOW() WHERE id = $1`,
+        [current.id]
+      );
+
+      // Create new allocation with updated values
+      const insertQ = `
+        INSERT INTO allocations(location_id, bed_number, name, phone, gender, start_date, end_date)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id
+      `;
+      await execQuery(insertQ, [
+        id,
+        bedNumber,
+        newName,
+        newPhone,
+        newGender,
+        newStartDate,
+        newEndDate
+      ]);
+
+      await execQuery('COMMIT');
+      res.json({ ok: true });
+    } catch (e) {
+      await execQuery('ROLLBACK');
+      throw e;
+    }
   } catch (e) {
     console.error(e);
     if (e.code === '23P01') {
@@ -390,7 +419,7 @@ app.patch('/api/locations/:id/beds/:bedNumber', async (req, res) => {
   }
 });
 
-// DELETE /api/locations/:id/beds/:bedNumber (deallocate current active allocation)
+// DELETE /api/locations/:id/beds/:bedNumber (soft delete current active allocation)
 app.delete('/api/locations/:id/beds/:bedNumber', async (req, res) => {
   try {
     const id = Number(req.params.id);
@@ -398,12 +427,15 @@ app.delete('/api/locations/:id/beds/:bedNumber', async (req, res) => {
     await validateBedWithinCapacity(id, bedNumber);
 
     const delQ = `
-      DELETE FROM allocations
+      UPDATE allocations 
+      SET deleted_at = NOW(), updated_at = NOW()
       WHERE id IN (
         SELECT id FROM allocations
         WHERE location_id = $1
-          AND bed_number  = $2
-          AND ${todaySQL} BETWEEN start_date AND end_date
+          AND bed_number = $2
+          AND deleted_at IS NULL
+          AND end_date >= CURRENT_DATE
+        ORDER BY created_at DESC
         LIMIT 1
       )
     `;
@@ -482,6 +514,12 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       return res.status(400).json({ error: 'missing_required_fields' });
     }
 
+    // Validate and normalize gender
+    const validGenders = ['Male', 'Female', 'Other'];
+    const normalizedGender = gender && gender.trim() && validGenders.includes(gender.trim()) 
+      ? gender.trim() 
+      : 'Other';
+
     // Get tent_id for the allocation
     const tentRes = await execQuery(`
       SELECT id FROM tents WHERE location_id = $1 AND tent_index = $2
@@ -502,7 +540,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       bedNumber,
       name,
       phone || null,
-      gender || 'Other',
+      normalizedGender,
       startDate,
       endDate,
     ]);
@@ -517,6 +555,8 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
 });
 
 // PATCH /api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber
+// body: partial { name, phone, gender, startDate, endDate }
+// soft deletes current allocation and creates new one (preserves history)
 app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async (req, res) => {
   try {
     const locationId = Number(req.params.id);
@@ -526,42 +566,75 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
     
     const blockId = await validateBedWithinBlock(locationId, tentIndex, blockIndex, bedNumber);
 
-    // Find today's active allocation
+    // Find current active allocation
     const findQ = `
-      SELECT id FROM allocations
+      SELECT id, name, phone, gender, start_date, end_date FROM allocations
       WHERE block_id = $1
         AND bed_number = $2
-        AND ${todaySQL} BETWEEN start_date AND end_date
+        AND deleted_at IS NULL
+        AND end_date >= CURRENT_DATE
+      ORDER BY created_at DESC
       LIMIT 1
     `;
     const active = await execQuery(findQ, [blockId, bedNumber]);
     if (!active.rowCount) return res.status(404).json({ error: 'no_active_allocation' });
 
-    const allocId = active.rows[0].id;
-
-    // Build dynamic update
-    const fields = [];
-    const values = [];
-    let idx = 1;
-
-    function push(col, val) {
-      fields.push(`${col} = $${idx++}`);
-      values.push(val);
-    }
-
+    const current = active.rows[0];
     const { name, phone, gender, startDate, endDate } = req.body || {};
-    if (name !== undefined) push('name', name);
-    if (phone !== undefined) push('phone', phone);
-    if (gender !== undefined) push('gender', gender);
-    if (startDate !== undefined) push('start_date', startDate);
-    if (endDate !== undefined) push('end_date', endDate);
-    push('updated_at', new Date());
 
-    if (fields.length === 1) return res.json({ ok: true });
+    // Use current values as defaults for missing fields
+    const newName = name !== undefined ? name : current.name;
+    const newPhone = phone !== undefined ? phone : current.phone;
+    const newGender = gender !== undefined ? (
+      gender && gender.trim() && ['Male', 'Female', 'Other'].includes(gender.trim()) 
+        ? gender.trim() 
+        : 'Other'
+    ) : current.gender;
+    const newStartDate = startDate !== undefined ? startDate : current.start_date.toISOString().split('T')[0];
+    const newEndDate = endDate !== undefined ? endDate : current.end_date.toISOString().split('T')[0];
 
-    const q = `UPDATE allocations SET ${fields.join(', ')} WHERE id = $${idx} RETURNING id`;
-    await execQuery(q, [...values, allocId]);
-    res.json({ ok: true });
+    // Get tent_id for the allocation
+    const tentRes = await execQuery(`
+      SELECT id FROM tents WHERE location_id = $1 AND tent_index = $2
+    `, [locationId, tentIndex]);
+    const tentId = tentRes.rows[0].id;
+
+    // Begin transaction
+    await execQuery('BEGIN');
+
+    try {
+      // Soft delete current allocation
+      await execQuery(
+        `UPDATE allocations SET deleted_at = NOW() WHERE id = $1`,
+        [current.id]
+      );
+
+      // Create new allocation with updated values
+      const insertQ = `
+        INSERT INTO allocations(location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        RETURNING id
+      `;
+      await execQuery(insertQ, [
+        locationId,
+        tentId,
+        blockId,
+        tentIndex,
+        blockIndex,
+        bedNumber,
+        newName,
+        newPhone,
+        newGender,
+        newStartDate,
+        newEndDate
+      ]);
+
+      await execQuery('COMMIT');
+      res.json({ ok: true });
+    } catch (e) {
+      await execQuery('ROLLBACK');
+      throw e;
+    }
   } catch (e) {
     console.error(e);
     if (e.code === '23P01') {
@@ -571,7 +644,7 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
   }
 });
 
-// DELETE /api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber
+// DELETE /api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber (soft delete)
 app.delete('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async (req, res) => {
   try {
     const locationId = Number(req.params.id);
@@ -582,12 +655,15 @@ app.delete('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async
     const blockId = await validateBedWithinBlock(locationId, tentIndex, blockIndex, bedNumber);
 
     const delQ = `
-      DELETE FROM allocations
+      UPDATE allocations 
+      SET deleted_at = NOW(), updated_at = NOW()
       WHERE id IN (
         SELECT id FROM allocations
         WHERE block_id = $1
           AND bed_number = $2
-          AND ${todaySQL} BETWEEN start_date AND end_date
+          AND deleted_at IS NULL
+          AND end_date >= CURRENT_DATE
+        ORDER BY created_at DESC
         LIMIT 1
       )
     `;
