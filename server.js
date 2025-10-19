@@ -11,6 +11,7 @@ import {
   getBlockDetail,
   validateBedWithinCapacity,
   validateBedWithinBlock,
+  validateGenderRestriction,
   todaySQL, 
   tomorrowSQL 
 } from './common/helpers.js';
@@ -483,6 +484,93 @@ app.get('/api/locations/:id/tents/:tent/blocks', async (req, res) => {
   }
 });
 
+// PATCH /api/locations/:id/tents/:tent
+// body: { genderRestriction }
+app.patch('/api/locations/:id/tents/:tent', async (req, res) => {
+  try {
+    const locationId = Number(req.params.id);
+    const tentIndex = Number(req.params.tent);
+    const { genderRestriction } = req.body || {};
+    
+    if (!genderRestriction || !['male_only', 'female_only', 'both'].includes(genderRestriction)) {
+      return res.status(400).json({ error: 'invalid_gender_restriction' });
+    }
+
+    // Verify tent exists and get current restriction
+    const tentRes = await execQuery(`
+      SELECT id, gender_restriction FROM tents WHERE location_id = $1 AND tent_index = $2
+    `, [locationId, tentIndex]);
+    
+    if (!tentRes.rowCount) {
+      return res.status(404).json({ error: 'tent_not_found' });
+    }
+
+    const tentId = tentRes.rows[0].id;
+    const currentRestriction = tentRes.rows[0].gender_restriction;
+
+    // If restriction is changing, validate existing allocations
+    if (currentRestriction !== genderRestriction) {
+      // Check for existing allocations that would violate the new restriction
+      const today = new Date().toISOString().split('T')[0];
+      const existingAllocations = await execQuery(`
+        SELECT DISTINCT gender, COUNT(*) as count
+        FROM allocations
+        WHERE tent_id = $1 AND end_date >= $2 AND deleted_at IS NULL
+        GROUP BY gender
+      `, [tentId, today]);
+
+      if (existingAllocations.rowCount > 0) {
+        const genders = existingAllocations.rows.map(row => ({
+          gender: row.gender,
+          count: Number(row.count)
+        }));
+
+        // Check if new restriction would violate existing bookings
+        let violationMessage = null;
+
+        if (genderRestriction === 'male_only') {
+          const nonMaleBookings = genders.filter(g => g.gender !== 'Male');
+          if (nonMaleBookings.length > 0) {
+            const totalNonMale = nonMaleBookings.reduce((sum, g) => sum + g.count, 0);
+            violationMessage = `Cannot change to male-only: ${totalNonMale} active booking(s) for non-male guests exist. ` +
+              `Genders: ${nonMaleBookings.map(g => `${g.gender} (${g.count})`).join(', ')}. ` +
+              `Please contact the application developer if you need to make this change.`;
+          }
+        } else if (genderRestriction === 'female_only') {
+          const nonFemaleBookings = genders.filter(g => g.gender !== 'Female');
+          if (nonFemaleBookings.length > 0) {
+            const totalNonFemale = nonFemaleBookings.reduce((sum, g) => sum + g.count, 0);
+            violationMessage = `Cannot change to female-only: ${totalNonFemale} active booking(s) for non-female guests exist. ` +
+              `Genders: ${nonFemaleBookings.map(g => `${g.gender} (${g.count})`).join(', ')}. ` +
+              `Please contact the application developer if you need to make this change.`;
+          }
+        } else if (genderRestriction === 'both' && currentRestriction !== 'both') {
+          // Changing from restricted to unrestricted is always allowed
+          // No validation needed
+        }
+
+        if (violationMessage) {
+          return res.status(409).json({ 
+            error: 'existing_bookings_conflict', 
+            message: violationMessage,
+            existingGenders: genders
+          });
+        }
+      }
+    }
+
+    // Update gender restriction
+    await execQuery(`
+      UPDATE tents SET gender_restriction = $1 WHERE location_id = $2 AND tent_index = $3
+    `, [genderRestriction, locationId, tentIndex]);
+
+    res.json({ ok: true, genderRestriction });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'update_tent_failed' });
+  }
+});
+
 // GET /api/locations/:id/tents/:tent/blocks/:block
 app.get('/api/locations/:id/tents/:tent/blocks/:block', async (req, res) => {
   try {
@@ -520,6 +608,13 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       ? gender.trim() 
       : 'Other';
 
+    // Validate gender restriction for the tent
+    try {
+      await validateGenderRestriction(locationId, tentIndex, normalizedGender);
+    } catch (e) {
+      return res.status(400).json({ error: 'gender_restriction_violation', message: e.message });
+    }
+
     // Get tent_id for the allocation
     const tentRes = await execQuery(`
       SELECT id FROM tents WHERE location_id = $1 AND tent_index = $2
@@ -551,6 +646,135 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       return res.status(409).json({ error: 'overlapping_allocation' });
     }
     res.status(500).json({ error: 'allocate_failed' });
+  }
+});
+
+// POST /api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate
+app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', async (req, res) => {
+  try {
+    const locationId = Number(req.params.id);
+    const tentIndex = Number(req.params.tent);
+    const blockIndex = Number(req.params.block);
+    
+    const { name, phone, maleCount, femaleCount, startDate, endDate } = req.body || {};
+    
+    if (!name || !startDate || !endDate) {
+      return res.status(400).json({ error: 'missing_required_fields' });
+    }
+
+    const totalCount = (maleCount || 0) + (femaleCount || 0);
+    if (totalCount <= 0) {
+      return res.status(400).json({ error: 'invalid_count', message: 'At least one person must be specified' });
+    }
+
+    // Get block info
+    const blockRes = await execQuery(`
+      SELECT b.id, b.size
+      FROM blocks b
+      JOIN tents t ON t.id = b.tent_id
+      WHERE t.location_id = $1 AND t.tent_index = $2 AND b.block_index = $3
+    `, [locationId, tentIndex, blockIndex]);
+    
+    if (!blockRes.rowCount) {
+      return res.status(404).json({ error: 'block_not_found' });
+    }
+    
+    const blockId = blockRes.rows[0].id;
+    const blockSize = blockRes.rows[0].size;
+
+    // Get tent_id
+    const tentRes = await execQuery(`
+      SELECT id FROM tents WHERE location_id = $1 AND tent_index = $2
+    `, [locationId, tentIndex]);
+    const tentId = tentRes.rows[0].id;
+
+    // Find available beds in this block
+    const occupiedRes = await execQuery(`
+      SELECT bed_number 
+      FROM allocations 
+      WHERE block_id = $1 AND deleted_at IS NULL AND end_date >= CURRENT_DATE
+    `, [blockId]);
+    
+    const occupiedBeds = new Set(occupiedRes.rows.map(r => r.bed_number));
+    const availableBeds = [];
+    
+    for (let bedNum = 1; bedNum <= blockSize; bedNum++) {
+      if (!occupiedBeds.has(bedNum)) {
+        availableBeds.push(bedNum);
+      }
+    }
+
+    if (availableBeds.length < totalCount) {
+      return res.status(400).json({ 
+        error: 'insufficient_beds', 
+        message: `Not enough available beds. Need ${totalCount}, but only ${availableBeds.length} available.`,
+        available: availableBeds.length,
+        needed: totalCount
+      });
+    }
+
+    // Begin transaction for bulk insert
+    await execQuery('BEGIN');
+
+    const success = [];
+    const errors = [];
+    let bedIndex = 0;
+
+    try {
+      // Allocate male beds
+      for (let i = 0; i < (maleCount || 0); i++) {
+        const bedNumber = availableBeds[bedIndex++];
+        
+        try {
+          // Validate gender restriction
+          await validateGenderRestriction(locationId, tentIndex, 'Male');
+          
+          await execQuery(`
+            INSERT INTO allocations(location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+          `, [locationId, tentId, blockId, tentIndex, blockIndex, bedNumber, name, phone || null, 'Male', startDate, endDate]);
+          
+          success.push({ bedNumber, gender: 'Male', name });
+        } catch (e) {
+          errors.push({ bedNumber, gender: 'Male', message: e.message || 'Failed to allocate bed' });
+        }
+      }
+
+      // Allocate female beds
+      for (let i = 0; i < (femaleCount || 0); i++) {
+        const bedNumber = availableBeds[bedIndex++];
+        
+        try {
+          // Validate gender restriction
+          await validateGenderRestriction(locationId, tentIndex, 'Female');
+          
+          await execQuery(`
+            INSERT INTO allocations(location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+          `, [locationId, tentId, blockId, tentIndex, blockIndex, bedNumber, name, phone || null, 'Female', startDate, endDate]);
+          
+          success.push({ bedNumber, gender: 'Female', name });
+        } catch (e) {
+          errors.push({ bedNumber, gender: 'Female', message: e.message || 'Failed to allocate bed' });
+        }
+      }
+
+      await execQuery('COMMIT');
+      
+      res.json({ 
+        ok: true, 
+        success, 
+        errors,
+        total: totalCount,
+        allocated: success.length
+      });
+    } catch (e) {
+      await execQuery('ROLLBACK');
+      throw e;
+    }
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'bulk_allocate_failed', message: e.message });
   }
 });
 
@@ -592,6 +816,15 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
     ) : current.gender;
     const newStartDate = startDate !== undefined ? startDate : current.start_date.toISOString().split('T')[0];
     const newEndDate = endDate !== undefined ? endDate : current.end_date.toISOString().split('T')[0];
+
+    // Validate gender restriction for the tent if gender is being changed
+    if (gender !== undefined) {
+      try {
+        await validateGenderRestriction(locationId, tentIndex, newGender);
+      } catch (e) {
+        return res.status(400).json({ error: 'gender_restriction_violation', message: e.message });
+      }
+    }
 
     // Get tent_id for the allocation
     const tentRes = await execQuery(`

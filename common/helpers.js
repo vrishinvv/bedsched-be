@@ -101,6 +101,7 @@ export async function getLocationTents(locationId) {
       t.id,
       t.tent_index,
       t.size,
+      t.gender_restriction,
       COALESCE(a.allocated, 0) AS allocated,
       COALESCE(a.freeing_tomorrow, 0) AS freeing_tomorrow
     FROM tents t
@@ -126,6 +127,7 @@ export async function getLocationTents(locationId) {
     tents: tentsRes.rows.map(t => ({
       index: Number(t.tent_index),
       size: Number(t.size),
+      genderRestriction: t.gender_restriction,
       allocated: Number(t.allocated),
       freeingTomorrow: Number(t.freeing_tomorrow)
     }))
@@ -135,7 +137,7 @@ export async function getLocationTents(locationId) {
 export async function getTentBlocks(locationId, tentIndex) {
   // Get location and tent info
   const tentRes = await execQuery(`
-    SELECT t.id, t.tent_index, t.size, l.name as location_name
+    SELECT t.id, t.tent_index, t.size, t.gender_restriction, l.name as location_name
     FROM tents t
     JOIN locations l ON l.id = t.location_id
     WHERE t.location_id = $1 AND t.tent_index = $2
@@ -173,7 +175,8 @@ export async function getTentBlocks(locationId, tentIndex) {
     },
     tent: {
       index: Number(tent.tent_index),
-      size: Number(tent.size)
+      size: Number(tent.size),
+      genderRestriction: tent.gender_restriction
     },
     blocks: blocksRes.rows.map(b => ({
       index: Number(b.block_index),
@@ -254,4 +257,27 @@ export async function validateBedWithinBlock(locationId, tentIndex, blockIndex, 
   
   if (bedNumber < 1 || bedNumber > block.size) throw new Error('Bed out of range');
   return block.id;
+}
+
+export async function validateGenderRestriction(locationId, tentIndex, guestGender) {
+  const tentRes = await execQuery(`
+    SELECT gender_restriction FROM tents WHERE location_id = $1 AND tent_index = $2
+  `, [locationId, tentIndex]);
+  
+  if (!tentRes.rowCount) throw new Error('Tent not found');
+  const { gender_restriction } = tentRes.rows[0];
+  
+  // Normalize gender values for comparison
+  const normalizedGuestGender = guestGender?.toLowerCase();
+  
+  if (gender_restriction === 'male_only' && normalizedGuestGender !== 'male') {
+    throw new Error('This tent is restricted to male guests only');
+  }
+  
+  if (gender_restriction === 'female_only' && normalizedGuestGender !== 'female') {
+    throw new Error('This tent is restricted to female guests only');
+  }
+  
+  // 'both' restriction allows any gender
+  return true;
 }
