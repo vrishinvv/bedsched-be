@@ -1,7 +1,18 @@
 import { execQuery } from './db.js';
 
-export const todaySQL = `CURRENT_DATE`;
-export const tomorrowSQL = `CURRENT_DATE + INTERVAL '1 day'`;
+// IST timezone functions - PostgreSQL uses UTC by default, we need IST (UTC+5:30)
+export const todaySQL = `(CURRENT_DATE AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date`;
+export const tomorrowSQL = `((CURRENT_DATE AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') + INTERVAL '1 day')::date`;
+export const nowIST = `(NOW() AT TIME ZONE 'Asia/Kolkata')`;
+
+// Helper function to get today's date in IST as YYYY-MM-DD string for JavaScript
+export function getTodayIST() {
+  const now = new Date();
+  // Convert to IST by adding 5.5 hours
+  const istOffset = 5.5 * 60 * 60 * 1000;
+  const istDate = new Date(now.getTime() + istOffset);
+  return istDate.toISOString().split('T')[0];
+}
 
 
 export async function getLocationsWithStats() {
@@ -11,17 +22,24 @@ export async function getLocationsWithStats() {
       l.name,
       l.capacity,
       COALESCE(a.alloc_today, 0) AS allocated_count,
-      COALESCE(a.free_tomorrow, 0) AS freeing_tomorrow
+      COALESCE(a.free_tomorrow, 0) AS freeing_tomorrow,
+      COALESCE(r.reserved_active, 0) AS reserved_count
     FROM locations l
     LEFT JOIN (
       SELECT
         location_id,
-        COUNT(*) FILTER (WHERE end_date >= ${todaySQL}) AS alloc_today,
-        COUNT(*) FILTER (WHERE end_date = (CURRENT_DATE + INTERVAL '1 day')::date) AS free_tomorrow
+        COUNT(*) FILTER (WHERE end_date >= ${todaySQL} AND status = 'confirmed') AS alloc_today,
+        COUNT(*) FILTER (WHERE end_date = ${tomorrowSQL}) AS free_tomorrow
       FROM allocations
       WHERE deleted_at IS NULL
       GROUP BY location_id
     ) a ON a.location_id = l.id
+    LEFT JOIN (
+      SELECT location_id, COUNT(*) AS reserved_active
+      FROM allocations
+      WHERE deleted_at IS NULL AND status = 'reserved' AND reserved_expires_at > ${nowIST}
+      GROUP BY location_id
+    ) r ON r.location_id = l.id
     ORDER BY l.id ASC;
   `;
   const { rows } = await execQuery(q);
@@ -31,6 +49,7 @@ export async function getLocationsWithStats() {
     capacity: Number(r.capacity),
     allocatedCount: Number(r.allocated_count),
     freeingTomorrow: Number(r.freeing_tomorrow),
+    reservedCount: Number(r.reserved_count || 0),
   }));
 }
 
@@ -40,10 +59,22 @@ export async function getLocationDetail(locationId) {
   if (locRes.rowCount === 0) return null;
   const loc = locRes.rows[0];
 
+  // Get stats
+  const statsRes = await execQuery(`
+    SELECT
+      COALESCE(COUNT(*) FILTER (WHERE end_date >= ${todaySQL} AND status = 'confirmed'), 0) AS allocated,
+      COALESCE(COUNT(*) FILTER (WHERE end_date = ${tomorrowSQL}), 0) AS freeing_tomorrow,
+      COALESCE(COUNT(*) FILTER (WHERE status = 'reserved' AND reserved_expires_at > ${nowIST}), 0) AS reserved
+    FROM allocations
+    WHERE location_id = $1 AND deleted_at IS NULL
+  `, [locationId]);
+  
+  const stats = statsRes.rows[0] || { allocated: 0, freeing_tomorrow: 0, reserved: 0 };
+
   // Current and future allocations (from today onwards)
   const activeRes = await execQuery(
     `
-    SELECT bed_number, name, phone, gender, start_date, end_date
+    SELECT bed_number, name, phone, gender, start_date, end_date, status, reserved_expires_at
     FROM allocations
     WHERE location_id = $1
       AND end_date >= ${todaySQL}
@@ -69,6 +100,8 @@ export async function getLocationDetail(locationId) {
       gender: r.gender || 'Other',
       startDate: formatDate(r.start_date),
       endDate: formatDate(r.end_date),
+      status: r.status,
+      reservedExpiresAt: r.reserved_expires_at ? r.reserved_expires_at.toISOString() : null,
     };
   }
 
@@ -76,6 +109,9 @@ export async function getLocationDetail(locationId) {
     id: String(loc.id),
     name: loc.name,
     capacity: Number(loc.capacity),
+    allocated: Number(stats.allocated),
+    freeingTomorrow: Number(stats.freeing_tomorrow),
+    reserved: Number(stats.reserved),
     beds,
   };
 }
@@ -101,19 +137,25 @@ export async function getLocationTents(locationId) {
       t.id,
       t.tent_index,
       t.size,
-      t.gender_restriction,
       COALESCE(a.allocated, 0) AS allocated,
-      COALESCE(a.freeing_tomorrow, 0) AS freeing_tomorrow
+      COALESCE(a.freeing_tomorrow, 0) AS freeing_tomorrow,
+      COALESCE(r.reserved_active, 0) AS reserved
     FROM tents t
     LEFT JOIN (
       SELECT 
         tent_id,
-        COUNT(*) FILTER (WHERE end_date >= ${todaySQL}) AS allocated,
+        COUNT(*) FILTER (WHERE end_date >= ${todaySQL} AND status = 'confirmed') AS allocated,
         COUNT(*) FILTER (WHERE end_date = (CURRENT_DATE + INTERVAL '1 day')::date) AS freeing_tomorrow
       FROM allocations
       WHERE deleted_at IS NULL
       GROUP BY tent_id
     ) a ON a.tent_id = t.id
+    LEFT JOIN (
+      SELECT tent_id, COUNT(*) AS reserved_active
+      FROM allocations
+      WHERE deleted_at IS NULL AND status = 'reserved' AND reserved_expires_at > ${nowIST}
+      GROUP BY tent_id
+    ) r ON r.tent_id = t.id
     WHERE t.location_id = $1
     ORDER BY t.tent_index ASC
   `, [locationId]);
@@ -127,9 +169,9 @@ export async function getLocationTents(locationId) {
     tents: tentsRes.rows.map(t => ({
       index: Number(t.tent_index),
       size: Number(t.size),
-      genderRestriction: t.gender_restriction,
       allocated: Number(t.allocated),
-      freeingTomorrow: Number(t.freeing_tomorrow)
+      freeingTomorrow: Number(t.freeing_tomorrow),
+      reserved: Number(t.reserved || 0)
     }))
   };
 }
@@ -137,7 +179,7 @@ export async function getLocationTents(locationId) {
 export async function getTentBlocks(locationId, tentIndex) {
   // Get location and tent info
   const tentRes = await execQuery(`
-    SELECT t.id, t.tent_index, t.size, t.gender_restriction, l.name as location_name
+    SELECT t.id, t.tent_index, t.size, l.name as location_name
     FROM tents t
     JOIN locations l ON l.id = t.location_id
     WHERE t.location_id = $1 AND t.tent_index = $2
@@ -152,18 +194,26 @@ export async function getTentBlocks(locationId, tentIndex) {
       b.id,
       b.block_index,
       b.size,
+      b.gender_restriction,
       COALESCE(a.allocated, 0) AS allocated,
-      COALESCE(a.freeing_tomorrow, 0) AS freeing_tomorrow
+      COALESCE(a.freeing_tomorrow, 0) AS freeing_tomorrow,
+      COALESCE(r.reserved_active, 0) AS reserved
     FROM blocks b
     LEFT JOIN (
       SELECT 
         block_id,
-        COUNT(*) FILTER (WHERE end_date >= ${todaySQL}) AS allocated,
-        COUNT(*) FILTER (WHERE end_date = (CURRENT_DATE + INTERVAL '1 day')::date) AS freeing_tomorrow
+        COUNT(*) FILTER (WHERE end_date >= ${todaySQL} AND status = 'confirmed') AS allocated,
+        COUNT(*) FILTER (WHERE end_date = ${tomorrowSQL}) AS freeing_tomorrow
       FROM allocations
       WHERE deleted_at IS NULL
       GROUP BY block_id
     ) a ON a.block_id = b.id
+    LEFT JOIN (
+      SELECT block_id, COUNT(*) AS reserved_active
+      FROM allocations
+      WHERE deleted_at IS NULL AND status = 'reserved' AND reserved_expires_at > ${nowIST}
+      GROUP BY block_id
+    ) r ON r.block_id = b.id
     WHERE b.tent_id = $1
     ORDER BY b.block_index ASC
   `, [tent.id]);
@@ -175,14 +225,15 @@ export async function getTentBlocks(locationId, tentIndex) {
     },
     tent: {
       index: Number(tent.tent_index),
-      size: Number(tent.size),
-      genderRestriction: tent.gender_restriction
+      size: Number(tent.size)
     },
     blocks: blocksRes.rows.map(b => ({
       index: Number(b.block_index),
       size: Number(b.size),
+      genderRestriction: b.gender_restriction,
       allocated: Number(b.allocated),
-      freeingTomorrow: Number(b.freeing_tomorrow)
+      freeingTomorrow: Number(b.freeing_tomorrow),
+      reserved: Number(b.reserved || 0)
     }))
   };
 }
@@ -190,7 +241,7 @@ export async function getTentBlocks(locationId, tentIndex) {
 export async function getBlockDetail(locationId, tentIndex, blockIndex) {
   // Get block info
   const blockRes = await execQuery(`
-    SELECT b.id, b.block_index, b.size, t.tent_index, l.name as location_name
+    SELECT b.id, b.block_index, b.size, b.gender_restriction, t.tent_index, l.name as location_name
     FROM blocks b
     JOIN tents t ON t.id = b.tent_id
     JOIN locations l ON l.id = t.location_id
@@ -202,7 +253,7 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
 
   // Get bed allocations
   const allocRes = await execQuery(`
-    SELECT bed_number, name, phone, gender, start_date, end_date
+    SELECT bed_number, name, phone, gender, start_date, end_date, status, reserved_expires_at
     FROM allocations
     WHERE block_id = $1 AND end_date >= ${todaySQL} AND deleted_at IS NULL
   `, [block.id]);
@@ -223,6 +274,8 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
       gender: r.gender || 'Other',
       startDate: formatDate(r.start_date),
       endDate: formatDate(r.end_date),
+      status: r.status,
+      reservedExpiresAt: r.reserved_expires_at ? r.reserved_expires_at.toISOString() : null,
     };
   }
 
@@ -236,7 +289,8 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
         index: Number(block.tent_index)
       },
       block: {
-        index: Number(block.block_index)
+        index: Number(block.block_index),
+        genderRestriction: block.gender_restriction
       }
     },
     blockSize: Number(block.size),
@@ -259,13 +313,16 @@ export async function validateBedWithinBlock(locationId, tentIndex, blockIndex, 
   return block.id;
 }
 
-export async function validateGenderRestriction(locationId, tentIndex, guestGender) {
-  const tentRes = await execQuery(`
-    SELECT gender_restriction FROM tents WHERE location_id = $1 AND tent_index = $2
-  `, [locationId, tentIndex]);
+export async function validateGenderRestriction(locationId, tentIndex, blockIndex, guestGender) {
+  const blockRes = await execQuery(`
+    SELECT b.gender_restriction
+    FROM blocks b
+    JOIN tents t ON t.id = b.tent_id
+    WHERE t.location_id = $1 AND t.tent_index = $2 AND b.block_index = $3
+  `, [locationId, tentIndex, blockIndex]);
   
-  if (!tentRes.rowCount) throw new Error('Tent not found');
-  const { gender_restriction } = tentRes.rows[0];
+  if (!blockRes.rowCount) throw new Error('Block not found');
+  const { gender_restriction } = blockRes.rows[0];
   
   // Normalize gender values for comparison
   const normalizedGuestGender = guestGender?.toLowerCase();
