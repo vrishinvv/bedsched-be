@@ -8,6 +8,7 @@ const config = {
     frontendUrl: process.env.FRONTEND_URL || 'http://localhost:3000',
     nodeEnv: process.env.NODE_ENV || 'development',
     reservationTTLHours: Number(process.env.RESERVATION_TTL_HOURS || 7),
+    jwtSecret: process.env.JWT_SECRET || 'dev-insecure-secret',
 }
 
 console.log(config)

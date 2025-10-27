@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
 import cookieParser from 'cookie-parser';
+import jwt from 'jsonwebtoken';
 import { config } from './common/configs.js';
 import { execQuery } from './common/db.js';
 import {   
@@ -26,7 +27,8 @@ const app = express();
 const corsOptions = {
   origin: ['http://localhost:3000', 'https://bedsched-fe.vercel.app'],
   credentials: true,
-  optionsSuccessStatus: 200
+  optionsSuccessStatus: 200,
+  allowedHeaders: ['Content-Type', 'Authorization']
 };
 
 app.use(cors(corsOptions));
@@ -40,8 +42,21 @@ if (config.nodeEnv === 'development') {
 
 /* ------------------------------ Auth Guard ------------------------------ */
 
-// Helpers to read auth from cookies
-function getUserFromCookies(req) {
+// Helpers to read auth from header or cookies
+function getUserFromRequest(req) {
+  // Prefer Bearer token from Authorization header if present
+  const authHeader = req.headers['authorization'] || req.headers['Authorization'];
+  if (authHeader && typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice('Bearer '.length).trim();
+    try {
+      const payload = jwt.verify(token, config.jwtSecret);
+      if (payload && payload.username && payload.role) {
+        return { username: payload.username, role: payload.role };
+      }
+    } catch (e) {
+      // invalid token -> fall back to cookies
+    }
+  }
   const user = req.cookies?.bs_user;
   const role = req.cookies?.bs_role;
   if (user && role) return { username: user, role };
@@ -55,7 +70,7 @@ app.use((req, res, next) => {
   if (req.path === '/api/health') return next();
   if (req.path === '/api/seed') return next();
 
-  const user = getUserFromCookies(req);
+  const user = getUserFromRequest(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
 
   // Dashboard role restriction: allow GET /api/locations and smart-reserve; admin can access all
@@ -96,7 +111,9 @@ app.post('/api/auth/login', async (req, res) => {
     res.cookie('bs_user', u.username, cookieOptions);
     res.cookie('bs_role', u.role, cookieOptions);
 
-    res.json({ ok: true, user: { username: u.username, role: u.role } });
+    // Also return a signed JWT for token-based auth on platforms where cookies are unreliable
+    const token = jwt.sign({ username: u.username, role: u.role }, config.jwtSecret, { expiresIn: '7d' });
+    res.json({ ok: true, user: { username: u.username, role: u.role }, token });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'login_failed' });
@@ -110,7 +127,7 @@ app.post('/api/auth/logout', (req, res) => {
 });
 
 app.get('/api/auth/me', (req, res) => {
-  const user = getUserFromCookies(req);
+  const user = getUserFromRequest(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
   res.json({ user });
 });
@@ -776,13 +793,15 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
       blocksByTent.get(b.tent_id).push(b);
     });
 
-    // Prefetch occupancy for all blocks in one query and build free bed lists in-memory
+    // Prefetch occupancy for all blocks that OVERLAP the requested date range.
+    // Use end-exclusive range '[)' so back-to-back bookings are allowed (prev end = next start).
     const occRes = await execQuery(`
       SELECT block_id, bed_number
       FROM allocations
-      WHERE deleted_at IS NULL AND end_date >= (CURRENT_DATE AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date
+      WHERE deleted_at IS NULL
+        AND daterange(start_date, end_date, '[]') && daterange($1::date, $2::date, '[]')
         AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > (NOW() AT TIME ZONE 'Asia/Kolkata')))
-    `);
+    `, [startDate, endDate]);
     const occupiedByBlock = new Map(); // block_id -> Set of occupied
     for (const r of occRes.rows) {
       const bid = Number(r.block_id);
@@ -1247,7 +1266,7 @@ app.get('/api/allocations/by-phone', async (req, res) => {
   try {
     const phone = String(req.query.phone || '').trim();
     if (!phone) return res.status(400).json({ error: 'missing_phone' });
-    const user = getUserFromCookies(req);
+    const user = getUserFromRequest(req);
     if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
 
     const rows = await execQuery(`
@@ -1288,7 +1307,7 @@ app.get('/api/allocations/by-phone', async (req, res) => {
 // body: { oldPhone, newPhone, batchId?, allocationIds? }
 app.patch('/api/allocations/by-phone/update-phone', async (req, res) => {
   try {
-    const user = getUserFromCookies(req);
+    const user = getUserFromRequest(req);
     if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
     const { oldPhone, newPhone, batchId, allocationIds } = req.body || {};
     if (!oldPhone || !newPhone) return res.status(400).json({ error: 'missing_phone' });
@@ -1314,7 +1333,7 @@ app.patch('/api/allocations/by-phone/update-phone', async (req, res) => {
 // body: { phone, contactName, batchId? }
 app.patch('/api/allocations/by-phone/update-contact', async (req, res) => {
   try {
-    const user = getUserFromCookies(req);
+    const user = getUserFromRequest(req);
     if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
     const { phone, contactName, batchId } = req.body || {};
     if (!phone) return res.status(400).json({ error: 'missing_phone' });
@@ -1335,7 +1354,7 @@ app.patch('/api/allocations/by-phone/update-contact', async (req, res) => {
 // body: { phone, endDate, batchId?, allocationIds? }
 app.patch('/api/allocations/by-phone/update-end-date', async (req, res) => {
   try {
-    const user = getUserFromCookies(req);
+    const user = getUserFromRequest(req);
     if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
     const { phone, endDate, batchId, allocationIds } = req.body || {};
     if (!phone || !endDate) return res.status(400).json({ error: 'missing_fields' });
@@ -1361,7 +1380,7 @@ app.patch('/api/allocations/by-phone/update-end-date', async (req, res) => {
 // body: { phone, batchId?, allocationIds? }
 app.post('/api/allocations/by-phone/deallocate', async (req, res) => {
   try {
-    const user = getUserFromCookies(req);
+    const user = getUserFromRequest(req);
     if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
     const { phone, batchId, allocationIds } = req.body || {};
     if (!phone) return res.status(400).json({ error: 'missing_phone' });
@@ -1385,7 +1404,7 @@ app.post('/api/allocations/by-phone/deallocate', async (req, res) => {
 // GET /api/allocations/departures?date=YYYY-MM-DD
 app.get('/api/allocations/departures', async (req, res) => {
   try {
-    const user = getUserFromCookies(req);
+    const user = getUserFromRequest(req);
     if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
     const date = String(req.query.date || '').trim();
     if (!date) return res.status(400).json({ error: 'missing_date' });
@@ -1407,7 +1426,7 @@ app.get('/api/allocations/departures', async (req, res) => {
 // GET /api/allocations/reserved-active
 app.get('/api/allocations/reserved-active', async (_req, res) => {
   try {
-    const user = getUserFromCookies(_req);
+    const user = getUserFromRequest(_req);
     if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
     const rows = await execQuery(`
       SELECT a.id, a.batch_id, a.phone, a.contact_name, a.location_id, l.name as location_name, a.tent_index, a.block_index, a.bed_number, 
@@ -1428,7 +1447,7 @@ app.get('/api/allocations/reserved-active', async (_req, res) => {
 // body: { batchId, allocationIds? }
 app.post('/api/allocations/confirm', async (req, res) => {
   try {
-    const user = getUserFromCookies(req);
+    const user = getUserFromRequest(req);
     if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
     const { batchId, allocationIds } = req.body || {};
     if (!batchId) return res.status(400).json({ error: 'missing_batch' });
@@ -1575,8 +1594,11 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
     const occupiedRes = await execQuery(`
       SELECT bed_number 
       FROM allocations 
-      WHERE block_id = $1 AND deleted_at IS NULL AND end_date >= (CURRENT_DATE AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date
-    `, [blockId]);
+      WHERE block_id = $1 
+        AND deleted_at IS NULL 
+        AND daterange(start_date, end_date, '[]') && daterange($2::date, $3::date, '[]')
+        AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > (NOW() AT TIME ZONE 'Asia/Kolkata')))
+    `, [blockId, startDate, endDate]);
     
     const occupiedBeds = new Set(occupiedRes.rows.map(r => r.bed_number));
     const availableBeds = [];
