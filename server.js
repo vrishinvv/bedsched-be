@@ -86,11 +86,11 @@ app.post('/api/auth/login', async (req, res) => {
     const u = r.rows[0];
     if (u.password !== password) return res.status(401).json({ error: 'invalid_credentials' });
 
-    // Set simple cookies (httpOnly) for auth
+    // Set cookies for auth - use 'none' for cross-site with secure, or 'lax' for same-site
     const cookieOptions = {
       httpOnly: true,
-      sameSite: 'lax',
-      // secure: true, // enable in production with HTTPS
+      sameSite: config.nodeEnv === 'production' ? 'none' : 'lax', // 'none' allows cross-site cookies
+      secure: config.nodeEnv === 'production', // required when sameSite=none
       path: '/',
     };
     res.cookie('bs_user', u.username, cookieOptions);
