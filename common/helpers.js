@@ -29,7 +29,7 @@ export async function getLocationsWithStats() {
       SELECT
         location_id,
         COUNT(*) FILTER (WHERE end_date >= ${todaySQL} AND status = 'confirmed') AS alloc_today,
-        COUNT(*) FILTER (WHERE end_date = ${tomorrowSQL}) AS free_tomorrow
+        COUNT(*) FILTER (WHERE end_date = ${tomorrowSQL} AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > ${nowIST}))) AS free_tomorrow
       FROM allocations
       WHERE deleted_at IS NULL
       GROUP BY location_id
@@ -63,7 +63,7 @@ export async function getLocationDetail(locationId) {
   const statsRes = await execQuery(`
     SELECT
       COALESCE(COUNT(*) FILTER (WHERE end_date >= ${todaySQL} AND status = 'confirmed'), 0) AS allocated,
-      COALESCE(COUNT(*) FILTER (WHERE end_date = ${tomorrowSQL}), 0) AS freeing_tomorrow,
+      COALESCE(COUNT(*) FILTER (WHERE end_date = ${tomorrowSQL} AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > ${nowIST}))), 0) AS freeing_tomorrow,
       COALESCE(COUNT(*) FILTER (WHERE status = 'reserved' AND reserved_expires_at > ${nowIST}), 0) AS reserved
     FROM allocations
     WHERE location_id = $1 AND deleted_at IS NULL
@@ -145,7 +145,7 @@ export async function getLocationTents(locationId) {
       SELECT 
         tent_id,
         COUNT(*) FILTER (WHERE end_date >= ${todaySQL} AND status = 'confirmed') AS allocated,
-        COUNT(*) FILTER (WHERE end_date = (CURRENT_DATE + INTERVAL '1 day')::date) AS freeing_tomorrow
+        COUNT(*) FILTER (WHERE end_date = (CURRENT_DATE + INTERVAL '1 day')::date AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > ${nowIST}))) AS freeing_tomorrow
       FROM allocations
       WHERE deleted_at IS NULL
       GROUP BY tent_id
@@ -203,7 +203,7 @@ export async function getTentBlocks(locationId, tentIndex) {
       SELECT 
         block_id,
         COUNT(*) FILTER (WHERE end_date >= ${todaySQL} AND status = 'confirmed') AS allocated,
-        COUNT(*) FILTER (WHERE end_date = ${tomorrowSQL}) AS freeing_tomorrow
+        COUNT(*) FILTER (WHERE end_date = ${tomorrowSQL} AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > ${nowIST}))) AS freeing_tomorrow
       FROM allocations
       WHERE deleted_at IS NULL
       GROUP BY block_id

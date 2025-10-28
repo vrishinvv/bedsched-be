@@ -473,6 +473,21 @@ app.post('/api/locations/:id/beds/:bedNumber/allocate', async (req, res) => {
       ? gender.trim() 
       : 'Other';
 
+    // Cleanup: soft-delete expired reservations that overlap this range for this bed
+    try {
+      await execQuery(`
+        UPDATE allocations
+        SET deleted_at = NOW(), updated_at = NOW()
+        WHERE location_id = $1
+          AND bed_number = $2
+          AND status = 'reserved'
+          AND reserved_expires_at IS NOT NULL
+          AND reserved_expires_at <= ${nowIST}
+          AND deleted_at IS NULL
+          AND daterange(start_date, end_date, '[]') && daterange($3::date, $4::date, '[]')
+      `, [id, bedNumber, startDate, endDate]);
+    } catch {}
+
     // Insert allocation; exclusion constraint prevents overlaps
     const q = `
       INSERT INTO allocations(location_id, bed_number, name, phone, gender, start_date, end_date)
@@ -506,6 +521,7 @@ app.patch('/api/locations/:id/beds/:bedNumber', async (req, res) => {
   try {
     const id = Number(req.params.id);
     const bedNumber = Number(req.params.bedNumber);
+    if (!Number.isFinite(bedNumber)) return res.status(400).json({ error: 'invalid_bed_number' });
     await validateBedWithinCapacity(id, bedNumber);
 
     // find current active allocation
@@ -742,6 +758,7 @@ app.get('/api/locations/:id/tents/:tent/blocks/:block', async (req, res) => {
   }
 });
 
+
 /* --------------------- Smart Reserve and Reservation APIs --------------------- */
 
 // Note: per-block availability queries were replaced with a single prefetch
@@ -767,6 +784,12 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
     if (!phone || typeof isFamily !== 'boolean' || !startDate || !endDate) {
       return res.status(400).json({ error: 'missing_required_fields' });
     }
+
+    // Validate date range
+    if (new Date(startDate) > new Date(endDate)) {
+      return res.status(400).json({ error: 'invalid_date_range', message: 'start_date must be before or equal to end_date' });
+    }
+
     const totalCount = Number(maleCount) + Number(femaleCount);
     if (totalCount <= 0) {
       return res.status(400).json({ error: 'invalid_count', message: 'At least one person must be specified' });
@@ -794,7 +817,6 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
     });
 
     // Prefetch occupancy for all blocks that OVERLAP the requested date range.
-    // Use end-exclusive range '[)' so back-to-back bookings are allowed (prev end = next start).
     const occRes = await execQuery(`
       SELECT block_id, bed_number
       FROM allocations
@@ -1489,6 +1511,29 @@ app.post('/api/allocations/confirm', async (req, res) => {
   }
 });
 
+// POST /api/allocations/cleanup-expired - Admin only endpoint to clean up expired reservations
+app.post('/api/allocations/cleanup-expired', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+
+    // Soft-delete all expired reservations
+    const result = await execQuery(`
+      UPDATE allocations
+      SET deleted_at = NOW(), updated_at = NOW()
+      WHERE deleted_at IS NULL
+        AND status = 'reserved'
+        AND reserved_expires_at IS NOT NULL
+        AND reserved_expires_at <= ${nowIST}
+    `);
+
+    res.json({ ok: true, cleaned: result.rowCount });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'cleanup_failed' });
+  }
+});
+
 // POST /api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate
 app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate', async (req, res) => {
   try {
@@ -1502,6 +1547,11 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
     const { name, phone, gender, startDate, endDate } = req.body || {};
     if (!name || !startDate || !endDate) {
       return res.status(400).json({ error: 'missing_required_fields' });
+    }
+
+    // Validate date range
+    if (new Date(startDate) > new Date(endDate)) {
+      return res.status(400).json({ error: 'invalid_date_range', message: 'start_date must be before or equal to end_date' });
     }
 
     // Validate and normalize gender
@@ -1522,6 +1572,21 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       SELECT id FROM tents WHERE location_id = $1 AND tent_index = $2
     `, [locationId, tentIndex]);
     const tentId = tentRes.rows[0].id;
+
+    // Cleanup: soft-delete expired reservations that overlap this range for this bed in this block
+    try {
+      await execQuery(`
+        UPDATE allocations
+        SET deleted_at = NOW(), updated_at = NOW()
+        WHERE block_id = $1
+          AND bed_number = $2
+          AND status = 'reserved'
+          AND reserved_expires_at IS NOT NULL
+          AND reserved_expires_at <= ${nowIST}
+          AND deleted_at IS NULL
+          AND daterange(start_date, end_date, '[]') && daterange($3::date, $4::date, '[]')
+      `, [blockId, bedNumber, startDate, endDate]);
+    } catch {}
 
     const q = `
       INSERT INTO allocations(location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date)
@@ -1562,6 +1627,11 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
     
     if (!name || !startDate || !endDate) {
       return res.status(400).json({ error: 'missing_required_fields' });
+    }
+
+    // Validate date range
+    if (new Date(startDate) > new Date(endDate)) {
+      return res.status(400).json({ error: 'invalid_date_range', message: 'start_date must be before or equal to end_date' });
     }
 
     const totalCount = (maleCount || 0) + (femaleCount || 0);
@@ -1692,6 +1762,7 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
     const tentIndex = Number(req.params.tent);
     const blockIndex = Number(req.params.block);
     const bedNumber = Number(req.params.bedNumber);
+    if (!Number.isFinite(bedNumber)) return res.status(400).json({ error: 'invalid_bed_number' });
     
     const blockId = await validateBedWithinBlock(locationId, tentIndex, blockIndex, bedNumber);
 
@@ -1814,3 +1885,55 @@ app.delete('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async
   }
 });
 
+// POST /api/locations/:id/tents/:tent/blocks/:block/beds/deallocate-batch
+// body: { bedNumbers: number[] }
+app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/deallocate-batch', async (req, res) => {
+  try {
+    const locationId = Number(req.params.id);
+    const tentIndex = Number(req.params.tent);
+    const blockIndex = Number(req.params.block);
+    const bedNumbers = Array.isArray(req.body?.bedNumbers) ? req.body.bedNumbers.map(Number).filter(n=>Number.isFinite(n)) : [];
+    if (bedNumbers.length === 0) return res.status(400).json({ error: 'no_beds' });
+
+    // Validate block and obtain block_id
+    const v = await execQuery(`
+      SELECT b.id, b.size
+      FROM blocks b JOIN tents t ON t.id = b.tent_id
+      WHERE t.location_id = $1 AND t.tent_index = $2 AND b.block_index = $3
+    `, [locationId, tentIndex, blockIndex]);
+    if (!v.rowCount) return res.status(404).json({ error: 'block_not_found' });
+    const blockId = Number(v.rows[0].id);
+
+    // One set-based update to soft-delete latest active allocation per requested bed
+    const sql = `
+      WITH latest AS (
+        SELECT id, bed_number
+        FROM (
+          SELECT a.id, a.bed_number, ROW_NUMBER() OVER (PARTITION BY a.bed_number ORDER BY a.created_at DESC) rn
+          FROM allocations a
+          WHERE a.block_id = $1
+            AND a.bed_number = ANY($2::int[])
+            AND a.deleted_at IS NULL
+            AND a.end_date >= (CURRENT_DATE AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date
+        ) s
+        WHERE rn = 1
+      ), upd AS (
+        UPDATE allocations a
+        SET deleted_at = NOW(), updated_at = NOW()
+        FROM latest l
+        WHERE a.id = l.id
+        RETURNING l.bed_number
+      )
+      SELECT 
+        (SELECT COUNT(*) FROM upd) AS success,
+        (SELECT ARRAY(SELECT unnest($2::int[]) EXCEPT SELECT bed_number FROM latest)) AS no_active
+    `;
+    const r = await execQuery(sql, [blockId, bedNumbers]);
+    const row = r.rows?.[0] || { success: 0, no_active: [] };
+    const errors = (row.no_active || []).map(bn => ({ bedNumber: Number(bn), error: 'no_active_allocation' }));
+    res.json({ ok: true, success: Number(row.success || 0), errors });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'deallocate_batch_failed' });
+  }
+});
