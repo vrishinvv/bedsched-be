@@ -473,7 +473,7 @@ app.post('/api/locations/:id/beds/:bedNumber/allocate', async (req, res) => {
       ? gender.trim() 
       : 'Other';
 
-    // Cleanup: soft-delete expired reservations that overlap this range for this bed
+    // Cleanup: soft-delete expired reservations on this bed
     try {
       await execQuery(`
         UPDATE allocations
@@ -484,11 +484,28 @@ app.post('/api/locations/:id/beds/:bedNumber/allocate', async (req, res) => {
           AND reserved_expires_at IS NOT NULL
           AND reserved_expires_at <= ${nowIST}
           AND deleted_at IS NULL
-          AND daterange(start_date, end_date, '[]') && daterange($3::date, $4::date, '[]')
-      `, [id, bedNumber, startDate, endDate]);
+      `, [id, bedNumber]);
     } catch {}
 
-    // Insert allocation; exclusion constraint prevents overlaps
+    // Check if bed has current or future allocation (end_date >= today)
+    const checkQ = `
+      SELECT id FROM allocations
+      WHERE location_id = $1
+        AND bed_number = $2
+        AND deleted_at IS NULL
+        AND end_date >= ${todaySQL}
+        AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > ${nowIST}))
+      LIMIT 1
+    `;
+    const existing = await execQuery(checkQ, [id, bedNumber]);
+    if (existing.rowCount > 0) {
+      return res.status(409).json({ 
+        error: 'bed_already_allocated',
+        message: 'This bed is already allocated or reserved (current or future booking exists)'
+      });
+    }
+
+    // Insert allocation
     const q = `
       INSERT INTO allocations(location_id, bed_number, name, phone, gender, start_date, end_date)
       VALUES ($1,$2,$3,$4,$5,$6,$7)
@@ -505,12 +522,23 @@ app.post('/api/locations/:id/beds/:bedNumber/allocate', async (req, res) => {
     ]);
     res.json({ ok: true });
   } catch (e) {
-    console.error(e);
+    console.error('[ALLOCATE ERROR]', {
+      error: e.message,
+      code: e.code,
+      detail: e.detail,
+      bedNumber,
+      locationId: id,
+      timestamp: new Date().toISOString()
+    });
     // Exclusion constraint violation code is 23P01
     if (e.code === '23P01') {
-      return res.status(409).json({ error: 'overlapping_allocation' });
+      return res.status(409).json({ 
+        error: 'overlapping_allocation',
+        message: 'Cannot allocate: This bed is already booked for the selected dates',
+        detail: e.detail
+      });
     }
-    res.status(500).json({ error: 'allocate_failed' });
+    res.status(500).json({ error: 'allocate_failed', message: e.message });
   }
 });
 
@@ -551,6 +579,26 @@ app.patch('/api/locations/:id/beds/:bedNumber', async (req, res) => {
     const newStartDate = startDate !== undefined ? startDate : current.start_date.toISOString().split('T')[0];
     const newEndDate = endDate !== undefined ? endDate : current.end_date.toISOString().split('T')[0];
 
+    // Cleanup: soft-delete expired reservations on this bed (only if not the current allocation)
+    try {
+      const cleanupResult = await execQuery(`
+        UPDATE allocations
+        SET deleted_at = NOW(), updated_at = NOW()
+        WHERE location_id = $1
+          AND bed_number = $2
+          AND status = 'reserved'
+          AND reserved_expires_at IS NOT NULL
+          AND reserved_expires_at <= ${nowIST}
+          AND deleted_at IS NULL
+          AND id != $3
+      `, [id, bedNumber, current.id]);
+      if (cleanupResult.rowCount > 0) {
+        console.log('[EDIT] Cleaned up', cleanupResult.rowCount, 'expired reservations before edit');
+      }
+    } catch (cleanupErr) {
+      console.error('[EDIT] Cleanup error:', cleanupErr.message);
+    }
+
     // Begin transaction
     await execQuery('BEGIN');
 
@@ -584,11 +632,22 @@ app.patch('/api/locations/:id/beds/:bedNumber', async (req, res) => {
       throw e;
     }
   } catch (e) {
-    console.error(e);
+    console.error('[EDIT ERROR]', {
+      error: e.message,
+      code: e.code,
+      detail: e.detail,
+      bedNumber,
+      locationId: id,
+      timestamp: new Date().toISOString()
+    });
     if (e.code === '23P01') {
-      return res.status(409).json({ error: 'overlapping_allocation' });
+      return res.status(409).json({ 
+        error: 'overlapping_allocation',
+        message: 'Cannot update: The new dates conflict with an existing booking',
+        detail: e.detail
+      });
     }
-    res.status(500).json({ error: 'edit_failed' });
+    res.status(500).json({ error: 'edit_failed', message: e.message });
   }
 });
 
@@ -795,6 +854,24 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
       return res.status(400).json({ error: 'invalid_count', message: 'At least one person must be specified' });
     }
 
+    // Clean up expired reservations first to avoid conflicts with stale data
+    try {
+      const cleanupResult = await execQuery(`
+        UPDATE allocations
+        SET deleted_at = NOW(), updated_at = NOW()
+        WHERE deleted_at IS NULL
+          AND status = 'reserved'
+          AND reserved_expires_at IS NOT NULL
+          AND reserved_expires_at <= ${nowIST}
+      `);
+      if (cleanupResult.rowCount > 0) {
+        console.log('[SMART-RESERVE] Cleaned up', cleanupResult.rowCount, 'expired reservations before processing');
+      }
+    } catch (cleanupErr) {
+      console.error('[SMART-RESERVE] Cleanup error:', cleanupErr.message);
+      // Continue anyway - cleanup failure shouldn't block the reservation
+    }
+
     // Fetch locations and blocks with sizes and restrictions
     const locRes = await execQuery(`SELECT id, capacity FROM locations ORDER BY id`);
     const tentRes = await execQuery(`SELECT id, location_id, tent_index FROM tents ORDER BY location_id, tent_index`);
@@ -816,20 +893,47 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
       blocksByTent.get(b.tent_id).push(b);
     });
 
-    // Prefetch occupancy for all blocks that OVERLAP the requested date range.
+    // Prefetch occupancy for all blocks - check current + future allocations (end_date >= today)
+    console.log('[SMART-RESERVE] Checking current and future allocations');
     const occRes = await execQuery(`
-      SELECT block_id, bed_number
+      SELECT block_id, bed_number, start_date, end_date, status, reserved_expires_at, id, phone
       FROM allocations
       WHERE deleted_at IS NULL
-        AND daterange(start_date, end_date, '[]') && daterange($1::date, $2::date, '[]')
+        AND end_date >= ${todaySQL}
         AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > (NOW() AT TIME ZONE 'Asia/Kolkata')))
-    `, [startDate, endDate]);
-    const occupiedByBlock = new Map(); // block_id -> Set of occupied
+    `);
+    console.log('[SMART-RESERVE] Found', occRes.rows.length, 'total active allocations across all blocks');
+    
+    // Log detailed occupancy per block for debugging
+    const blockOccupancyCounts = new Map();
+    occRes.rows.forEach(r => {
+      const count = blockOccupancyCounts.get(r.block_id) || 0;
+      blockOccupancyCounts.set(r.block_id, count + 1);
+    });
+    console.log('[SMART-RESERVE] Block occupancy counts:', Array.from(blockOccupancyCounts.entries()).map(([bid, count]) => `Block ${bid}: ${count} beds occupied`).join(', '));
+    
+    const occupiedByBlock = new Map(); // block_id -> Set of occupied beds
+    const occupancyDetails = new Map(); // For debugging - track what's occupying each bed
     for (const r of occRes.rows) {
       const bid = Number(r.block_id);
+      const bedNum = Number(r.bed_number);
       const set = occupiedByBlock.get(bid) || new Set();
-      set.add(Number(r.bed_number));
+      set.add(bedNum);
       occupiedByBlock.set(bid, set);
+      
+      // Store details for debugging
+      const key = `${bid}-${bedNum}`;
+      if (!occupancyDetails.has(key)) {
+        occupancyDetails.set(key, []);
+      }
+      occupancyDetails.get(key).push({
+        id: r.id,
+        phone: r.phone,
+        startDate: r.start_date,
+        endDate: r.end_date,
+        status: r.status,
+        expiresAt: r.reserved_expires_at
+      });
     }
     const freeBedsByBlock = new Map(); // block_id -> Array of free beds (ascending)
     for (const b of blockRes.rows) {
@@ -837,28 +941,28 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
       const arr = [];
       for (let i = 1; i <= Number(b.size); i++) if (!occ.has(i)) arr.push(i);
       freeBedsByBlock.set(b.id, arr);
+      console.log(`[SMART-RESERVE] Block ${b.id} (L${b.location_id} T${b.tent_index} B${b.block_index}): ${b.size} total, ${occ.size} occupied, ${arr.length} free`);
     }
 
-    // Helper: try to plan in a given location id (used by family-first passes)
-    const tryPlanInLocation = async (locationId) => {
-      // Gather candidate tents in location
-      const tents = (tentsByLoc.get(locationId) || []).slice().sort((a,b)=>a.tent_index-b.tent_index);
-      if (tents.length === 0) return null;
+    let finalPlan = null;
 
-      // Clone freeBedsByBlock for this attempt so we don't mutate the original
-      const localFreeBeds = new Map();
-      for (const [blockId, beds] of freeBedsByBlock.entries()) {
-        localFreeBeds.set(blockId, [...beds]); // shallow copy array
-      }
-
+    if (isFamily) {
+      // FAMILY ALLOCATION STRATEGY:
+      // Priority 1: Maximize male-female pairs in 'both' blocks (same block = together)
+      // Priority 2: Same location/tent is secondary consideration
+      // Priority 3: If not enough 'both' blocks, use single-gender blocks for excess
+      
       const planItems = [];
-      const reserve = (block, count, gender) => {
-        const freeList = localFreeBeds.get(block.id) || [];
+      let malesRem = Number(maleCount);
+      let femalesRem = Number(femaleCount);
+      
+      const reserveGlobal = (block, count, gender) => {
+        const freeList = freeBedsByBlock.get(block.id) || [];
         const take = Math.min(freeList.length, count);
-        const picked = freeList.splice(0, take); // mutate local copy
+        const picked = freeList.splice(0, take);
         for (const bed of picked) {
           planItems.push({
-            locationId,
+            locationId: block.location_id,
             tentId: block.tent_id,
             blockId: block.id,
             tentIndex: block.tent_index,
@@ -869,294 +973,126 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
         }
         return take;
       };
-
-      if (isFamily) {
-        const need = totalCount;
-        // Prefer single mixed block in same tent
-        for (const t of tents) {
-          const blocks = (blocksByTent.get(t.id) || []).filter(b=>b.gender_restriction==='both').sort((a,b)=>a.block_index-b.block_index);
-          for (const b of blocks) {
-            const free = localFreeBeds.get(b.id) || [];
-            if (free.length >= need) {
-              reserve(b, need, 'Female'); // gender irrelevant mix; split below
-              // Adjust genders across the reserved items: rewrite last maleCount as 'Male'
-              let malesLeft = Number(maleCount);
-              for (let i = planItems.length - 1; i >= 0 && malesLeft > 0; i--) {
-                planItems[i].gender = 'Male';
-                malesLeft--;
-              }
-              return { items: planItems, requiresConfirmation: null };
-            }
-          }
-        }
-        // Else pack across mixed blocks within the same tent first
-        for (const t of tents) {
-          const blocks = (blocksByTent.get(t.id) || []).filter(b=>b.gender_restriction==='both').sort((a,b)=>a.block_index-b.block_index);
-          let remaining = need;
-          const startLen = planItems.length;
-          for (const b of blocks) {
-            const got = reserve(b, remaining, 'Female');
-            remaining -= got;
-            if (remaining <= 0) break;
-          }
-          if (remaining <= 0) {
-            // Set genders: assign males over the last allocated
-            let malesLeft = Number(maleCount);
-            for (let i = planItems.length - 1; i >= startLen && malesLeft > 0; i--) {
-              planItems[i].gender = 'Male';
-              malesLeft--;
-            }
-            // Splitting across blocks in same tent; prompt if needed
-            return { items: planItems, requiresConfirmation: 'split' };
-          }
-        }
-        // Else split across tents in same location
-        let remaining = need;
-        const startLen = planItems.length;
-        for (const t of tents) {
-          const blocks = (blocksByTent.get(t.id) || []).filter(b=>b.gender_restriction==='both').sort((a,b)=>a.block_index-b.block_index);
-          for (const b of blocks) {
-            const got = reserve(b, remaining, 'Female');
-            remaining -= got;
-            if (remaining <= 0) break;
-          }
-          if (remaining <= 0) break;
-        }
-        if (remaining <= 0) {
-          let malesLeft = Number(maleCount);
-          for (let i = planItems.length - 1; i >= 0 && malesLeft > 0; i--) {
-            planItems[i].gender = 'Male';
-            malesLeft--;
-          }
-          return { items: planItems, requiresConfirmation: 'split' };
-        }
-        return null; // cannot satisfy
-      } else {
-        // Non-family handled at global scope across locations; this per-location planner isn't used
-        // for non-family anymore. Return null so outer logic can proceed.
-        return null;
-      }
-    };
-
-    let finalPlan = null;
-
-    if (isFamily) {
-      // Prefer solutions within a single location first
-      for (const loc of locRes.rows) {
-        const resPlan = await tryPlanInLocation(loc.id);
-        if (resPlan) { finalPlan = resPlan; break; }
-      }
-      if (!finalPlan) {
-        // Check if there are any 'both' blocks available globally
-        const blocksMixed = blockRes.rows.filter(b=>b.gender_restriction==='both').sort((a,b)=>a.location_id-b.location_id || a.tent_index-b.tent_index || a.block_index-b.block_index);
-        const totalMixedCapacity = blocksMixed.reduce((sum, b) => sum + (freeBedsByBlock.get(b.id) || []).length, 0);
+      
+      // Get all 'both' blocks sorted by capacity (largest first for better pair allocation)
+      const blocksMixed = blockRes.rows
+        .filter(b => b.gender_restriction === 'both')
+        .map(b => ({
+          ...b,
+          freeCapacity: (freeBedsByBlock.get(b.id) || []).length
+        }))
+        .filter(b => b.freeCapacity > 0)
+        .sort((a, b) => {
+          // Sort by capacity descending, then by location/tent/block
+          if (b.freeCapacity !== a.freeCapacity) return b.freeCapacity - a.freeCapacity;
+          if (a.location_id !== b.location_id) return a.location_id - b.location_id;
+          if (a.tent_index !== b.tent_index) return a.tent_index - b.tent_index;
+          return a.block_index - b.block_index;
+        });
+      
+      const totalMixedCapacity = blocksMixed.reduce((sum, b) => sum + b.freeCapacity, 0);
+      
+      // Calculate how many pairs we can allocate (1 male + 1 female = pair)
+      const pairsNeeded = Math.min(malesRem, femalesRem);
+      const pairsWeCanAllocate = Math.min(pairsNeeded, Math.floor(totalMixedCapacity / 2));
+      
+      console.log('[FAMILY ALLOC] Males:', malesRem, 'Females:', femalesRem, 'Pairs needed:', pairsNeeded);
+      console.log('[FAMILY ALLOC] Total mixed capacity:', totalMixedCapacity, 'Pairs we can allocate:', pairsWeCanAllocate);
+      console.log('[FAMILY ALLOC] Mixed blocks:', blocksMixed.map(b => 
+        `L${b.location_id}T${b.tent_index}B${b.block_index}:${b.freeCapacity}beds`
+      ).join(', '));
+      
+      // STEP 1: Allocate pairs to 'both' blocks (maximize togetherness)
+      let pairsAllocated = 0;
+      for (const b of blocksMixed) {
+        if (pairsAllocated >= pairsWeCanAllocate) break;
         
-        if (totalMixedCapacity < totalCount) {
-          // Not enough 'both' blocks, need to use single-gender blocks
-          if (!confirmFallback) {
-            return res.status(409).json({
-              error: 'requires_confirmation',
-              requiresConfirmation: 'no-mixed-blocks-family',
-              message: 'No all-gender blocks available with sufficient capacity for family. Would you like to allocate in single-gender blocks instead?',
-              preview: []
-            });
+        const pairsRemainingToAllocate = pairsWeCanAllocate - pairsAllocated;
+        const pairsThisBlockCanFit = Math.floor(b.freeCapacity / 2);
+        const pairsToAllocateHere = Math.min(pairsRemainingToAllocate, pairsThisBlockCanFit);
+        
+        if (pairsToAllocateHere > 0) {
+          console.log(`[FAMILY ALLOC] Block L${b.location_id}T${b.tent_index}B${b.block_index}: allocating ${pairsToAllocateHere} pairs`);
+          for (let i = 0; i < pairsToAllocateHere; i++) {
+            reserveGlobal(b, 1, 'Male');
+            reserveGlobal(b, 1, 'Female');
           }
-          
-          // User confirmed - allocate maximum pairs in 'both' blocks, rest in single-gender
-          const planItems = [];
-          let malesRem = Number(maleCount);
-          let femalesRem = Number(femaleCount);
-          
-          const reserveGlobal = (block, count, gender) => {
-            const freeList = freeBedsByBlock.get(block.id) || [];
-            const take = Math.min(freeList.length, count);
-            const picked = freeList.splice(0, take);
-            for (const bed of picked) {
-              planItems.push({
-                locationId: block.location_id,
-                tentId: block.tent_id,
-                blockId: block.id,
-                tentIndex: block.tent_index,
-                blockIndex: block.block_index,
-                bedNumber: bed,
-                gender,
-              });
-            }
-            return take;
-          };
-          
-          // Calculate max pairs (1 male + 1 female) that can fit in 'both' blocks
-          const maxPossiblePairs = Math.min(
-            Math.floor(totalMixedCapacity / 2), // max pairs based on space
-            Math.min(malesRem, femalesRem) // max pairs based on available people
-          );
-          
-          console.log('[FAMILY ALLOC] Total mixed capacity:', totalMixedCapacity);
-          console.log('[FAMILY ALLOC] Males remaining:', malesRem, 'Females remaining:', femalesRem);
-          console.log('[FAMILY ALLOC] Max possible pairs:', maxPossiblePairs);
-          console.log('[FAMILY ALLOC] Mixed blocks available:', blocksMixed.length);
-          
-          // Allocate pairs to 'both' blocks - distribute evenly
-          let pairsToAllocate = maxPossiblePairs;
-          for (const b of blocksMixed) {
-            if (pairsToAllocate <= 0) break;
-            
-            const freeInBlock = (freeBedsByBlock.get(b.id) || []).length;
-            console.log(`[FAMILY ALLOC] Block ${b.id} (L${b.location_id} T${b.tent_index} B${b.block_index}): ${freeInBlock} free beds`);
-            if (freeInBlock < 2) continue; // need at least 2 beds for a pair
-            
-            // Allocate as many pairs as possible in this block
-            const pairsInThisBlock = Math.min(pairsToAllocate, Math.floor(freeInBlock / 2));
-            console.log(`[FAMILY ALLOC] Allocating ${pairsInThisBlock} pairs to this block`);
-            for (let i = 0; i < pairsInThisBlock; i++) {
+          pairsAllocated += pairsToAllocateHere;
+          malesRem -= pairsToAllocateHere;
+          femalesRem -= pairsToAllocateHere;
+        }
+      }
+      
+      console.log('[FAMILY ALLOC] After pair allocation - Males rem:', malesRem, 'Females rem:', femalesRem);
+      
+      // STEP 2: Use remaining capacity in 'both' blocks for individuals (alternate to maintain balance)
+      for (const b of blocksMixed) {
+        if (malesRem <= 0 && femalesRem <= 0) break;
+        
+        const freeInBlock = (freeBedsByBlock.get(b.id) || []).length;
+        if (freeInBlock === 0) continue;
+        
+        // Alternate between male and female when both remain
+        while ((freeBedsByBlock.get(b.id) || []).length > 0 && (malesRem > 0 || femalesRem > 0)) {
+          if (malesRem > 0 && femalesRem > 0) {
+            // Allocate whichever has more remaining to maintain balance
+            if (malesRem >= femalesRem) {
               reserveGlobal(b, 1, 'Male');
+              malesRem -= 1;
+            } else {
               reserveGlobal(b, 1, 'Female');
+              femalesRem -= 1;
             }
-            pairsToAllocate -= pairsInThisBlock;
-            malesRem -= pairsInThisBlock;
-            femalesRem -= pairsInThisBlock;
-          }
-          
-          console.log('[FAMILY ALLOC] After pairs - Males rem:', malesRem, 'Females rem:', femalesRem);
-          
-          // Now use any remaining capacity in 'both' blocks for individuals
-          // Try to keep some balance between males and females even in leftover allocation
-          for (const b of blocksMixed) {
-            if (malesRem <= 0 && femalesRem <= 0) break;
-            
-            const freeInBlock = (freeBedsByBlock.get(b.id) || []).length;
-            if (freeInBlock === 0) continue;
-            
-            // Alternate or balance allocation in remaining capacity
-            while ((freeBedsByBlock.get(b.id) || []).length > 0 && (malesRem > 0 || femalesRem > 0)) {
-              // If we have both males and females remaining, alternate
-              if (malesRem > 0 && femalesRem > 0) {
-                reserveGlobal(b, 1, 'Male');
-                malesRem -= 1;
-                if ((freeBedsByBlock.get(b.id) || []).length > 0 && femalesRem > 0) {
-                  reserveGlobal(b, 1, 'Female');
-                  femalesRem -= 1;
-                }
-              } else if (malesRem > 0) {
-                reserveGlobal(b, 1, 'Male');
-                malesRem -= 1;
-              } else if (femalesRem > 0) {
-                reserveGlobal(b, 1, 'Female');
-                femalesRem -= 1;
-              }
-            }
-          }
-          
-          // Now allocate remaining males to male_only blocks
-          if (malesRem > 0) {
-            const maleBlocks = blockRes.rows
-              .filter(b => b.gender_restriction === 'male_only')
-              .sort((a,b)=>a.location_id-b.location_id || a.tent_index-b.tent_index || a.block_index-b.block_index);
-            for (const b of maleBlocks) {
-              if (malesRem <= 0) break;
-              const got = reserveGlobal(b, malesRem, 'Male');
-              malesRem -= got;
-            }
-          }
-          
-          // Allocate remaining females to female_only blocks
-          if (femalesRem > 0) {
-            const femaleBlocks = blockRes.rows
-              .filter(b => b.gender_restriction === 'female_only')
-              .sort((a,b)=>a.location_id-b.location_id || a.tent_index-b.tent_index || a.block_index-b.block_index);
-            for (const b of femaleBlocks) {
-              if (femalesRem <= 0) break;
-              const got = reserveGlobal(b, femalesRem, 'Female');
-              femalesRem -= got;
-            }
-          }
-          
-          if (malesRem <= 0 && femalesRem <= 0) {
-            finalPlan = { items: planItems, requiresConfirmation: 'split' };
-          }
-        } else {
-          // Enough 'both' blocks available - allocate pairs across locations
-          console.log('[FAMILY ENOUGH MIXED] Total mixed capacity:', totalMixedCapacity, 'Total needed:', totalCount);
-          const planItems = [];
-          let malesRem = Number(maleCount);
-          let femalesRem = Number(femaleCount);
-          
-          const reserveGlobal = (block, count, gender) => {
-            const freeList = freeBedsByBlock.get(block.id) || [];
-            const take = Math.min(freeList.length, count);
-            const picked = freeList.splice(0, take);
-            for (const bed of picked) {
-              planItems.push({
-                locationId: block.location_id,
-                tentId: block.tent_id,
-                blockId: block.id,
-                tentIndex: block.tent_index,
-                blockIndex: block.block_index,
-                bedNumber: bed,
-                gender,
-              });
-            }
-            return take;
-          };
-          
-          // Calculate max pairs that fit
-          const maxPossiblePairs = Math.min(
-            Math.floor(totalMixedCapacity / 2),
-            Math.min(malesRem, femalesRem)
-          );
-          
-          console.log('[FAMILY ENOUGH MIXED] Max pairs:', maxPossiblePairs);
-          
-          // Allocate pairs across all 'both' blocks
-          let pairsToAllocate = maxPossiblePairs;
-          for (const b of blocksMixed) {
-            if (pairsToAllocate <= 0) break;
-            
-            const freeInBlock = (freeBedsByBlock.get(b.id) || []).length;
-            if (freeInBlock < 2) continue;
-            
-            const pairsInThisBlock = Math.min(pairsToAllocate, Math.floor(freeInBlock / 2));
-            console.log(`[FAMILY ENOUGH MIXED] Block ${b.id}: allocating ${pairsInThisBlock} pairs`);
-            for (let i = 0; i < pairsInThisBlock; i++) {
-              reserveGlobal(b, 1, 'Male');
-              reserveGlobal(b, 1, 'Female');
-            }
-            pairsToAllocate -= pairsInThisBlock;
-            malesRem -= pairsInThisBlock;
-            femalesRem -= pairsInThisBlock;
-          }
-          
-          console.log('[FAMILY ENOUGH MIXED] After pairs - Males rem:', malesRem, 'Females rem:', femalesRem);
-          
-          // Use remaining capacity in 'both' blocks - alternate genders
-          for (const b of blocksMixed) {
-            if (malesRem <= 0 && femalesRem <= 0) break;
-            
-            const freeInBlock = (freeBedsByBlock.get(b.id) || []).length;
-            if (freeInBlock === 0) continue;
-            
-            while ((freeBedsByBlock.get(b.id) || []).length > 0 && (malesRem > 0 || femalesRem > 0)) {
-              if (malesRem > 0 && femalesRem > 0) {
-                reserveGlobal(b, 1, 'Male');
-                malesRem -= 1;
-                if ((freeBedsByBlock.get(b.id) || []).length > 0 && femalesRem > 0) {
-                  reserveGlobal(b, 1, 'Female');
-                  femalesRem -= 1;
-                }
-              } else if (malesRem > 0) {
-                reserveGlobal(b, 1, 'Male');
-                malesRem -= 1;
-              } else if (femalesRem > 0) {
-                reserveGlobal(b, 1, 'Female');
-                femalesRem -= 1;
-              }
-            }
-          }
-          
-          if (malesRem <= 0 && femalesRem <= 0) {
-            finalPlan = { items: planItems, requiresConfirmation: 'split' };
+          } else if (malesRem > 0) {
+            reserveGlobal(b, 1, 'Male');
+            malesRem -= 1;
+          } else if (femalesRem > 0) {
+            reserveGlobal(b, 1, 'Female');
+            femalesRem -= 1;
           }
         }
+      }
+      
+      console.log('[FAMILY ALLOC] After using remaining mixed blocks - Males rem:', malesRem, 'Females rem:', femalesRem);
+      
+      // STEP 3: If we still have remaining people, use single-gender blocks
+      if (malesRem > 0 || femalesRem > 0) {
+        if (!confirmFallback) {
+          return res.status(409).json({
+            error: 'requires_confirmation',
+            requiresConfirmation: 'need-single-gender-blocks',
+            message: `All-gender blocks are full. ${malesRem > 0 ? `${malesRem} male${malesRem > 1 ? 's' : ''}` : ''}${malesRem > 0 && femalesRem > 0 ? ' and ' : ''}${femalesRem > 0 ? `${femalesRem} female${femalesRem > 1 ? 's' : ''}` : ''} will be allocated to single-gender blocks. Continue?`,
+            preview: planItems.map(i => ({ locationId: i.locationId, tentIndex: i.tentIndex, blockIndex: i.blockIndex, bedNumber: i.bedNumber, gender: i.gender }))
+          });
+        }
+        
+        // Allocate remaining males to male_only blocks
+        if (malesRem > 0) {
+          const maleBlocks = blockRes.rows
+            .filter(b => b.gender_restriction === 'male_only')
+            .sort((a,b) => a.location_id - b.location_id || a.tent_index - b.tent_index || a.block_index - b.block_index);
+          for (const b of maleBlocks) {
+            if (malesRem <= 0) break;
+            const got = reserveGlobal(b, malesRem, 'Male');
+            malesRem -= got;
+          }
+        }
+        
+        // Allocate remaining females to female_only blocks
+        if (femalesRem > 0) {
+          const femaleBlocks = blockRes.rows
+            .filter(b => b.gender_restriction === 'female_only')
+            .sort((a,b) => a.location_id - b.location_id || a.tent_index - b.tent_index || a.block_index - b.block_index);
+          for (const b of femaleBlocks) {
+            if (femalesRem <= 0) break;
+            const got = reserveGlobal(b, femalesRem, 'Female');
+            femalesRem -= got;
+          }
+        }
+      }
+      
+      if (malesRem <= 0 && femalesRem <= 0) {
+        finalPlan = { items: planItems, requiresConfirmation: pairsAllocated < pairsNeeded ? 'split' : null };
       }
     } else {
       // Non-family: allocate across ALL locations using single-gender blocks first; only then consider mixed
@@ -1215,8 +1151,48 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
     }
 
     if (!finalPlan) {
+      console.log('[SMART-RESERVE] Insufficient beds - no plan found', {
+        totalCount,
+        maleCount,
+        femaleCount,
+        isFamily,
+        dateRange: `${startDate} to ${endDate}`,
+        timestamp: new Date().toISOString()
+      });
       return res.status(400).json({ error: 'insufficient_beds', message: 'Unable to satisfy reservation with current capacity' });
     }
+    
+    // Log the final plan before attempting insertion
+    console.log('[SMART-RESERVE] Final plan ready:', {
+      batchId: `batch_${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+      totalBeds: finalPlan.items.length,
+      locations: [...new Set(finalPlan.items.map(i => i.locationId))],
+      dateRange: `${startDate} to ${endDate}`,
+      phone,
+      contactName,
+      isFamily,
+      maleCount,
+      femaleCount,
+      timestamp: new Date().toISOString()
+    });
+    
+    // Group plan by block to show what's being allocated where
+    const planByBlock = new Map();
+    finalPlan.items.forEach(item => {
+      const key = `${item.locationId}-${item.tentIndex}-${item.blockIndex}`;
+      if (!planByBlock.has(key)) {
+        planByBlock.set(key, { males: 0, females: 0, beds: [] });
+      }
+      const entry = planByBlock.get(key);
+      if (item.gender === 'Male') entry.males++;
+      else if (item.gender === 'Female') entry.females++;
+      entry.beds.push(item.bedNumber);
+    });
+    console.log('[SMART-RESERVE] Allocation plan by block:');
+    planByBlock.forEach((stats, key) => {
+      const [loc, tent, block] = key.split('-');
+      console.log(`  L${loc} T${tent} B${block}: ${stats.males}M + ${stats.females}F = ${stats.beds.length} beds (bed numbers: ${stats.beds.slice(0, 5).join(', ')}${stats.beds.length > 5 ? '...' : ''})`);
+    });
 
     if (finalPlan.requiresConfirmation && !confirmFallback) {
       return res.status(409).json({
@@ -1262,7 +1238,23 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
     } catch (e) {
       await execQuery('ROLLBACK');
       if (e.code === '23P01') {
-        return res.status(409).json({ error: 'overlapping_allocation' });
+        // Exclusion constraint violation - provide detailed error
+        console.error('[SMART-RESERVE CONFLICT]', {
+          batchId,
+          error: e.message,
+          detail: e.detail,
+          itemsAttempted: finalPlan.items.length,
+          dateRange: `${startDate} to ${endDate}`,
+          maleCount,
+          femaleCount,
+          isFamily,
+          timestamp: new Date().toISOString()
+        });
+        return res.status(409).json({ 
+          error: 'overlapping_allocation',
+          message: 'One or more beds are already booked for the requested dates. The beds may have been reserved by someone else while you were completing your booking.',
+          detail: e.detail || 'Date range conflict detected'
+        });
       }
       throw e;
     }
@@ -1278,8 +1270,18 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
       items: finalPlan.items.map(i=>({ locationId: i.locationId, tentIndex: i.tentIndex, blockIndex: i.blockIndex, bedNumber: i.bedNumber, gender: i.gender }))
     });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'smart_reserve_failed', message: e.message });
+    console.error('[SMART-RESERVE ERROR]', {
+      error: e.message,
+      code: e.code,
+      stack: e.stack,
+      requestBody: { phone, isFamily, maleCount, femaleCount, startDate, endDate },
+      timestamp: new Date().toISOString()
+    });
+    res.status(500).json({ 
+      error: 'smart_reserve_failed', 
+      message: e.message || 'Failed to process reservation request',
+      detail: e.detail || null
+    });
   }
 });
 
@@ -1573,7 +1575,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
     `, [locationId, tentIndex]);
     const tentId = tentRes.rows[0].id;
 
-    // Cleanup: soft-delete expired reservations that overlap this range for this bed in this block
+    // Cleanup: soft-delete expired reservations on this bed
     try {
       await execQuery(`
         UPDATE allocations
@@ -1584,9 +1586,26 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
           AND reserved_expires_at IS NOT NULL
           AND reserved_expires_at <= ${nowIST}
           AND deleted_at IS NULL
-          AND daterange(start_date, end_date, '[]') && daterange($3::date, $4::date, '[]')
-      `, [blockId, bedNumber, startDate, endDate]);
+      `, [blockId, bedNumber]);
     } catch {}
+
+    // Check if bed has current or future allocation (end_date >= today)
+    const checkQ = `
+      SELECT id FROM allocations
+      WHERE block_id = $1
+        AND bed_number = $2
+        AND deleted_at IS NULL
+        AND end_date >= ${todaySQL}
+        AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > ${nowIST}))
+      LIMIT 1
+    `;
+    const existing = await execQuery(checkQ, [blockId, bedNumber]);
+    if (existing.rowCount > 0) {
+      return res.status(409).json({ 
+        error: 'bed_already_allocated',
+        message: 'This bed is already allocated or reserved (current or future booking exists)'
+      });
+    }
 
     const q = `
       INSERT INTO allocations(location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date)
@@ -1608,11 +1627,24 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
     ]);
     res.json({ ok: true });
   } catch (e) {
-    console.error(e);
+    console.error('[ALLOCATE-BLOCK ERROR]', {
+      error: e.message,
+      code: e.code,
+      detail: e.detail,
+      bedNumber,
+      locationId,
+      tentIndex,
+      blockIndex,
+      timestamp: new Date().toISOString()
+    });
     if (e.code === '23P01') {
-      return res.status(409).json({ error: 'overlapping_allocation' });
+      return res.status(409).json({ 
+        error: 'overlapping_allocation',
+        message: 'Cannot allocate: This bed is already booked for the selected dates',
+        detail: e.detail
+      });
     }
-    res.status(500).json({ error: 'allocate_failed' });
+    res.status(500).json({ error: 'allocate_failed', message: e.message });
   }
 });
 
@@ -1660,15 +1692,33 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
     `, [locationId, tentIndex]);
     const tentId = tentRes.rows[0].id;
 
-    // Find available beds in this block
+    // Cleanup: soft-delete expired reservations in this block for the date range
+    try {
+      const cleanupResult = await execQuery(`
+        UPDATE allocations
+        SET deleted_at = NOW(), updated_at = NOW()
+        WHERE block_id = $1
+          AND status = 'reserved'
+          AND reserved_expires_at IS NOT NULL
+          AND reserved_expires_at <= ${nowIST}
+          AND deleted_at IS NULL
+      `, [blockId]);
+      if (cleanupResult.rowCount > 0) {
+        console.log('[BULK-ALLOCATE] Cleaned up', cleanupResult.rowCount, 'expired reservations');
+      }
+    } catch (cleanupErr) {
+      console.error('[BULK-ALLOCATE] Cleanup error:', cleanupErr.message);
+    }
+
+    // Find available beds in this block (current + future allocations make bed unavailable)
     const occupiedRes = await execQuery(`
       SELECT bed_number 
       FROM allocations 
       WHERE block_id = $1 
-        AND deleted_at IS NULL 
-        AND daterange(start_date, end_date, '[]') && daterange($2::date, $3::date, '[]')
+        AND deleted_at IS NULL
+        AND end_date >= ${todaySQL}
         AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > (NOW() AT TIME ZONE 'Asia/Kolkata')))
-    `, [blockId, startDate, endDate]);
+    `, [blockId]);
     
     const occupiedBeds = new Set(occupiedRes.rows.map(r => r.bed_number));
     const availableBeds = [];
@@ -1808,6 +1858,26 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
     `, [locationId, tentIndex]);
     const tentId = tentRes.rows[0].id;
 
+    // Cleanup: soft-delete expired reservations on this bed (only if not the current allocation)
+    try {
+      const cleanupResult = await execQuery(`
+        UPDATE allocations
+        SET deleted_at = NOW(), updated_at = NOW()
+        WHERE block_id = $1
+          AND bed_number = $2
+          AND status = 'reserved'
+          AND reserved_expires_at IS NOT NULL
+          AND reserved_expires_at <= ${nowIST}
+          AND deleted_at IS NULL
+          AND id != $3
+      `, [blockId, bedNumber, current.id]);
+      if (cleanupResult.rowCount > 0) {
+        console.log('[EDIT-BLOCK] Cleaned up', cleanupResult.rowCount, 'expired reservations before edit');
+      }
+    } catch (cleanupErr) {
+      console.error('[EDIT-BLOCK] Cleanup error:', cleanupErr.message);
+    }
+
     // Begin transaction
     await execQuery('BEGIN');
 
@@ -1845,11 +1915,24 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
       throw e;
     }
   } catch (e) {
-    console.error(e);
+    console.error('[EDIT-BLOCK ERROR]', {
+      error: e.message,
+      code: e.code,
+      detail: e.detail,
+      bedNumber,
+      locationId,
+      tentIndex,
+      blockIndex,
+      timestamp: new Date().toISOString()
+    });
     if (e.code === '23P01') {
-      return res.status(409).json({ error: 'overlapping_allocation' });
+      return res.status(409).json({ 
+        error: 'overlapping_allocation',
+        message: 'Cannot update: The new dates conflict with an existing booking',
+        detail: e.detail
+      });
     }
-    res.status(500).json({ error: 'edit_failed' });
+    res.status(500).json({ error: 'edit_failed', message: e.message });
   }
 });
 

@@ -21,14 +21,14 @@ export async function getLocationsWithStats() {
       l.id,
       l.name,
       l.capacity,
-      COALESCE(a.alloc_today, 0) AS allocated_count,
+      COALESCE(a.alloc_count, 0) AS allocated_count,
       COALESCE(a.free_tomorrow, 0) AS freeing_tomorrow,
       COALESCE(r.reserved_active, 0) AS reserved_count
     FROM locations l
     LEFT JOIN (
       SELECT
         location_id,
-        COUNT(*) FILTER (WHERE end_date >= ${todaySQL} AND status = 'confirmed') AS alloc_today,
+        COUNT(*) FILTER (WHERE end_date >= ${todaySQL} AND status = 'confirmed') AS alloc_count,
         COUNT(*) FILTER (WHERE end_date = ${tomorrowSQL} AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > ${nowIST}))) AS free_tomorrow
       FROM allocations
       WHERE deleted_at IS NULL
@@ -251,11 +251,13 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
   if (blockRes.rowCount === 0) return null;
   const block = blockRes.rows[0];
 
-  // Get bed allocations
+  // Get bed allocations - current and future allocations only
   const allocRes = await execQuery(`
     SELECT bed_number, name, phone, gender, start_date, end_date, status, reserved_expires_at
     FROM allocations
-    WHERE block_id = $1 AND end_date >= ${todaySQL} AND deleted_at IS NULL
+    WHERE block_id = $1 
+      AND end_date >= ${todaySQL}
+      AND deleted_at IS NULL
   `, [block.id]);
 
   // Build beds object
