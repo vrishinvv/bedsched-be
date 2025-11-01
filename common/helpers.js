@@ -1,8 +1,9 @@
 import { execQuery } from './db.js';
 
-// IST timezone functions - PostgreSQL uses UTC by default, we need IST (UTC+5:30)
-export const todaySQL = `(CURRENT_DATE AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date`;
-export const tomorrowSQL = `((CURRENT_DATE AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata') + INTERVAL '1 day')::date`;
+// IST timezone functions - Get current date in IST as a DATE type
+// Use NOW() to get current timestamp, convert to IST timezone, then cast to DATE
+export const todaySQL = `(NOW() AT TIME ZONE 'Asia/Kolkata')::DATE`;
+export const tomorrowSQL = `((NOW() AT TIME ZONE 'Asia/Kolkata')::DATE + INTERVAL '1 day')::DATE`;
 export const nowIST = `(NOW() AT TIME ZONE 'Asia/Kolkata')`;
 
 // Helper function to get today's date in IST as YYYY-MM-DD string for JavaScript
@@ -74,7 +75,15 @@ export async function getLocationDetail(locationId) {
   // Current and future allocations (from today onwards)
   const activeRes = await execQuery(
     `
-    SELECT bed_number, name, phone, gender, start_date, end_date, status, reserved_expires_at
+    SELECT 
+      bed_number, 
+      name, 
+      phone, 
+      gender, 
+      TO_CHAR(start_date, 'YYYY-MM-DD') as start_date_str,
+      TO_CHAR(end_date, 'YYYY-MM-DD') as end_date_str,
+      status, 
+      reserved_expires_at
     FROM allocations
     WHERE location_id = $1
       AND end_date >= ${todaySQL}
@@ -86,20 +95,12 @@ export async function getLocationDetail(locationId) {
   // Build { [bedNumber]: allocation }
   const beds = {};
   for (const r of activeRes.rows) {
-    // Format dates as YYYY-MM-DD without timezone conversion
-    const formatDate = (date) => {
-      const year = date.getFullYear();
-      const month = String(date.getMonth() + 1).padStart(2, '0');
-      const day = String(date.getDate()).padStart(2, '0');
-      return `${year}-${month}-${day}`;
-    };
-
     beds[r.bed_number] = {
       name: r.name,
       phone: r.phone,
       gender: r.gender || 'Other',
-      startDate: formatDate(r.start_date),
-      endDate: formatDate(r.end_date),
+      startDate: r.start_date_str, // Already formatted as YYYY-MM-DD string from TO_CHAR
+      endDate: r.end_date_str,     // Already formatted as YYYY-MM-DD string from TO_CHAR
       status: r.status,
       reservedExpiresAt: r.reserved_expires_at ? r.reserved_expires_at.toISOString() : null,
     };
@@ -145,7 +146,7 @@ export async function getLocationTents(locationId) {
       SELECT 
         tent_id,
         COUNT(*) FILTER (WHERE end_date >= ${todaySQL} AND status = 'confirmed') AS allocated,
-        COUNT(*) FILTER (WHERE end_date = (CURRENT_DATE + INTERVAL '1 day')::date AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > ${nowIST}))) AS freeing_tomorrow
+        COUNT(*) FILTER (WHERE end_date = ${tomorrowSQL} AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > ${nowIST}))) AS freeing_tomorrow
       FROM allocations
       WHERE deleted_at IS NULL
       GROUP BY tent_id
@@ -252,8 +253,17 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
   const block = blockRes.rows[0];
 
   // Get bed allocations - current and future allocations only
+  // Query dates as strings to avoid timezone conversion issues
   const allocRes = await execQuery(`
-    SELECT bed_number, name, phone, gender, start_date, end_date, status, reserved_expires_at
+    SELECT 
+      bed_number, 
+      name, 
+      phone, 
+      gender, 
+      TO_CHAR(start_date, 'YYYY-MM-DD') as start_date_str,
+      TO_CHAR(end_date, 'YYYY-MM-DD') as end_date_str,
+      status, 
+      reserved_expires_at
     FROM allocations
     WHERE block_id = $1 
       AND end_date >= ${todaySQL}
@@ -263,19 +273,12 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
   // Build beds object
   const beds = {};
   for (const r of allocRes.rows) {
-    const formatDate = (date) => {
-      const year = date.getFullYear();
-      const month = String(date.getMonth() + 1).padStart(2, '0');
-      const day = String(date.getDate()).padStart(2, '0');
-      return `${year}-${month}-${day}`;
-    };
-
     beds[r.bed_number] = {
       name: r.name,
       phone: r.phone,
       gender: r.gender || 'Other',
-      startDate: formatDate(r.start_date),
-      endDate: formatDate(r.end_date),
+      startDate: r.start_date_str, // Already formatted as YYYY-MM-DD string from TO_CHAR
+      endDate: r.end_date_str,     // Already formatted as YYYY-MM-DD string from TO_CHAR
       status: r.status,
       reservedExpiresAt: r.reserved_expires_at ? r.reserved_expires_at.toISOString() : null,
     };

@@ -137,6 +137,97 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Debug endpoint to check allocation dates in a block
+app.get('/api/debug/block-allocations/:blockId', async (req, res) => {
+  try {
+    const blockId = Number(req.params.blockId);
+    
+    const result = await execQuery(`
+      SELECT 
+        bed_number,
+        name,
+        phone,
+        TO_CHAR(start_date, 'YYYY-MM-DD') as start_date_str,
+        TO_CHAR(end_date, 'YYYY-MM-DD') as end_date_str,
+        start_date,
+        end_date,
+        status,
+        deleted_at,
+        reserved_expires_at,
+        CASE 
+          WHEN end_date >= ${todaySQL} THEN 'CURRENT/FUTURE'
+          ELSE 'PAST'
+        END as backend_timeframe,
+        CASE
+          WHEN deleted_at IS NOT NULL THEN 'DELETED'
+          WHEN status = 'confirmed' AND end_date >= ${todaySQL} THEN 'COUNTED_IN_STATS'
+          WHEN status = 'reserved' AND reserved_expires_at > ${nowIST} THEN 'RESERVED_ACTIVE'
+          WHEN status = 'reserved' AND (reserved_expires_at IS NULL OR reserved_expires_at <= ${nowIST}) THEN 'RESERVED_EXPIRED'
+          ELSE 'PAST_NOT_COUNTED'
+        END as backend_classification,
+        CASE
+          WHEN status = 'confirmed' THEN
+            CASE 
+              WHEN ${todaySQL} >= start_date AND ${todaySQL} <= end_date THEN 'SHOULD_BE_RED_OR_ORANGE'
+              WHEN start_date > ${todaySQL} THEN 'SHOULD_BE_ORANGE'
+              ELSE 'SHOULD_BE_WHITE'
+            END
+          WHEN status = 'reserved' AND (reserved_expires_at IS NULL OR reserved_expires_at > ${nowIST}) THEN 'SHOULD_BE_BLUE'
+          ELSE 'SHOULD_BE_WHITE'
+        END as expected_frontend_color
+      FROM allocations
+      WHERE block_id = $1
+      ORDER BY 
+        CASE WHEN deleted_at IS NULL THEN 0 ELSE 1 END,
+        end_date DESC,
+        bed_number
+    `, [blockId]);
+    
+    const stats = await execQuery(`
+      SELECT 
+        COUNT(*) FILTER (WHERE deleted_at IS NULL) as total_active_records,
+        COUNT(*) FILTER (WHERE deleted_at IS NULL AND end_date >= ${todaySQL}) as backend_returns_to_frontend,
+        COUNT(*) FILTER (WHERE deleted_at IS NULL AND end_date < ${todaySQL}) as past_not_returned,
+        COUNT(*) FILTER (WHERE deleted_at IS NULL AND end_date >= ${todaySQL} AND status = 'confirmed') as stats_pill_should_show,
+        COUNT(*) FILTER (WHERE deleted_at IS NULL AND status = 'confirmed' AND ${todaySQL} >= start_date AND ${todaySQL} <= end_date) as should_be_red_or_orange,
+        COUNT(*) FILTER (WHERE deleted_at IS NULL AND status = 'confirmed' AND start_date > ${todaySQL}) as should_be_orange,
+        COUNT(*) FILTER (WHERE deleted_at IS NULL AND status = 'confirmed' AND end_date < ${todaySQL}) as should_be_white_past,
+        ${todaySQL} as today_from_sql,
+        CURRENT_DATE as current_date_utc
+      FROM allocations
+      WHERE block_id = $1
+    `, [blockId]);
+    
+    res.json({
+      blockId,
+      todayIST: getTodayIST(),
+      serverTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      serverTime: new Date().toISOString(),
+      explanation: {
+        backend_returns_to_frontend: "Beds with end_date >= TODAY (included in API response)",
+        stats_pill_should_show: "Beds counted in 'allocated' stat (status=confirmed AND end_date >= TODAY)",
+        should_be_red_or_orange: "Beds that should show as occupied in grid (current or future within range)",
+        should_be_white_past: "Past allocations NOT returned to frontend",
+        today_from_sql: "What PostgreSQL calculates as TODAY in IST"
+      },
+      summary: stats.rows[0],
+      allocations: result.rows.map(r => ({
+        bed: r.bed_number,
+        name: r.name,
+        dates: `${r.start_date_str} to ${r.end_date_str}`,
+        status: r.status,
+        backend_timeframe: r.backend_timeframe,
+        backend_classification: r.backend_classification,
+        expected_color: r.expected_frontend_color,
+        deleted: r.deleted_at ? 'YES' : 'NO'
+      }))
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'debug_failed', message: e.message });
+  }
+});
+
 // Seed quick convenience (optional)
 app.post('/api/seed', async (req, res) => {
   const client = await execQuery('BEGIN'); // Start transaction
@@ -554,11 +645,14 @@ app.patch('/api/locations/:id/beds/:bedNumber', async (req, res) => {
 
     // find current active allocation
     const findQ = `
-      SELECT id, name, phone, gender, start_date, end_date FROM allocations
+      SELECT id, name, phone, gender, 
+             TO_CHAR(start_date, 'YYYY-MM-DD') as start_date,
+             TO_CHAR(end_date, 'YYYY-MM-DD') as end_date
+      FROM allocations
       WHERE location_id = $1
         AND bed_number = $2
         AND deleted_at IS NULL
-        AND end_date >= (CURRENT_DATE AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date
+        AND end_date >= ${todaySQL}
       ORDER BY created_at DESC
       LIMIT 1
     `;
@@ -576,8 +670,8 @@ app.patch('/api/locations/:id/beds/:bedNumber', async (req, res) => {
         ? gender.trim() 
         : 'Other'
     ) : current.gender;
-    const newStartDate = startDate !== undefined ? startDate : current.start_date.toISOString().split('T')[0];
-    const newEndDate = endDate !== undefined ? endDate : current.end_date.toISOString().split('T')[0];
+    const newStartDate = startDate !== undefined ? startDate : current.start_date;
+    const newEndDate = endDate !== undefined ? endDate : current.end_date;
 
     // Cleanup: soft-delete expired reservations on this bed (only if not the current allocation)
     try {
@@ -666,7 +760,7 @@ app.delete('/api/locations/:id/beds/:bedNumber', async (req, res) => {
         WHERE location_id = $1
           AND bed_number = $2
           AND deleted_at IS NULL
-          AND end_date >= (CURRENT_DATE AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date
+          AND end_date >= ${todaySQL}
         ORDER BY created_at DESC
         LIMIT 1
       )
@@ -708,6 +802,38 @@ app.get('/api/locations/:id/tents/:tent/blocks', async (req, res) => {
   try {
     const data = await getTentBlocks(req.params.id, Number(req.params.tent));
     if (!data) return res.status(404).json({ error: 'tent_not_found' });
+    
+    // Debug logging to help troubleshoot stats issues
+    const debug = req.query.debug === 'true';
+    if (debug && data.blocks && data.blocks.length > 0) {
+      // For each block, get detailed allocation info
+      for (const block of data.blocks) {
+        const debugQuery = await execQuery(`
+          SELECT 
+            COUNT(*) FILTER (WHERE deleted_at IS NULL) as total_all,
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND end_date >= ${todaySQL}) as total_current_future,
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND end_date < ${todaySQL}) as total_past,
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND status = 'confirmed') as total_confirmed_all,
+            COUNT(*) FILTER (WHERE deleted_at IS NULL AND end_date >= ${todaySQL} AND status = 'confirmed') as total_confirmed_current,
+            MIN(end_date) as earliest_end,
+            MAX(end_date) as latest_end
+          FROM blocks b
+          JOIN allocations a ON a.block_id = b.id
+          WHERE b.location_id = $1 
+            AND (SELECT tent_id FROM blocks WHERE location_id = $1 AND block_index = $2 LIMIT 1) = b.tent_id
+            AND b.block_index = $2
+          GROUP BY b.id
+        `, [req.params.id, block.index]);
+        
+        console.log(`[DEBUG BLOCK ${block.index}]`, {
+          blockSize: block.size,
+          reportedAllocated: block.allocated,
+          ...debugQuery.rows[0],
+          todayIST: getTodayIST()
+        });
+      }
+    }
+    
     res.json(data);
   } catch (e) {
     console.error(e);
@@ -826,7 +952,7 @@ app.get('/api/locations/:id/tents/:tent/blocks/:block', async (req, res) => {
 async function getAvailableBedsForBlock(blockId, blockSize) {
   const occ = await execQuery(`
     SELECT bed_number FROM allocations
-    WHERE block_id = $1 AND deleted_at IS NULL AND end_date >= (CURRENT_DATE AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date
+    WHERE block_id = $1 AND deleted_at IS NULL AND end_date >= ${todaySQL}
       AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > (NOW() AT TIME ZONE 'Asia/Kolkata')))
   `, [blockId]);
   const occupied = new Set(occ.rows.map(r => r.bed_number));
@@ -1818,11 +1944,14 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
 
     // Find current active allocation
     const findQ = `
-      SELECT id, name, phone, gender, start_date, end_date FROM allocations
+      SELECT id, name, phone, gender, 
+             TO_CHAR(start_date, 'YYYY-MM-DD') as start_date,
+             TO_CHAR(end_date, 'YYYY-MM-DD') as end_date
+      FROM allocations
       WHERE block_id = $1
         AND bed_number = $2
         AND deleted_at IS NULL
-        AND end_date >= (CURRENT_DATE AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date
+        AND end_date >= ${todaySQL}
       ORDER BY created_at DESC
       LIMIT 1
     `;
@@ -1840,8 +1969,8 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
         ? gender.trim() 
         : 'Other'
     ) : current.gender;
-    const newStartDate = startDate !== undefined ? startDate : current.start_date.toISOString().split('T')[0];
-    const newEndDate = endDate !== undefined ? endDate : current.end_date.toISOString().split('T')[0];
+    const newStartDate = startDate !== undefined ? startDate : current.start_date;
+    const newEndDate = endDate !== undefined ? endDate : current.end_date;
 
     // Validate gender restriction for the block if gender is being changed
     if (gender !== undefined) {
@@ -1954,7 +2083,7 @@ app.delete('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async
         WHERE block_id = $1
           AND bed_number = $2
           AND deleted_at IS NULL
-          AND end_date >= (CURRENT_DATE AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date
+          AND end_date >= ${todaySQL}
         ORDER BY created_at DESC
         LIMIT 1
       )
@@ -1997,7 +2126,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/deallocate-batch', a
           WHERE a.block_id = $1
             AND a.bed_number = ANY($2::int[])
             AND a.deleted_at IS NULL
-            AND a.end_date >= (CURRENT_DATE AT TIME ZONE 'UTC' AT TIME ZONE 'Asia/Kolkata')::date
+            AND a.end_date >= ${todaySQL}
         ) s
         WHERE rn = 1
       ), upd AS (
