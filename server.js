@@ -191,8 +191,8 @@ app.get('/api/debug/block-allocations/:blockId', async (req, res) => {
         CASE
           WHEN deleted_at IS NOT NULL THEN 'DELETED'
           WHEN status = 'confirmed' AND end_date >= ${todaySQL} THEN 'COUNTED_IN_STATS'
-          WHEN status = 'reserved' AND reserved_expires_at > ${nowIST} THEN 'RESERVED_ACTIVE'
-          WHEN status = 'reserved' AND (reserved_expires_at IS NULL OR reserved_expires_at <= ${nowIST}) THEN 'RESERVED_EXPIRED'
+          WHEN status = 'reserved' AND reserved_expires_at > NOW() THEN 'RESERVED_ACTIVE'
+          WHEN status = 'reserved' AND (reserved_expires_at IS NULL OR reserved_expires_at <= NOW()) THEN 'RESERVED_EXPIRED'
           ELSE 'PAST_NOT_COUNTED'
         END as backend_classification,
         CASE
@@ -602,9 +602,11 @@ app.post('/api/locations/:id/beds/:bedNumber/allocate', async (req, res) => {
         WHERE location_id = $1
           AND bed_number = $2
           AND status = 'reserved'
-          AND reserved_expires_at IS NOT NULL
-          AND reserved_expires_at <= ${nowIST}
           AND deleted_at IS NULL
+          AND (
+            (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
+            OR end_date < ${todaySQL}
+          )
       `, [id, bedNumber]);
     } catch {}
 
@@ -712,10 +714,12 @@ app.patch('/api/locations/:id/beds/:bedNumber', async (req, res) => {
         WHERE location_id = $1
           AND bed_number = $2
           AND status = 'reserved'
-          AND reserved_expires_at IS NOT NULL
-          AND reserved_expires_at <= ${nowIST}
           AND deleted_at IS NULL
           AND id != $3
+          AND (
+            (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
+            OR end_date < ${todaySQL}
+          )
       `, [id, bedNumber, current.id]);
       if (cleanupResult.rowCount > 0) {
         console.log('[EDIT] Cleaned up', cleanupResult.rowCount, 'expired reservations before edit');
@@ -984,7 +988,7 @@ async function getAvailableBedsForBlock(blockId, blockSize) {
   const occ = await execQuery(`
     SELECT bed_number FROM allocations
     WHERE block_id = $1 AND deleted_at IS NULL AND end_date >= ${todaySQL}
-      AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > (NOW() AT TIME ZONE 'Asia/Kolkata')))
+      AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > NOW()))
   `, [blockId]);
   const occupied = new Set(occ.rows.map(r => r.bed_number));
   const free = [];
@@ -1019,8 +1023,10 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
         SET deleted_at = NOW(), updated_at = NOW()
         WHERE deleted_at IS NULL
           AND status = 'reserved'
-          AND reserved_expires_at IS NOT NULL
-          AND reserved_expires_at <= ${nowIST}
+          AND (
+            (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
+            OR end_date < ${todaySQL}
+          )
       `);
       if (cleanupResult.rowCount > 0) {
         console.log('[SMART-RESERVE] Cleaned up', cleanupResult.rowCount, 'expired reservations before processing');
@@ -1058,7 +1064,7 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
       FROM allocations
       WHERE deleted_at IS NULL
         AND end_date >= ${todaySQL}
-        AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > (NOW() AT TIME ZONE 'Asia/Kolkata')))
+        AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > NOW()))
     `);
     console.log('[SMART-RESERVE] Found', occRes.rows.length, 'total active allocations across all blocks');
     
@@ -1628,7 +1634,7 @@ app.get('/api/allocations/reserved-active', async (_req, res) => {
              a.reserved_expires_at, a.start_date, a.end_date, a.gender
       FROM allocations a
       LEFT JOIN locations l ON a.location_id = l.id
-      WHERE a.deleted_at IS NULL AND a.status = 'reserved' AND (a.reserved_expires_at IS NULL OR a.reserved_expires_at > (NOW() AT TIME ZONE 'Asia/Kolkata'))
+      WHERE a.deleted_at IS NULL AND a.status = 'reserved' AND (a.reserved_expires_at IS NULL OR a.reserved_expires_at > NOW())
       ORDER BY a.location_id, a.tent_index, a.block_index, a.batch_id, a.created_at
     `);
     res.json({ ok: true, items: rows.rows });
@@ -1652,7 +1658,7 @@ app.post('/api/allocations/confirm', async (req, res) => {
       // Select target rows (reserved and not expired)
       const target = await execQuery(`
         SELECT id FROM allocations
-        WHERE batch_id = $1 AND status = 'reserved' AND (reserved_expires_at IS NULL OR reserved_expires_at > (NOW() AT TIME ZONE 'Asia/Kolkata'))
+        WHERE batch_id = $1 AND status = 'reserved' AND (reserved_expires_at IS NULL OR reserved_expires_at > NOW())
       `, [batchId]);
 
       let ids = target.rows.map(r=>r.id);
@@ -1697,8 +1703,10 @@ app.post('/api/allocations/cleanup-expired', async (req, res) => {
       SET deleted_at = NOW(), updated_at = NOW()
       WHERE deleted_at IS NULL
         AND status = 'reserved'
-        AND reserved_expires_at IS NOT NULL
-        AND reserved_expires_at <= ${nowIST}
+        AND (
+          (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
+          OR end_date < ${todaySQL}
+        )
     `);
 
     res.json({ ok: true, cleaned: result.rowCount });
@@ -1755,9 +1763,11 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
         WHERE block_id = $1
           AND bed_number = $2
           AND status = 'reserved'
-          AND reserved_expires_at IS NOT NULL
-          AND reserved_expires_at <= ${nowIST}
           AND deleted_at IS NULL
+          AND (
+            (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
+            OR end_date < ${todaySQL}
+          )
       `, [blockId, bedNumber]);
     } catch {}
 
@@ -1874,9 +1884,11 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
         SET deleted_at = NOW(), updated_at = NOW()
         WHERE block_id = $1
           AND status = 'reserved'
-          AND reserved_expires_at IS NOT NULL
-          AND reserved_expires_at <= ${nowIST}
           AND deleted_at IS NULL
+          AND (
+            (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
+            OR end_date < ${todaySQL}
+          )
       `, [blockId]);
       if (cleanupResult.rowCount > 0) {
         console.log('[BULK-ALLOCATE] Cleaned up', cleanupResult.rowCount, 'expired reservations');
@@ -2047,10 +2059,12 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
         WHERE block_id = $1
           AND bed_number = $2
           AND status = 'reserved'
-          AND reserved_expires_at IS NOT NULL
-          AND reserved_expires_at <= ${nowIST}
           AND deleted_at IS NULL
           AND id != $3
+          AND (
+            (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
+            OR end_date < ${todaySQL}
+          )
       `, [blockId, bedNumber, current.id]);
       if (cleanupResult.rowCount > 0) {
         console.log('[EDIT-BLOCK] Cleaned up', cleanupResult.rowCount, 'expired reservations before edit');

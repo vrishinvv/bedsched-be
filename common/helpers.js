@@ -4,7 +4,7 @@ import { execQuery } from './db.js';
 // Use NOW() to get current timestamp, convert to IST timezone, then cast to DATE
 export const todaySQL = `(NOW() AT TIME ZONE 'Asia/Kolkata')::DATE`;
 export const tomorrowSQL = `((NOW() AT TIME ZONE 'Asia/Kolkata')::DATE + INTERVAL '1 day')::DATE`;
-export const nowIST = `(NOW() AT TIME ZONE 'Asia/Kolkata')`;
+export const nowIST = `NOW()`; // Keep as UTC for timestamp comparisons
 
 // Helper function to get today's date in IST as YYYY-MM-DD string for JavaScript
 export function getTodayIST() {
@@ -17,6 +17,22 @@ export function getTodayIST() {
 
 
 export async function getLocationsWithStats() {
+  // Clean up expired reservations before fetching stats
+  try {
+    await execQuery(`
+      UPDATE allocations
+      SET deleted_at = NOW(), updated_at = NOW()
+      WHERE deleted_at IS NULL
+        AND status = 'reserved'
+        AND (
+          (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
+          OR end_date < ${todaySQL}
+        )
+    `);
+  } catch (cleanupErr) {
+    console.error('[getLocationsWithStats] Cleanup error:', cleanupErr.message);
+  }
+
   const q = `
     SELECT
       l.id,
@@ -55,17 +71,35 @@ export async function getLocationsWithStats() {
 }
 
 export async function getLocationDetail(locationId) {
+  // Clean up expired reservations before fetching location detail
+  try {
+    await execQuery(`
+      UPDATE allocations
+      SET deleted_at = NOW(), updated_at = NOW()
+      WHERE deleted_at IS NULL
+        AND status = 'reserved'
+        AND (
+          (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
+          OR end_date < ${todaySQL}
+        )
+    `);
+  } catch (cleanupErr) {
+    console.error('[getLocationDetail] Cleanup error:', cleanupErr.message);
+  }
+  
   // Validate location exists
   const locRes = await execQuery(`SELECT id, name, capacity FROM locations WHERE id = $1`, [locationId]);
   if (locRes.rowCount === 0) return null;
   const loc = locRes.rows[0];
 
   // Get stats
-  const statsRes = await execQuery(`
+  const statsQuery = `
     SELECT
       COALESCE(COUNT(*) FILTER (WHERE end_date >= ${todaySQL} AND status = 'confirmed'), 0) AS allocated,
       COALESCE(COUNT(*) FILTER (WHERE end_date = ${tomorrowSQL} AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > ${nowIST}))), 0) AS freeing_tomorrow,
-      COALESCE(COUNT(*) FILTER (WHERE status = 'reserved' AND reserved_expires_at > ${nowIST}), 0) AS reserved
+      COALESCE(COUNT(*) FILTER (WHERE status = 'reserved' AND reserved_expires_at > ${nowIST}), 0) AS reserved`;
+  console.log('[DEBUG getLocationDetail] Stats query:', statsQuery);
+  const statsRes = await execQuery(statsQuery + `
     FROM allocations
     WHERE location_id = $1 AND deleted_at IS NULL
   `, [locationId]);
@@ -73,6 +107,8 @@ export async function getLocationDetail(locationId) {
   const stats = statsRes.rows[0] || { allocated: 0, freeing_tomorrow: 0, reserved: 0 };
 
   // Current and future allocations (from today onwards)
+  // For confirmed: end_date >= TODAY
+  // For reserved: reserved_expires_at > NOW (regardless of end_date)
   const activeRes = await execQuery(
     `
     SELECT 
@@ -87,8 +123,11 @@ export async function getLocationDetail(locationId) {
       reserved_expires_at
     FROM allocations
     WHERE location_id = $1
-      AND end_date >= ${todaySQL}
       AND deleted_at IS NULL
+      AND (
+        (status = 'confirmed' AND end_date >= ${todaySQL})
+        OR (status = 'reserved' AND reserved_expires_at > ${nowIST})
+      )
     `,
     [locationId]
   );
@@ -180,6 +219,22 @@ export async function getLocationTents(locationId) {
 }
 
 export async function getTentBlocks(locationId, tentIndex) {
+  // Clean up expired reservations before fetching tent blocks
+  try {
+    await execQuery(`
+      UPDATE allocations
+      SET deleted_at = NOW(), updated_at = NOW()
+      WHERE deleted_at IS NULL
+        AND status = 'reserved'
+        AND (
+          (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
+          OR end_date < ${todaySQL}
+        )
+    `);
+  } catch (cleanupErr) {
+    console.error('[getTentBlocks] Cleanup error:', cleanupErr.message);
+  }
+
   // Get location and tent info
   const tentRes = await execQuery(`
     SELECT t.id, t.tent_index, t.size, l.name as location_name
@@ -242,6 +297,22 @@ export async function getTentBlocks(locationId, tentIndex) {
 }
 
 export async function getBlockDetail(locationId, tentIndex, blockIndex) {
+  // Clean up expired reservations before fetching block detail
+  try {
+    await execQuery(`
+      UPDATE allocations
+      SET deleted_at = NOW(), updated_at = NOW()
+      WHERE deleted_at IS NULL
+        AND status = 'reserved'
+        AND (
+          (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
+          OR end_date < ${todaySQL}
+        )
+    `);
+  } catch (cleanupErr) {
+    console.error('[getBlockDetail] Cleanup error:', cleanupErr.message);
+  }
+
   // Get block info
   const blockRes = await execQuery(`
     SELECT b.id, b.block_index, b.size, b.gender_restriction, t.tent_index, l.name as location_name
@@ -256,6 +327,8 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
 
   // Get bed allocations - current and future allocations only
   // Query dates as strings to avoid timezone conversion issues
+  // For confirmed: end_date >= TODAY
+  // For reserved: reserved_expires_at > NOW (regardless of end_date)
   const allocRes = await execQuery(`
     SELECT 
       bed_number, 
@@ -269,8 +342,11 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
       reserved_expires_at
     FROM allocations
     WHERE block_id = $1 
-      AND end_date >= ${todaySQL}
       AND deleted_at IS NULL
+      AND (
+        (status = 'confirmed' AND end_date >= ${todaySQL})
+        OR (status = 'reserved' AND reserved_expires_at > ${nowIST})
+      )
   `, [block.id]);
 
   // Build beds object
