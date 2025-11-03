@@ -79,6 +79,7 @@ export async function getLocationDetail(locationId) {
       bed_number, 
       name, 
       phone, 
+      aadhar_number,
       gender, 
       TO_CHAR(start_date, 'YYYY-MM-DD') as start_date_str,
       TO_CHAR(end_date, 'YYYY-MM-DD') as end_date_str,
@@ -98,6 +99,7 @@ export async function getLocationDetail(locationId) {
     beds[r.bed_number] = {
       name: r.name,
       phone: r.phone,
+      aadharNumber: r.aadhar_number,
       gender: r.gender || 'Other',
       startDate: r.start_date_str, // Already formatted as YYYY-MM-DD string from TO_CHAR
       endDate: r.end_date_str,     // Already formatted as YYYY-MM-DD string from TO_CHAR
@@ -259,6 +261,7 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
       bed_number, 
       name, 
       phone, 
+      aadhar_number,
       gender, 
       TO_CHAR(start_date, 'YYYY-MM-DD') as start_date_str,
       TO_CHAR(end_date, 'YYYY-MM-DD') as end_date_str,
@@ -276,6 +279,7 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
     beds[r.bed_number] = {
       name: r.name,
       phone: r.phone,
+      aadharNumber: r.aadhar_number,
       gender: r.gender || 'Other',
       startDate: r.start_date_str, // Already formatted as YYYY-MM-DD string from TO_CHAR
       endDate: r.end_date_str,     // Already formatted as YYYY-MM-DD string from TO_CHAR
