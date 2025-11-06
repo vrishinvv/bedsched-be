@@ -1,4 +1,5 @@
 import { execQuery } from './db.js';
+import { generateViewUrl } from './s3.js';
 
 // IST timezone functions - Get current date in IST as a DATE type
 // Use NOW() to get current timestamp, convert to IST timezone, then cast to DATE
@@ -338,6 +339,8 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
       gender, 
       TO_CHAR(start_date, 'YYYY-MM-DD') as start_date_str,
       TO_CHAR(end_date, 'YYYY-MM-DD') as end_date_str,
+      person_photo_key,
+      aadhaar_photo_key,
       status, 
       reserved_expires_at
     FROM allocations
@@ -352,7 +355,7 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
   // Build beds object
   const beds = {};
   for (const r of allocRes.rows) {
-    beds[r.bed_number] = {
+    const bedData = {
       name: r.name,
       phone: r.phone,
       aadharNumber: r.aadhar_number,
@@ -362,6 +365,18 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
       status: r.status,
       reservedExpiresAt: r.reserved_expires_at ? r.reserved_expires_at.toISOString() : null,
     };
+
+    // Include photo keys and generate URLs if keys exist
+    if (r.person_photo_key) {
+      bedData.personPhotoKey = r.person_photo_key;
+      bedData.personPhotoUrl = await generateViewUrl(r.person_photo_key);
+    }
+    if (r.aadhaar_photo_key) {
+      bedData.aadhaarPhotoKey = r.aadhaar_photo_key;
+      bedData.aadhaarPhotoUrl = await generateViewUrl(r.aadhaar_photo_key);
+    }
+
+    beds[r.bed_number] = bedData;
   }
 
   return {

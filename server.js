@@ -19,6 +19,7 @@ import {
   tomorrowSQL,
   nowIST
 } from './common/helpers.js';
+import { generateUploadUrl, generateViewUrl } from './common/s3.js';
 
 
 const app = express();
@@ -576,16 +577,21 @@ app.patch('/api/locations/:id', async (req, res) => {
 });
 
 // POST /api/locations/:id/beds/:bedNumber/allocate
-// body: { name, phone, gender, startDate, endDate, aadharNumber }
+// body: { name, phone, gender, startDate, endDate, aadharNumber, personPhotoKey, aadhaarPhotoKey }
 app.post('/api/locations/:id/beds/:bedNumber/allocate', async (req, res) => {
   try {
     const id = Number(req.params.id);
     const bedNumber = Number(req.params.bedNumber);
     await validateBedWithinCapacity(id, bedNumber);
 
-    const { name, phone, gender, startDate, endDate, aadharNumber } = req.body || {};
+    const { name, phone, gender, startDate, endDate, aadharNumber, personPhotoKey, aadhaarPhotoKey } = req.body || {};
     if (!name || !startDate || !endDate) {
       return res.status(400).json({ error: 'missing_required_fields' });
+    }
+
+    // Validate photos are provided
+    if (!personPhotoKey || !aadhaarPhotoKey) {
+      return res.status(400).json({ error: 'photos_required', message: 'Both person and Aadhaar photos are required' });
     }
 
     // Validate and normalize gender
@@ -630,8 +636,8 @@ app.post('/api/locations/:id/beds/:bedNumber/allocate', async (req, res) => {
 
     // Insert allocation
     const q = `
-      INSERT INTO allocations(location_id, bed_number, name, phone, gender, start_date, end_date, aadhar_number)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      INSERT INTO allocations(location_id, bed_number, name, phone, gender, start_date, end_date, aadhar_number, person_photo_key, aadhaar_photo_key)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
       RETURNING id
     `;
     await execQuery(q, [
@@ -643,6 +649,8 @@ app.post('/api/locations/:id/beds/:bedNumber/allocate', async (req, res) => {
       startDate,
       endDate,
       aadharNumber || null,
+      personPhotoKey,
+      aadhaarPhotoKey
     ]);
     res.json({ ok: true });
   } catch (e) {
@@ -1458,6 +1466,67 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
   }
 });
 
+// GET /api/allocations/by-phone/:phone - Search allocations by phone number (MUST be before query-based route)
+app.get('/api/allocations/by-phone/:phone', async (req, res) => {
+  console.log('HIT: /api/allocations/by-phone/:phone with phone =', req.params.phone);
+  try {
+    const user = getUserFromRequest(req);
+    if (!user) return res.status(401).json({ error: 'unauthorized' });
+
+    const { phone } = req.params;
+
+    const result = await execQuery(`
+      SELECT 
+        a.id,
+        a.location_id,
+        a.tent_id,
+        a.block_id,
+        a.tent_index,
+        a.block_index,
+        a.bed_number,
+        a.name,
+        a.phone,
+        a.aadhar_number,
+        a.gender,
+        TO_CHAR(a.start_date, 'YYYY-MM-DD') as start_date,
+        TO_CHAR(a.end_date, 'YYYY-MM-DD') as end_date,
+        a.status,
+        a.person_photo_key,
+        a.aadhaar_photo_key,
+        TO_CHAR(a.created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at,
+        l.name as location_name
+      FROM allocations a
+      JOIN locations l ON l.id = a.location_id
+      WHERE a.phone = $1 
+        AND a.deleted_at IS NULL
+      ORDER BY a.created_at DESC
+    `, [phone]);
+
+    // Generate pre-signed URLs for photos
+    const allocations = await Promise.all(
+      result.rows.map(async (row) => {
+        const personPhotoUrl = row.person_photo_key 
+          ? await generateViewUrl(row.person_photo_key) 
+          : null;
+        const aadhaarPhotoUrl = row.aadhaar_photo_key 
+          ? await generateViewUrl(row.aadhaar_photo_key) 
+          : null;
+
+        return {
+          ...row,
+          personPhotoUrl,
+          aadhaarPhotoUrl
+        };
+      })
+    );
+
+    res.json(allocations);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'search_failed' });
+  }
+});
+
 // GET /api/allocations/by-phone?phone=...
 app.get('/api/allocations/by-phone', async (req, res) => {
   try {
@@ -1712,7 +1781,131 @@ app.post('/api/allocations/cleanup-expired', async (req, res) => {
     res.json({ ok: true, cleaned: result.rowCount });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'cleanup_failed' });
+    res.status(500).json({ error: 'cleanup_expired_failed' });
+  }
+});
+
+// POST /api/upload-url - Generate pre-signed URL for photo upload
+app.post('/api/upload-url', async (req, res) => {
+  console.log('POST /api/upload-url - Request body:', req.body);
+  try {
+    const user = getUserFromRequest(req);
+    console.log('User:', user ? user.username : 'null');
+    if (!user) return res.status(401).json({ error: 'unauthorized' });
+
+    const { photoType, locationId, tentIndex, blockIndex } = req.body;
+    console.log('Extracted params:', { photoType, locationId, tentIndex, blockIndex });
+    
+    if (!photoType || !locationId) {
+      console.log('Missing required fields');
+      return res.status(400).json({ error: 'missing_required_fields' });
+    }
+
+    if (photoType !== 'person' && photoType !== 'aadhaar') {
+      console.log('Invalid photo type:', photoType);
+      return res.status(400).json({ error: 'invalid_photo_type' });
+    }
+
+    console.log('Generating upload URL...');
+    const { uploadUrl, key } = await generateUploadUrl(
+      photoType,
+      Number(locationId),
+      Number(tentIndex || 0),
+      Number(blockIndex || 0)
+    );
+
+    console.log('Upload URL generated successfully. Key:', key);
+    res.json({ uploadUrl, key });
+  } catch (e) {
+    console.error('Error in /api/upload-url:', e);
+    res.status(500).json({ error: 'generate_upload_url_failed' });
+  }
+});
+
+// PATCH /api/allocations/:id - Update allocation
+app.patch('/api/allocations/:id', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user) return res.status(401).json({ error: 'unauthorized' });
+
+    const { id } = req.params;
+    const { name, phone, aadharNumber, gender, startDate, endDate, personPhotoKey, aadhaarPhotoKey } = req.body;
+
+    // Validate allocation exists and is not deleted
+    const existing = await execQuery(
+      'SELECT * FROM allocations WHERE id = $1 AND deleted_at IS NULL',
+      [id]
+    );
+
+    if (existing.rowCount === 0) {
+      return res.status(404).json({ error: 'allocation_not_found' });
+    }
+
+    const current = existing.rows[0];
+
+    // Build update query dynamically based on provided fields
+    const updates = [];
+    const values = [];
+    let paramIndex = 1;
+
+    if (name !== undefined) {
+      updates.push(`name = $${paramIndex++}`);
+      values.push(name);
+    }
+    if (phone !== undefined) {
+      updates.push(`phone = $${paramIndex++}`);
+      values.push(phone);
+    }
+    if (aadharNumber !== undefined) {
+      updates.push(`aadhar_number = $${paramIndex++}`);
+      values.push(aadharNumber || null);
+    }
+    if (gender !== undefined) {
+      updates.push(`gender = $${paramIndex++}`);
+      values.push(gender);
+    }
+    if (startDate !== undefined) {
+      updates.push(`start_date = $${paramIndex++}`);
+      values.push(startDate);
+    }
+    if (endDate !== undefined) {
+      updates.push(`end_date = $${paramIndex++}`);
+      values.push(endDate);
+    }
+    if (personPhotoKey !== undefined) {
+      updates.push(`person_photo_key = $${paramIndex++}`);
+      values.push(personPhotoKey);
+    }
+    if (aadhaarPhotoKey !== undefined) {
+      updates.push(`aadhaar_photo_key = $${paramIndex++}`);
+      values.push(aadhaarPhotoKey);
+    }
+
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'no_fields_to_update' });
+    }
+
+    updates.push(`updated_at = NOW()`);
+    values.push(id);
+
+    const query = `
+      UPDATE allocations 
+      SET ${updates.join(', ')}
+      WHERE id = $${paramIndex}
+      RETURNING *
+    `;
+
+    const result = await execQuery(query, values);
+
+    await logAudit(req, 'update', 'allocation', id, { 
+      updated_fields: Object.keys(req.body),
+      bed_number: current.bed_number 
+    });
+
+    res.json({ ok: true, allocation: result.rows[0] });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'update_failed' });
   }
 });
 
@@ -1726,9 +1919,14 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
     
     const blockId = await validateBedWithinBlock(locationId, tentIndex, blockIndex, bedNumber);
 
-    const { name, phone, gender, startDate, endDate, aadharNumber } = req.body || {};
+    const { name, phone, gender, startDate, endDate, aadharNumber, personPhotoKey, aadhaarPhotoKey } = req.body || {};
     if (!name || !startDate || !endDate) {
       return res.status(400).json({ error: 'missing_required_fields' });
+    }
+
+    // Validate photos are provided
+    if (!personPhotoKey || !aadhaarPhotoKey) {
+      return res.status(400).json({ error: 'photos_required', message: 'Both person and Aadhaar photos are required' });
     }
 
     // Validate date range
@@ -1790,11 +1988,11 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
     }
 
     const q = `
-      INSERT INTO allocations(location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date, aadhar_number)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      INSERT INTO allocations(location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date, aadhar_number, person_photo_key, aadhaar_photo_key)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
       RETURNING id
     `;
-    const result = await execQuery(q, [
+    const insertResult = await execQuery(q, [
       locationId,
       tentId,
       blockId,
@@ -1807,10 +2005,46 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       startDate,
       endDate,
       aadharNumber || null,
+      personPhotoKey,
+      aadhaarPhotoKey
     ]);
-    const allocationId = result.rows[0]?.id;
+    const allocationId = insertResult.rows[0]?.id;
     await logAudit(req, 'allocate', 'allocation', allocationId, { locationId, tentIndex, blockIndex, bedNumber, name, phone, gender: normalizedGender, startDate, endDate });
-    res.json({ ok: true });
+    
+    // Fetch the complete allocation with photo URLs
+    const allocQ = `
+      SELECT id, name, phone, gender,
+             TO_CHAR(start_date, 'YYYY-MM-DD') as start_date,
+             TO_CHAR(end_date, 'YYYY-MM-DD') as end_date,
+             aadhar_number, person_photo_key, aadhaar_photo_key, status
+      FROM allocations
+      WHERE id = $1
+    `;
+    const allocRes = await execQuery(allocQ, [allocationId]);
+    const allocation = allocRes.rows[0];
+
+    // Transform to camelCase and generate photo URLs
+    const result = {
+      id: allocation.id,
+      name: allocation.name,
+      phone: allocation.phone,
+      gender: allocation.gender,
+      startDate: allocation.start_date,
+      endDate: allocation.end_date,
+      aadharNumber: allocation.aadhar_number,
+      status: allocation.status
+    };
+
+    if (allocation.person_photo_key) {
+      result.personPhotoKey = allocation.person_photo_key;
+      result.personPhotoUrl = await generateViewUrl(allocation.person_photo_key);
+    }
+    if (allocation.aadhaar_photo_key) {
+      result.aadhaarPhotoKey = allocation.aadhaar_photo_key;
+      result.aadhaarPhotoUrl = await generateViewUrl(allocation.aadhaar_photo_key);
+    }
+
+    res.json(result);
   } catch (e) {
     console.error('[ALLOCATE-BLOCK ERROR]', {
       error: e.message,
@@ -2104,13 +2338,71 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
       ]);
       const newAllocationId = insertResult.rows[0].id;
 
+      // Copy photo keys from old allocation to new one
+      if (req.body.personPhotoKey || req.body.aadhaarPhotoKey) {
+        const updatePhotoQ = `
+          UPDATE allocations
+          SET person_photo_key = COALESCE($1, person_photo_key),
+              aadhaar_photo_key = COALESCE($2, aadhaar_photo_key)
+          WHERE id = $3
+        `;
+        await execQuery(updatePhotoQ, [
+          req.body.personPhotoKey || null,
+          req.body.aadhaarPhotoKey || null,
+          newAllocationId
+        ]);
+      } else {
+        // Copy from old allocation
+        const copyPhotoQ = `
+          UPDATE allocations a
+          SET person_photo_key = old.person_photo_key,
+              aadhaar_photo_key = old.aadhaar_photo_key
+          FROM allocations old
+          WHERE a.id = $1 AND old.id = $2
+        `;
+        await execQuery(copyPhotoQ, [newAllocationId, current.id]);
+      }
+
       await execQuery('COMMIT');
       await logAudit(req, 'edit_allocation', 'allocation', newAllocationId, { 
         locationId, tentIndex, blockIndex, bedNumber, 
         oldAllocationId: current.id,
         changes: { name, phone, gender, startDate, endDate }
       });
-      res.json({ ok: true });
+
+      // Fetch the complete updated allocation with photo URLs
+      const updatedQ = `
+        SELECT id, name, phone, gender,
+               TO_CHAR(start_date, 'YYYY-MM-DD') as start_date,
+               TO_CHAR(end_date, 'YYYY-MM-DD') as end_date,
+               person_photo_key, aadhaar_photo_key, status
+        FROM allocations
+        WHERE id = $1
+      `;
+      const updatedRes = await execQuery(updatedQ, [newAllocationId]);
+      const updatedAllocation = updatedRes.rows[0];
+
+      // Transform to camelCase and generate photo URLs if keys exist
+      const result = {
+        id: updatedAllocation.id,
+        name: updatedAllocation.name,
+        phone: updatedAllocation.phone,
+        gender: updatedAllocation.gender,
+        startDate: updatedAllocation.start_date,
+        endDate: updatedAllocation.end_date,
+        status: updatedAllocation.status
+      };
+
+      if (updatedAllocation.person_photo_key) {
+        result.personPhotoKey = updatedAllocation.person_photo_key;
+        result.personPhotoUrl = await generateViewUrl(updatedAllocation.person_photo_key);
+      }
+      if (updatedAllocation.aadhaar_photo_key) {
+        result.aadhaarPhotoKey = updatedAllocation.aadhaar_photo_key;
+        result.aadhaarPhotoUrl = await generateViewUrl(updatedAllocation.aadhaar_photo_key);
+      }
+
+      res.json(result);
     } catch (e) {
       await execQuery('ROLLBACK');
       throw e;
@@ -2120,10 +2412,10 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
       error: e.message,
       code: e.code,
       detail: e.detail,
-      bedNumber,
-      locationId,
-      tentIndex,
-      blockIndex,
+      bedNumber: req.params.bedNumber,
+      locationId: req.params.id,
+      tentIndex: req.params.tent,
+      blockIndex: req.params.block,
       timestamp: new Date().toISOString()
     });
     if (e.code === '23P01') {
