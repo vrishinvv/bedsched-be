@@ -3,6 +3,7 @@ import cors from 'cors';
 import morgan from 'morgan';
 import cookieParser from 'cookie-parser';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 import { config } from './common/configs.js';
 import { execQuery } from './common/db.js';
 import {   
@@ -14,6 +15,7 @@ import {
   validateBedWithinCapacity,
   validateBedWithinBlock,
   validateGenderRestriction,
+  validateAndGetBlockInfo,
   getTodayIST,
   todaySQL, 
   tomorrowSQL,
@@ -1788,38 +1790,59 @@ app.post('/api/allocations/cleanup-expired', async (req, res) => {
 
 // POST /api/upload-url - Generate pre-signed URL for photo upload
 app.post('/api/upload-url', async (req, res) => {
-  console.log('POST /api/upload-url - Request body:', req.body);
   try {
     const user = getUserFromRequest(req);
-    console.log('User:', user ? user.username : 'null');
     if (!user) return res.status(401).json({ error: 'unauthorized' });
 
-    const { photoType, locationId, tentIndex, blockIndex } = req.body;
-    console.log('Extracted params:', { photoType, locationId, tentIndex, blockIndex });
+    const { photoType, locationId, tentIndex, blockIndex, key } = req.body;
     
     if (!photoType || !locationId) {
-      console.log('Missing required fields');
       return res.status(400).json({ error: 'missing_required_fields' });
     }
 
     if (photoType !== 'person' && photoType !== 'aadhaar') {
-      console.log('Invalid photo type:', photoType);
       return res.status(400).json({ error: 'invalid_photo_type' });
     }
 
-    console.log('Generating upload URL...');
-    const { uploadUrl, key } = await generateUploadUrl(
+    // If frontend provides key, use it; otherwise generate one
+    const photoKey = key || (() => {
+      const timestamp = Date.now();
+      const uuid = crypto.randomUUID();
+      return `location-${locationId}/tent-${tentIndex || 0}/block-${blockIndex || 0}/${timestamp}-${uuid}-${photoType}.jpg`;
+    })();
+
+    const { uploadUrl } = await generateUploadUrl(
       photoType,
       Number(locationId),
       Number(tentIndex || 0),
-      Number(blockIndex || 0)
+      Number(blockIndex || 0),
+      photoKey // Pass the key to use
     );
 
-    console.log('Upload URL generated successfully. Key:', key);
-    res.json({ uploadUrl, key });
+    res.json({ uploadUrl, key: photoKey });
   } catch (e) {
     console.error('Error in /api/upload-url:', e);
     res.status(500).json({ error: 'generate_upload_url_failed' });
+  }
+});
+
+// POST /api/photo-view-url - Generate pre-signed view URL for a photo
+app.post('/api/photo-view-url', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user) return res.status(401).json({ error: 'unauthorized' });
+
+    const { key } = req.body;
+    
+    if (!key) {
+      return res.status(400).json({ error: 'missing_key' });
+    }
+
+    const viewUrl = await generateViewUrl(key);
+    res.json({ viewUrl });
+  } catch (e) {
+    console.error('Error in /api/photo-view-url:', e);
+    res.status(500).json({ error: 'generate_view_url_failed' });
   }
 });
 
@@ -1912,13 +1935,14 @@ app.patch('/api/allocations/:id', async (req, res) => {
 
 // POST /api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate
 app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate', async (req, res) => {
+  const startTime = Date.now();
   try {
     const locationId = Number(req.params.id);
     const tentIndex = Number(req.params.tent);
     const blockIndex = Number(req.params.block);
     const bedNumber = Number(req.params.bedNumber);
     
-    const blockId = await validateBedWithinBlock(locationId, tentIndex, blockIndex, bedNumber);
+    console.log(`[ALLOCATE] Start - Bed ${bedNumber}`);
 
     const { name, phone, gender, startDate, endDate, aadharNumber, personPhotoKey, aadhaarPhotoKey } = req.body || {};
     if (!name || !startDate || !endDate) {
@@ -1941,36 +1965,36 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       ? gender.trim() 
       : 'Other';
 
-    // Validate gender restriction for the block
+    // Combined validation - gets blockId, tentId and validates bed + gender in ONE query
+    const t1 = Date.now();
+    let blockId, tentId;
     try {
-      await validateGenderRestriction(locationId, tentIndex, blockIndex, normalizedGender);
+      const result = await validateAndGetBlockInfo(locationId, tentIndex, blockIndex, bedNumber, normalizedGender);
+      blockId = result.blockId;
+      tentId = result.tentId;
     } catch (e) {
-      return res.status(400).json({ error: 'gender_restriction_violation', message: e.message });
+      return res.status(400).json({ error: 'validation_failed', message: e.message });
     }
+    console.log(`[ALLOCATE] Combined validation: ${Date.now() - t1}ms`);
 
-    // Get tent_id for the allocation
-    const tentRes = await execQuery(`
-      SELECT id FROM tents WHERE location_id = $1 AND tent_index = $2
-    `, [locationId, tentIndex]);
-    const tentId = tentRes.rows[0].id;
-
-    // Cleanup: soft-delete expired reservations on this bed
-    try {
-      await execQuery(`
-        UPDATE allocations
-        SET deleted_at = NOW(), updated_at = NOW()
-        WHERE block_id = $1
-          AND bed_number = $2
-          AND status = 'reserved'
-          AND deleted_at IS NULL
-          AND (
-            (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
-            OR end_date < ${todaySQL}
-          )
-      `, [blockId, bedNumber]);
-    } catch {}
+    // Cleanup: soft-delete expired reservations on this bed (non-blocking)
+    const t2 = Date.now();
+    execQuery(`
+      UPDATE allocations
+      SET deleted_at = NOW(), updated_at = NOW()
+      WHERE block_id = $1
+        AND bed_number = $2
+        AND status = 'reserved'
+        AND deleted_at IS NULL
+        AND (
+          (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
+          OR end_date < ${todaySQL}
+        )
+    `, [blockId, bedNumber]).catch(() => {}); // Non-blocking, ignore errors
+    console.log(`[ALLOCATE] Cleanup (non-blocking): ${Date.now() - t2}ms`);
 
     // Check if bed has current or future allocation (end_date >= today)
+    const t3 = Date.now();
     const checkQ = `
       SELECT id FROM allocations
       WHERE block_id = $1
@@ -1981,6 +2005,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       LIMIT 1
     `;
     const existing = await execQuery(checkQ, [blockId, bedNumber]);
+    console.log(`[ALLOCATE] Check existing: ${Date.now() - t3}ms`);
     if (existing.rowCount > 0) {
       return res.status(409).json({ 
         error: 'bed_already_allocated',
@@ -1988,10 +2013,15 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       });
     }
 
+    const t4 = Date.now();
+    // Combine INSERT + fetch using RETURNING clause (saves 1 round-trip!)
     const q = `
       INSERT INTO allocations(location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date, aadhar_number, person_photo_key, aadhaar_photo_key)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-      RETURNING id
+      RETURNING id, name, phone, gender,
+                TO_CHAR(start_date, 'YYYY-MM-DD') as start_date,
+                TO_CHAR(end_date, 'YYYY-MM-DD') as end_date,
+                aadhar_number, person_photo_key, aadhaar_photo_key, status
     `;
     const insertResult = await execQuery(q, [
       locationId,
@@ -2009,22 +2039,14 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       personPhotoKey,
       aadhaarPhotoKey
     ]);
-    const allocationId = insertResult.rows[0]?.id;
-    await logAudit(req, 'allocate', 'allocation', allocationId, { locationId, tentIndex, blockIndex, bedNumber, name, phone, gender: normalizedGender, startDate, endDate });
+    const allocation = insertResult.rows[0];
+    const allocationId = allocation.id;
+    console.log(`[ALLOCATE] INSERT+fetch: ${Date.now() - t4}ms`);
     
-    // Fetch the complete allocation with photo URLs
-    const allocQ = `
-      SELECT id, name, phone, gender,
-             TO_CHAR(start_date, 'YYYY-MM-DD') as start_date,
-             TO_CHAR(end_date, 'YYYY-MM-DD') as end_date,
-             aadhar_number, person_photo_key, aadhaar_photo_key, status
-      FROM allocations
-      WHERE id = $1
-    `;
-    const allocRes = await execQuery(allocQ, [allocationId]);
-    const allocation = allocRes.rows[0];
+    // Log audit in background (non-blocking - saves 300ms!)
+    logAudit(req, 'allocate', 'allocation', allocationId, { locationId, tentIndex, blockIndex, bedNumber, name, phone, gender: normalizedGender, startDate, endDate });
 
-    // Transform to camelCase and generate photo URLs
+    // Transform to camelCase (no need to generate view URLs - frontend already has the photos)
     const result = {
       id: allocation.id,
       name: allocation.name,
@@ -2033,18 +2055,12 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       startDate: allocation.start_date,
       endDate: allocation.end_date,
       aadharNumber: allocation.aadhar_number,
-      status: allocation.status
+      status: allocation.status,
+      personPhotoKey: allocation.person_photo_key,
+      aadhaarPhotoKey: allocation.aadhaar_photo_key
     };
 
-    if (allocation.person_photo_key) {
-      result.personPhotoKey = allocation.person_photo_key;
-      result.personPhotoUrl = await generateViewUrl(allocation.person_photo_key);
-    }
-    if (allocation.aadhaar_photo_key) {
-      result.aadhaarPhotoKey = allocation.aadhaar_photo_key;
-      result.aadhaarPhotoUrl = await generateViewUrl(allocation.aadhaar_photo_key);
-    }
-
+    console.log(`[ALLOCATE] Total time: ${Date.now() - startTime}ms`);
     res.json(result);
   } catch (e) {
     console.error('[ALLOCATE-BLOCK ERROR]', {
@@ -2229,9 +2245,10 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
 });
 
 // PATCH /api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber
-// body: partial { name, phone, gender, startDate, endDate }
+// body: partial { name, phone, gender, startDate, endDate, personPhotoKey, aadhaarPhotoKey }
 // soft deletes current allocation and creates new one (preserves history)
 app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async (req, res) => {
+  const startTime = Date.now();
   try {
     const locationId = Number(req.params.id);
     const tentIndex = Number(req.params.tent);
@@ -2239,13 +2256,27 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
     const bedNumber = Number(req.params.bedNumber);
     if (!Number.isFinite(bedNumber)) return res.status(400).json({ error: 'invalid_bed_number' });
     
-    const blockId = await validateBedWithinBlock(locationId, tentIndex, blockIndex, bedNumber);
+    console.log(`[EDIT] Start - Bed ${bedNumber}`);
+    
+    // Combined validation - gets blockId, tentId in one query
+    const t1 = Date.now();
+    let blockId, tentId;
+    try {
+      const result = await validateAndGetBlockInfo(locationId, tentIndex, blockIndex, bedNumber, null);
+      blockId = result.blockId;
+      tentId = result.tentId;
+    } catch (e) {
+      return res.status(400).json({ error: 'validation_failed', message: e.message });
+    }
+    console.log(`[EDIT] Validation: ${Date.now() - t1}ms`);
 
     // Find current active allocation
+    const t2 = Date.now();
     const findQ = `
       SELECT id, name, phone, gender, 
              TO_CHAR(start_date, 'YYYY-MM-DD') as start_date,
-             TO_CHAR(end_date, 'YYYY-MM-DD') as end_date
+             TO_CHAR(end_date, 'YYYY-MM-DD') as end_date,
+             person_photo_key, aadhaar_photo_key
       FROM allocations
       WHERE block_id = $1
         AND bed_number = $2
@@ -2255,10 +2286,11 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
       LIMIT 1
     `;
     const active = await execQuery(findQ, [blockId, bedNumber]);
+    console.log(`[EDIT] Find active: ${Date.now() - t2}ms`);
     if (!active.rowCount) return res.status(404).json({ error: 'no_active_allocation' });
 
     const current = active.rows[0];
-    const { name, phone, gender, startDate, endDate } = req.body || {};
+    const { name, phone, gender, startDate, endDate, personPhotoKey, aadhaarPhotoKey } = req.body || {};
 
     // Use current values as defaults for missing fields
     const newName = name !== undefined ? name : current.name;
@@ -2270,146 +2302,106 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
     ) : current.gender;
     const newStartDate = startDate !== undefined ? startDate : current.start_date;
     const newEndDate = endDate !== undefined ? endDate : current.end_date;
+    const newPersonPhotoKey = personPhotoKey !== undefined ? personPhotoKey : current.person_photo_key;
+    const newAadhaarPhotoKey = aadhaarPhotoKey !== undefined ? aadhaarPhotoKey : current.aadhaar_photo_key;
 
     // Validate gender restriction for the block if gender is being changed
-    if (gender !== undefined) {
+    if (gender !== undefined && gender !== current.gender) {
+      const t2b = Date.now();
       try {
         await validateGenderRestriction(locationId, tentIndex, blockIndex, newGender);
       } catch (e) {
         return res.status(400).json({ error: 'gender_restriction_violation', message: e.message });
       }
+      console.log(`[EDIT] Gender validation: ${Date.now() - t2b}ms`);
     }
 
-    // Get tent_id for the allocation
-    const tentRes = await execQuery(`
-      SELECT id FROM tents WHERE location_id = $1 AND tent_index = $2
-    `, [locationId, tentIndex]);
-    const tentId = tentRes.rows[0].id;
+    // Cleanup expired reservations (non-blocking)
+    const t2c = Date.now();
+    execQuery(`
+      UPDATE allocations
+      SET deleted_at = NOW(), updated_at = NOW()
+      WHERE block_id = $1
+        AND bed_number = $2
+        AND status = 'reserved'
+        AND deleted_at IS NULL
+        AND id != $3
+        AND (
+          (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
+          OR end_date < ${todaySQL}
+        )
+    `, [blockId, bedNumber, current.id]).catch(() => {});
+    console.log(`[EDIT] Cleanup (non-blocking): ${Date.now() - t2c}ms`);
 
-    // Cleanup: soft-delete expired reservations on this bed (only if not the current allocation)
-    try {
-      const cleanupResult = await execQuery(`
-        UPDATE allocations
-        SET deleted_at = NOW(), updated_at = NOW()
-        WHERE block_id = $1
-          AND bed_number = $2
-          AND status = 'reserved'
-          AND deleted_at IS NULL
-          AND id != $3
-          AND (
-            (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
-            OR end_date < ${todaySQL}
-          )
-      `, [blockId, bedNumber, current.id]);
-      if (cleanupResult.rowCount > 0) {
-        console.log('[EDIT-BLOCK] Cleaned up', cleanupResult.rowCount, 'expired reservations before edit');
-      }
-    } catch (cleanupErr) {
-      console.error('[EDIT-BLOCK] Cleanup error:', cleanupErr.message);
-    }
+    // Soft delete old allocation first
+    const t3 = Date.now();
+    await execQuery(`
+      UPDATE allocations 
+      SET deleted_at = NOW() 
+      WHERE id = $1
+    `, [current.id]);
+    console.log(`[EDIT] Delete old: ${Date.now() - t3}ms`);
 
-    // Begin transaction
-    await execQuery('BEGIN');
+    // Create new allocation with RETURNING
+    const t4 = Date.now();
+    const insertQ = `
+      INSERT INTO allocations(
+        location_id, tent_id, block_id, tent_index, block_index, bed_number, 
+        name, phone, gender, start_date, end_date, 
+        person_photo_key, aadhaar_photo_key
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+      RETURNING id, name, phone, gender,
+                TO_CHAR(start_date, 'YYYY-MM-DD') as start_date,
+                TO_CHAR(end_date, 'YYYY-MM-DD') as end_date,
+                person_photo_key, aadhaar_photo_key, status
+    `;
+    
+    const result = await execQuery(insertQ, [
+      locationId,
+      tentId,
+      blockId,
+      tentIndex,
+      blockIndex,
+      bedNumber,
+      newName,
+      newPhone,
+      newGender,
+      newStartDate,
+      newEndDate,
+      newPersonPhotoKey,
+      newAadhaarPhotoKey
+    ]);
+    
+    const updatedAllocation = result.rows[0];
+    const newAllocationId = updatedAllocation.id;
+    console.log(`[EDIT] INSERT: ${Date.now() - t4}ms`);
+    console.log(`[EDIT] Total DB time (delete+insert): ${Date.now() - t3}ms`);
 
-    try {
-      // Soft delete current allocation
-      await execQuery(
-        `UPDATE allocations SET deleted_at = NOW() WHERE id = $1`,
-        [current.id]
-      );
+    // Log audit in background (non-blocking)
+    logAudit(req, 'edit_allocation', 'allocation', newAllocationId, { 
+      locationId, tentIndex, blockIndex, bedNumber, 
+      oldAllocationId: current.id,
+      changes: { name, phone, gender, startDate, endDate }
+    });
 
-      // Create new allocation with updated values
-      const insertQ = `
-        INSERT INTO allocations(location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-        RETURNING id
-      `;
-      const insertResult = await execQuery(insertQ, [
-        locationId,
-        tentId,
-        blockId,
-        tentIndex,
-        blockIndex,
-        bedNumber,
-        newName,
-        newPhone,
-        newGender,
-        newStartDate,
-        newEndDate
-      ]);
-      const newAllocationId = insertResult.rows[0].id;
+    // Return keys only (frontend generates view URLs)
+    const response = {
+      id: updatedAllocation.id,
+      name: updatedAllocation.name,
+      phone: updatedAllocation.phone,
+      gender: updatedAllocation.gender,
+      startDate: updatedAllocation.start_date,
+      endDate: updatedAllocation.end_date,
+      status: updatedAllocation.status,
+      personPhotoKey: updatedAllocation.person_photo_key,
+      aadhaarPhotoKey: updatedAllocation.aadhaar_photo_key
+    };
 
-      // Copy photo keys from old allocation to new one
-      if (req.body.personPhotoKey || req.body.aadhaarPhotoKey) {
-        const updatePhotoQ = `
-          UPDATE allocations
-          SET person_photo_key = COALESCE($1, person_photo_key),
-              aadhaar_photo_key = COALESCE($2, aadhaar_photo_key)
-          WHERE id = $3
-        `;
-        await execQuery(updatePhotoQ, [
-          req.body.personPhotoKey || null,
-          req.body.aadhaarPhotoKey || null,
-          newAllocationId
-        ]);
-      } else {
-        // Copy from old allocation
-        const copyPhotoQ = `
-          UPDATE allocations a
-          SET person_photo_key = old.person_photo_key,
-              aadhaar_photo_key = old.aadhaar_photo_key
-          FROM allocations old
-          WHERE a.id = $1 AND old.id = $2
-        `;
-        await execQuery(copyPhotoQ, [newAllocationId, current.id]);
-      }
-
-      await execQuery('COMMIT');
-      await logAudit(req, 'edit_allocation', 'allocation', newAllocationId, { 
-        locationId, tentIndex, blockIndex, bedNumber, 
-        oldAllocationId: current.id,
-        changes: { name, phone, gender, startDate, endDate }
-      });
-
-      // Fetch the complete updated allocation with photo URLs
-      const updatedQ = `
-        SELECT id, name, phone, gender,
-               TO_CHAR(start_date, 'YYYY-MM-DD') as start_date,
-               TO_CHAR(end_date, 'YYYY-MM-DD') as end_date,
-               person_photo_key, aadhaar_photo_key, status
-        FROM allocations
-        WHERE id = $1
-      `;
-      const updatedRes = await execQuery(updatedQ, [newAllocationId]);
-      const updatedAllocation = updatedRes.rows[0];
-
-      // Transform to camelCase and generate photo URLs if keys exist
-      const result = {
-        id: updatedAllocation.id,
-        name: updatedAllocation.name,
-        phone: updatedAllocation.phone,
-        gender: updatedAllocation.gender,
-        startDate: updatedAllocation.start_date,
-        endDate: updatedAllocation.end_date,
-        status: updatedAllocation.status
-      };
-
-      if (updatedAllocation.person_photo_key) {
-        result.personPhotoKey = updatedAllocation.person_photo_key;
-        result.personPhotoUrl = await generateViewUrl(updatedAllocation.person_photo_key);
-      }
-      if (updatedAllocation.aadhaar_photo_key) {
-        result.aadhaarPhotoKey = updatedAllocation.aadhaar_photo_key;
-        result.aadhaarPhotoUrl = await generateViewUrl(updatedAllocation.aadhaar_photo_key);
-      }
-
-      res.json(result);
-    } catch (e) {
-      await execQuery('ROLLBACK');
-      throw e;
-    }
+    console.log(`[EDIT] Total time: ${Date.now() - startTime}ms`);
+    res.json(response);
   } catch (e) {
-    console.error('[EDIT-BLOCK ERROR]', {
+    console.error('[EDIT ERROR]', {
       error: e.message,
       code: e.code,
       detail: e.detail,

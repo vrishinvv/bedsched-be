@@ -20,18 +20,22 @@ const BUCKET_NAME = config.s3BucketName;
  * @param {number} locationId - Location ID
  * @param {number} tentIndex - Tent index
  * @param {number} blockIndex - Block index
+ * @param {string} key - Optional pre-generated key (if not provided, generates one)
  * @returns {Promise<{uploadUrl: string, key: string}>}
  */
-export async function generateUploadUrl(photoType, locationId, tentIndex, blockIndex) {
-  const timestamp = Date.now();
-  const uuid = crypto.randomUUID();
-  const key = `location-${locationId}/tent-${tentIndex}/block-${blockIndex}/${timestamp}-${uuid}-${photoType}.jpg`;
+export async function generateUploadUrl(photoType, locationId, tentIndex, blockIndex, key = null) {
+  // Use provided key or generate new one
+  const photoKey = key || (() => {
+    const timestamp = Date.now();
+    const uuid = crypto.randomUUID();
+    return `location-${locationId}/tent-${tentIndex}/block-${blockIndex}/${timestamp}-${uuid}-${photoType}.jpg`;
+  })();
 
   const command = new PutObjectCommand({
     Bucket: BUCKET_NAME,
-    Key: key,
+    Key: photoKey,
     ContentType: 'image/jpeg',
-    ACL: 'private',
+    // Removed ACL: 'private' - bucket has ACLs disabled (newer S3 default)
   });
 
   // URL valid for 5 minutes
@@ -40,7 +44,7 @@ export async function generateUploadUrl(photoType, locationId, tentIndex, blockI
     signableHeaders: new Set(['host', 'content-type']),
   });
 
-  return { uploadUrl, key };
+  return { uploadUrl, key: photoKey };
 }
 
 /**

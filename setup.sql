@@ -72,13 +72,16 @@ CREATE TABLE IF NOT EXISTS allocations (
 CREATE INDEX IF NOT EXISTS idx_tents_location ON tents(location_id);
 CREATE INDEX IF NOT EXISTS idx_blocks_tent ON blocks(tent_id);
 CREATE INDEX IF NOT EXISTS idx_blocks_location ON blocks(location_id);
+CREATE INDEX IF NOT EXISTS idx_blocks_location_tent_block ON blocks(location_id, tent_index, block_index); -- Combined lookup
 CREATE INDEX IF NOT EXISTS idx_allocations_location ON allocations(location_id);
 CREATE INDEX IF NOT EXISTS idx_allocations_tent ON allocations(tent_id);
 CREATE INDEX IF NOT EXISTS idx_allocations_block ON allocations(block_id);
+CREATE INDEX IF NOT EXISTS idx_allocations_block_bed ON allocations(block_id, bed_number, deleted_at, end_date); -- Fast lookup for allocation checks
 CREATE INDEX IF NOT EXISTS idx_allocations_end_date ON allocations(end_date);
 CREATE INDEX IF NOT EXISTS idx_allocations_status_expiry ON allocations(status, reserved_expires_at);
 CREATE INDEX IF NOT EXISTS idx_allocations_batch_id ON allocations(batch_id);
 CREATE INDEX IF NOT EXISTS idx_allocations_phone ON allocations(phone);
+CREATE INDEX IF NOT EXISTS idx_tents_location_index ON tents(location_id, tent_index); -- Fast tent lookup
 
 -- Users (simple auth)
 CREATE TABLE IF NOT EXISTS users (

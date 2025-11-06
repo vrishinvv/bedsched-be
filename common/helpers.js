@@ -438,3 +438,30 @@ export async function validateGenderRestriction(locationId, tentIndex, blockInde
   // 'both' restriction allows any gender
   return true;
 }
+
+// Combined validation function - does everything in ONE query
+export async function validateAndGetBlockInfo(locationId, tentIndex, blockIndex, bedNumber, guestGender) {
+  const result = await execQuery(`
+    SELECT b.id as block_id, b.size, b.gender_restriction, t.id as tent_id
+    FROM blocks b
+    JOIN tents t ON t.id = b.tent_id
+    WHERE t.location_id = $1 AND t.tent_index = $2 AND b.block_index = $3
+  `, [locationId, tentIndex, blockIndex]);
+  
+  if (!result.rowCount) throw new Error('Block not found');
+  const { block_id, size, gender_restriction, tent_id } = result.rows[0];
+  
+  // Validate bed number
+  if (bedNumber < 1 || bedNumber > size) throw new Error('Bed out of range');
+  
+  // Validate gender restriction
+  const normalizedGuestGender = guestGender?.toLowerCase();
+  if (gender_restriction === 'male_only' && normalizedGuestGender !== 'male') {
+    throw new Error('This tent is restricted to male guests only');
+  }
+  if (gender_restriction === 'female_only' && normalizedGuestGender !== 'female') {
+    throw new Error('This tent is restricted to female guests only');
+  }
+  
+  return { blockId: block_id, tentId: tent_id };
+}
