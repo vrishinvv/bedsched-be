@@ -135,6 +135,7 @@ app.post('/api/auth/login', async (req, res) => {
       sameSite: config.nodeEnv === 'production' ? 'none' : 'lax', // 'none' allows cross-site cookies
       secure: config.nodeEnv === 'production', // required when sameSite=none
       path: '/',
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     };
     res.cookie('bs_user', u.username, cookieOptions);
     res.cookie('bs_role', u.role, cookieOptions);
