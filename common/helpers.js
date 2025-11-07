@@ -179,6 +179,7 @@ export async function getLocationTents(locationId) {
     SELECT 
       t.id,
       t.tent_index,
+      t.name,
       t.size,
       COALESCE(a.allocated, 0) AS allocated,
       COALESCE(a.freeing_tomorrow, 0) AS freeing_tomorrow,
@@ -211,6 +212,7 @@ export async function getLocationTents(locationId) {
     },
     tents: tentsRes.rows.map(t => ({
       index: Number(t.tent_index),
+      name: t.name,
       size: Number(t.size),
       allocated: Number(t.allocated),
       freeingTomorrow: Number(t.freeing_tomorrow),
@@ -238,7 +240,7 @@ export async function getTentBlocks(locationId, tentIndex) {
 
   // Get location and tent info
   const tentRes = await execQuery(`
-    SELECT t.id, t.tent_index, t.size, l.name as location_name
+    SELECT t.id, t.tent_index, t.name, t.size, l.name as location_name
     FROM tents t
     JOIN locations l ON l.id = t.location_id
     WHERE t.location_id = $1 AND t.tent_index = $2
@@ -252,6 +254,7 @@ export async function getTentBlocks(locationId, tentIndex) {
     SELECT 
       b.id,
       b.block_index,
+      b.name,
       b.size,
       b.gender_restriction,
       COALESCE(a.allocated, 0) AS allocated,
@@ -284,10 +287,12 @@ export async function getTentBlocks(locationId, tentIndex) {
     },
     tent: {
       index: Number(tent.tent_index),
+      name: tent.name,
       size: Number(tent.size)
     },
     blocks: blocksRes.rows.map(b => ({
       index: Number(b.block_index),
+      name: b.name,
       size: Number(b.size),
       genderRestriction: b.gender_restriction,
       allocated: Number(b.allocated),
@@ -316,7 +321,7 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
 
   // Get block info
   const blockRes = await execQuery(`
-    SELECT b.id, b.block_index, b.size, b.gender_restriction, t.tent_index, l.name as location_name
+    SELECT b.id, b.block_index, b.name, b.size, b.gender_restriction, t.tent_index, t.name as tent_name, l.name as location_name
     FROM blocks b
     JOIN tents t ON t.id = b.tent_id
     JOIN locations l ON l.id = t.location_id
@@ -335,7 +340,7 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
       bed_number, 
       name, 
       phone, 
-      aadhar_number,
+      emergency_phone,
       gender, 
       TO_CHAR(start_date, 'YYYY-MM-DD') as start_date_str,
       TO_CHAR(end_date, 'YYYY-MM-DD') as end_date_str,
@@ -358,7 +363,7 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
     const bedData = {
       name: r.name,
       phone: r.phone,
-      aadharNumber: r.aadhar_number,
+      emergencyPhone: r.emergency_phone,
       gender: r.gender || 'Other',
       startDate: r.start_date_str, // Already formatted as YYYY-MM-DD string from TO_CHAR
       endDate: r.end_date_str,     // Already formatted as YYYY-MM-DD string from TO_CHAR
@@ -386,10 +391,12 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
         name: block.location_name
       },
       tent: {
-        index: Number(block.tent_index)
+        index: Number(block.tent_index),
+        name: block.tent_name
       },
       block: {
         index: Number(block.block_index),
+        name: block.name,
         genderRestriction: block.gender_restriction
       }
     },

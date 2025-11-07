@@ -22,6 +22,7 @@ import {
   nowIST
 } from './common/helpers.js';
 import { generateUploadUrl, generateViewUrl } from './common/s3.js';
+import { initBackupScheduler } from './common/backup.js';
 
 
 const app = express();
@@ -264,247 +265,248 @@ app.get('/api/debug/block-allocations/:blockId', async (req, res) => {
 
 // Seed quick convenience (optional)
 app.post('/api/seed', async (req, res) => {
-  const client = await execQuery('BEGIN'); // Start transaction
-  
   try {
+    // Start transaction
+    await execQuery('BEGIN');
+    
+    console.log('[SEED] Starting database seed...');
+    
     // Clear existing data in reverse dependency order
+    await execQuery('DELETE FROM audit_logs');
     await execQuery('DELETE FROM allocations');
     await execQuery('DELETE FROM blocks');
     await execQuery('DELETE FROM tents');
+    await execQuery('DELETE FROM users');
     await execQuery('DELETE FROM locations');
+    
+    console.log('[SEED] Cleared all existing data');
 
-    // Create locations with your specified names and capacities
+    // Helper function to distribute beds into blocks
+    function createBlocks(tentSize) {
+      const blocks = [];
+      let remaining = tentSize;
+      let blockIndex = 1;
+      
+      while (remaining > 0) {
+        if (remaining < 100) {
+          // Merge small remainder into last block
+          if (blocks.length > 0) {
+            blocks[blocks.length - 1] += remaining;
+          } else {
+            blocks.push(remaining); // Edge case: tiny tent
+          }
+          break;
+        } else if (tentSize < 200) {
+          // Small tent: use 100 beds/block
+          const blockSize = Math.min(100, remaining);
+          blocks.push(blockSize);
+          remaining -= blockSize;
+        } else {
+          // Large tent: use 250 beds/block
+          const blockSize = Math.min(250, remaining);
+          blocks.push(blockSize);
+          remaining -= blockSize;
+        }
+      }
+      
+      return blocks;
+    }
+
+    // Location data with shortcodes for user generation
     const locationData = [
-      { name: 'West Gate North', capacity: 6000 },
-      { name: 'West Gate South', capacity: 5500 },
-      { name: 'Gas Tank', capacity: 2000 },
-      { name: 'Bus Department', capacity: 1500 },
-      { name: 'Electricity Board', capacity: 1500 },
-      { name: 'Deer Park', capacity: 1500 }
+      { name: 'Anand Vilas Enclave', shortcode: 'ave', capacity: 850, tents: 1, gender: 'both', landmark: 'Chaitanya Jothi' },
+      { name: 'Brindavan Enclave', shortcode: 'be', capacity: 2100, tents: 3, gender: 'both', landmark: 'Electricity Board' },
+      { name: 'Sai Sruthi Enclave', shortcode: 'sse', capacity: 1800, tents: 2, gender: 'both', landmark: 'APSRTC Bus Depo' },
+      { name: 'Dharmakshetra Enclave', shortcode: 'de', capacity: 1400, tents: 2, gender: 'both', landmark: 'Sai Hira Hall' },
+      { name: 'Shivam Enclave', shortcode: 'she', capacity: 4000, tents: 4, gender: 'both', landmark: 'West South' },
+      { name: 'Sundaram Enclave', shortcode: 'sue', capacity: 6000, tents: 6, gender: 'both', landmark: 'West North' },
+      { name: 'New Block B Basement', shortcode: 'nbbb', capacity: 650, tents: 1, tentName: 'Basement', blocksPerTent: 7, gender: 'female_only', landmark: 'New Block B Basement' },
+      { name: 'New Block A', shortcode: 'nba', capacity: 950, tents: 1, tentName: 'First Floor', blocksPerTent: 6, gender: 'female_only', landmark: 'New Block A' },
+      { name: 'New Block B', shortcode: 'nbb', capacity: 480, tents: 1, tentName: 'First Floor', blocksPerTent: 3, gender: 'male_only', landmark: 'New Block B' }
     ];
 
-    // Insert all locations in one query
+    console.log('[SEED] Creating locations...');
+    
+    // Batch insert all locations
     const locationValues = locationData.map((_, i) => 
       `($${i * 2 + 1}, $${i * 2 + 2})`
     ).join(', ');
     const locationParams = locationData.flatMap(loc => [loc.name, loc.capacity]);
     
-    await execQuery(`
-      INSERT INTO locations(name, capacity)
-      VALUES ${locationValues};
+    const locResult = await execQuery(`
+      INSERT INTO locations(name, capacity) 
+      VALUES ${locationValues}
+      RETURNING id, name
     `, locationParams);
-
-    // Get all locations
-    const locations = await execQuery(`SELECT id, name, capacity FROM locations ORDER BY id`);
     
-    // Prepare tent data
-    const tentData = [];
-    const blockData = [];
+    // Map results back with original data
+    const locationInserts = locResult.rows.map((row, i) => ({
+      ...locationData[i],
+      id: row.id
+    }));
     
-    for (const loc of locations.rows) {
-      const capacity = Number(loc.capacity);
-      const fullTents = Math.floor(capacity / 2000);
-      const remainder = capacity % 2000;
-      
-      // Create full tents of 2000 seats each
-      for (let tentIndex = 1; tentIndex <= fullTents; tentIndex++) {
-        tentData.push([loc.id, tentIndex, 2000]);
-        
-        // Create blocks for this tent (500 beds per block)
-        const fullBlocks = Math.floor(2000 / 500); // 4 blocks
-        for (let blockIndex = 1; blockIndex <= fullBlocks; blockIndex++) {
-          blockData.push([loc.id, null, tentIndex, blockIndex, 500]); // tent_id will be filled later
-        }
-      }
-      
-      // Create remainder tent if needed
-      if (remainder > 0) {
-        tentData.push([loc.id, fullTents + 1, remainder]);
-        
-        // Create blocks for remainder tent
-        const fullBlocks = Math.floor(remainder / 500);
-        const blockRemainder = remainder % 500;
-        
-        for (let blockIndex = 1; blockIndex <= fullBlocks; blockIndex++) {
-          blockData.push([loc.id, null, fullTents + 1, blockIndex, 500]);
-        }
-        
-        if (blockRemainder > 0) {
-          blockData.push([loc.id, null, fullTents + 1, fullBlocks + 1, blockRemainder]);
-        }
-      }
-    }
+    console.log(`[SEED] Created ${locationInserts.length} locations`);
 
-    // Insert all tents in one query
-    if (tentData.length > 0) {
-      const tentValues = tentData.map((_, i) => 
-        `($${i * 3 + 1}, $${i * 3 + 2}, $${i * 3 + 3})`
-      ).join(', ');
-      const tentParams = tentData.flat();
-      
-      await execQuery(`
-        INSERT INTO tents(location_id, tent_index, size)
-        VALUES ${tentValues};
-      `, tentParams);
-    }
-
-    // Get all tents to get their IDs
-    const tents = await execQuery(`
-      SELECT id, location_id, tent_index, size 
-      FROM tents 
-      ORDER BY location_id, tent_index
-    `);
+    // Create tents and blocks
+    let totalTents = 0;
+    let totalBlocks = 0;
     
-    // Create a map for quick tent lookup
-    const tentMap = {};
-    tents.rows.forEach(tent => {
-      const key = `${tent.location_id}-${tent.tent_index}`;
-      tentMap[key] = tent.id;
-    });
-
-    // Update block data with tent IDs
-    const finalBlockData = blockData.map(block => {
-      const [locationId, _, tentIndex, blockIndex, size] = block;
-      const tentId = tentMap[`${locationId}-${tentIndex}`];
-      return [locationId, tentId, tentIndex, blockIndex, size];
-    });
-
-    // Insert all blocks in one query
-    if (finalBlockData.length > 0) {
-      const blockValues = finalBlockData.map((_, i) => 
-        `($${i * 5 + 1}, $${i * 5 + 2}, $${i * 5 + 3}, $${i * 5 + 4}, $${i * 5 + 5})`
-      ).join(', ');
-      const blockParams = finalBlockData.flat();
+    // Helper to generate tent name
+    const getTentName = (loc, tentIndex, totalTents) => {
+      if (loc.tentName) return loc.tentName; // Specific name provided
+      const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+      return `Tent ${letters[tentIndex - 1]}`;
+    };
+    
+    // Helper to generate block name
+    const getBlockName = (blockIndex) => {
+      const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+      return `Block ${letters[blockIndex - 1]}`;
+    };
+    
+    // Prepare all tent data
+    const allTentData = [];
+    const allBlockData = [];
+    
+    for (const loc of locationInserts) {
+      let remainingCapacity = loc.capacity;
       
-      await execQuery(`
-        INSERT INTO blocks(location_id, tent_id, tent_index, block_index, size)
-        VALUES ${blockValues};
-      `, blockParams);
-    }
-
-    // Optional: set some block-level gender restrictions for demo data
-    // Pattern: block_index 1 => male_only, 2 => female_only, others => both
-    await execQuery(`
-      UPDATE blocks b
-      SET gender_restriction = CASE 
-        WHEN (b.block_index % 3) = 1 THEN 'male_only'
-        WHEN (b.block_index % 3) = 2 THEN 'female_only'
-        ELSE 'both'
-      END
-    `);
-
-    // Get first 15 blocks for sample allocations (include restriction)
-    const blocks = await execQuery(`
-      SELECT b.id as block_id, b.location_id, b.tent_id, t.tent_index, b.block_index, b.size, b.gender_restriction
-      FROM blocks b
-      JOIN tents t ON t.id = b.tent_id
-      ORDER BY b.location_id, t.tent_index, b.block_index
-      LIMIT 15
-    `);
-
-    // Prepare allocation data
-    const allocationData = [];
-    const names = ['Rajesh Kumar', 'Priya Sharma', 'Amit Patel', 'Sunita Devi', 'Vikash Singh', 'Meera Gupta'];
-    const genders = ['Male', 'Female', 'Other']; // Use full words that match the check constraint
-
-    for (const block of blocks.rows) {
-      const bedsToAllocate = Math.floor(block.size * 0.1); // 10% occupancy
-      
-      for (let bedNum = 1; bedNum <= bedsToAllocate; bedNum++) {
-        const name = names[Math.floor(Math.random() * names.length)];
-        // Respect block-level gender restriction when seeding
-        let gender;
-        if (block.gender_restriction === 'male_only') {
-          gender = 'Male';
-        } else if (block.gender_restriction === 'female_only') {
-          gender = 'Female';
+      for (let tentIndex = 1; tentIndex <= loc.tents; tentIndex++) {
+        // Distribute capacity evenly, giving any remainder to the last tent
+        let tentSize;
+        if (tentIndex === loc.tents) {
+          tentSize = remainingCapacity; // Last tent gets all remaining
         } else {
-          gender = genders[Math.floor(Math.random() * genders.length)];
+          tentSize = Math.floor(loc.capacity / loc.tents);
+          remainingCapacity -= tentSize;
         }
         
-        // Random allocation duration (1-5 days starting today in IST)
-        const now = new Date();
-        const istOffset = 5.5 * 60 * 60 * 1000;
-        const istNow = new Date(now.getTime() + istOffset);
-        const startDate = istNow.toISOString().split('T')[0];
-        
-        const endDateObj = new Date(istNow);
-        endDateObj.setDate(istNow.getDate() + Math.floor(Math.random() * 5) + 1);
-        const endDate = endDateObj.toISOString().split('T')[0];
-        
-        allocationData.push([
-          block.location_id,
-          block.tent_id,
-          block.block_id,
-          block.tent_index,
-          block.block_index,
-          bedNum,
-          name,
-          `+91-${Math.floor(Math.random() * 9000000000) + 1000000000}`,
-          gender,
-          startDate,
-          endDate
-        ]);
+        allTentData.push({
+          location_id: loc.id,
+          location_name: loc.name,
+          tent_index: tentIndex,
+          tent_name: getTentName(loc, tentIndex, loc.tents),
+          size: tentSize,
+          gender: loc.gender,
+          blocks_per_tent: loc.blocksPerTent // For special locations
+        });
       }
     }
-
-    // Insert all allocations in one query (confirmed by default)
-    if (allocationData.length > 0) {
-      const allocationValues = allocationData.map((_, i) => 
-        `($${i * 11 + 1}, $${i * 11 + 2}, $${i * 11 + 3}, $${i * 11 + 4}, $${i * 11 + 5}, $${i * 11 + 6}, $${i * 11 + 7}, $${i * 11 + 8}, $${i * 11 + 9}, $${i * 11 + 10}, $${i * 11 + 11})`
+    
+    // Batch insert all tents
+    if (allTentData.length > 0) {
+      const tentValues = allTentData.map((_, i) => 
+        `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${i * 4 + 4})`
       ).join(', ');
-      const allocationParams = allocationData.flat();
+      const tentParams = allTentData.flatMap(t => [t.location_id, t.tent_index, t.tent_name, t.size]);
       
-      await execQuery(`
-        INSERT INTO allocations(location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date)
-        VALUES ${allocationValues};
-      `, allocationParams);
-    }
-
-    // Optional: seed a few reserved rows for demo visibility (expire in ~7 hours)
-    const demoReserved = await execQuery(`
-      SELECT b.location_id, b.tent_id, b.id as block_id, t.tent_index, b.block_index, b.size
-      FROM blocks b JOIN tents t ON t.id = b.tent_id
-      ORDER BY b.location_id, t.tent_index, b.block_index
-      LIMIT 3
-    `);
-    const now = new Date();
-    const istOffset = 5.5 * 60 * 60 * 1000;
-    const istNow = new Date(now.getTime() + istOffset);
-    const todayIST = istNow.toISOString().split('T')[0];
-    const sevenHours = new Date(now.getTime() + (config.reservationTTLHours * 60 * 60 * 1000));
-    for (const br of demoReserved.rows) {
-      // find first available bed in this block
-      const occ = await execQuery(`
-        SELECT bed_number FROM allocations WHERE block_id = $1 AND deleted_at IS NULL AND end_date >= ${todaySQL}
-      `, [br.block_id]);
-      const occupied = new Set(occ.rows.map(r => Number(r.bed_number)));
-      let bed = 1;
-      while (bed <= br.size && occupied.has(bed)) bed++;
-      if (bed <= br.size) {
+      const tentResult = await execQuery(`
+        INSERT INTO tents(location_id, tent_index, name, size) 
+        VALUES ${tentValues}
+        RETURNING id, location_id, tent_index, name, size
+      `, tentParams);
+      
+      totalTents = tentResult.rows.length;
+      
+      // Prepare block data for each tent
+      for (let i = 0; i < tentResult.rows.length; i++) {
+        const tent = tentResult.rows[i];
+        const tentData = allTentData[i];
+        
+        // If blocksPerTent is specified, create exact number of blocks with equal distribution
+        let blockSizes;
+        if (tentData.blocks_per_tent) {
+          const blocksCount = tentData.blocks_per_tent;
+          const baseSize = Math.floor(tent.size / blocksCount);
+          const remainder = tent.size % blocksCount;
+          blockSizes = [];
+          for (let j = 0; j < blocksCount; j++) {
+            // Distribute remainder across first blocks
+            blockSizes.push(baseSize + (j < remainder ? 1 : 0));
+          }
+        } else {
+          // Use default block creation logic
+          blockSizes = createBlocks(tent.size);
+        }
+        
+        for (let blockIndex = 0; blockIndex < blockSizes.length; blockIndex++) {
+          allBlockData.push({
+            location_id: tent.location_id,
+            tent_id: tent.id,
+            tent_index: tent.tent_index,
+            block_index: blockIndex + 1,
+            block_name: getBlockName(blockIndex + 1),
+            size: blockSizes[blockIndex],
+            gender: tentData.gender
+          });
+        }
+      }
+      
+      // Batch insert all blocks
+      if (allBlockData.length > 0) {
+        const blockValues = allBlockData.map((_, i) => 
+          `($${i * 7 + 1}, $${i * 7 + 2}, $${i * 7 + 3}, $${i * 7 + 4}, $${i * 7 + 5}, $${i * 7 + 6}, $${i * 7 + 7})`
+        ).join(', ');
+        const blockParams = allBlockData.flatMap(b => 
+          [b.location_id, b.tent_id, b.tent_index, b.block_index, b.block_name, b.size, b.gender]
+        );
+        
         await execQuery(`
-          INSERT INTO allocations(
-            location_id, tent_id, block_id, tent_index, block_index, bed_number,
-            name, phone, gender, start_date, end_date,
-            status, batch_id, contact_name, is_family, reserved_expires_at
-          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'reserved',$12,$13,$14,$15)
-        `, [
-          br.location_id, br.tent_id, br.block_id, br.tent_index, br.block_index, bed,
-          'Reserved', `+91-${Math.floor(Math.random() * 9000000000) + 1000000000}`, 'Other',
-          todayIST, todayIST,
-          `seed_${Date.now()}`, 'Seed Demo', false, sevenHours
-        ]);
+          INSERT INTO blocks(location_id, tent_id, tent_index, block_index, name, size, gender_restriction)
+          VALUES ${blockValues}
+        `, blockParams);
+        
+        totalBlocks = allBlockData.length;
       }
     }
+    
+    console.log(`[SEED] Created ${totalTents} tents and ${totalBlocks} blocks`);
 
-    // Calculate and return summary
+    // Create 20 users for each location (username = password) - BATCH INSERT
+    console.log('[SEED] Creating location users...');
+    
+    const userValues = [];
+    const userParams = [];
+    let paramIndex = 1;
+    
+    for (const loc of locationInserts) {
+      for (let i = 1; i <= 20; i++) {
+        const username = `${loc.shortcode}_${i}`;
+        const password = username; // username = password
+        
+        userValues.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3})`);
+        userParams.push(username, password, 'location_user', loc.id);
+        paramIndex += 4;
+      }
+      
+      console.log(`[SEED] Prepared 20 users for ${loc.name} (${loc.shortcode}_1 to ${loc.shortcode}_20, password = username)`);
+    }
+    
+    // Batch insert all users at once
+    await execQuery(`
+      INSERT INTO users(username, password, role, location_id) 
+      VALUES ${userValues.join(', ')}
+    `, userParams);
+    
+    console.log(`[SEED] Created ${locationInserts.length * 20} users in batch`);
+
+    // Recreate admin users (they were deleted during seed)
+    await execQuery(`
+      INSERT INTO users(username, password, role)
+      VALUES ('admin', 'admin', 'admin'), ('dashboard', 'dashboard', 'dashboard')
+      ON CONFLICT (username) DO NOTHING
+    `);
+    console.log('[SEED] Recreated admin and dashboard users');
+
+    console.log('[SEED] No dummy allocations created - clean slate ready!');
+
+    // Get summary
     const summary = await execQuery(`
       SELECT 
         l.name,
         l.capacity,
         COUNT(DISTINCT t.id) as tent_count,
-        COUNT(DISTINCT b.id) as block_count,
-        SUM(b.size) as total_beds
+        COUNT(DISTINCT b.id) as block_count
       FROM locations l
       LEFT JOIN tents t ON t.location_id = l.id
       LEFT JOIN blocks b ON b.tent_id = t.id
@@ -512,23 +514,26 @@ app.post('/api/seed', async (req, res) => {
       ORDER BY l.id
     `);
 
-    await execQuery('COMMIT'); // Commit transaction
+    await execQuery('COMMIT');
+    
+    console.log('[SEED] Database seed completed successfully!');
 
-    res.json({ 
-      ok: true, 
-      message: 'Successfully seeded database with hierarchical structure',
-      summary: summary.rows.map(s => ({
-        location: s.name,
-        capacity: Number(s.capacity),
-        tents: Number(s.tent_count),
-        blocks: Number(s.block_count),
-        totalBeds: Number(s.total_beds)
-      }))
+    res.json({
+      success: true,
+      message: 'Database seeded successfully',
+      summary: summary.rows,
+      credentials: locationInserts.flatMap(loc => 
+        Array.from({ length: 20 }, (_, i) => ({
+          location: loc.name,
+          username: `${loc.shortcode}_${i + 1}`,
+          password: `${loc.shortcode}_${i + 1}` // username = password
+        }))
+      )
     });
   } catch (e) {
-    await execQuery('ROLLBACK'); // Rollback on error
-    console.error(e);
-    res.status(500).json({ error: 'seed_failed', details: e.message });
+    await execQuery('ROLLBACK');
+    console.error('[SEED ERROR]', e);
+    res.status(500).json({ error: 'seed_failed', message: e.message });
   }
 });
 
@@ -580,14 +585,14 @@ app.patch('/api/locations/:id', async (req, res) => {
 });
 
 // POST /api/locations/:id/beds/:bedNumber/allocate
-// body: { name, phone, gender, startDate, endDate, aadharNumber, personPhotoKey, aadhaarPhotoKey }
+// body: { name, phone, gender, startDate, endDate, emergencyPhone, personPhotoKey, aadhaarPhotoKey }
 app.post('/api/locations/:id/beds/:bedNumber/allocate', async (req, res) => {
   try {
     const id = Number(req.params.id);
     const bedNumber = Number(req.params.bedNumber);
     await validateBedWithinCapacity(id, bedNumber);
 
-    const { name, phone, gender, startDate, endDate, aadharNumber, personPhotoKey, aadhaarPhotoKey } = req.body || {};
+    const { name, phone, gender, startDate, endDate, emergencyPhone, personPhotoKey, aadhaarPhotoKey } = req.body || {};
     if (!name || !startDate || !endDate) {
       return res.status(400).json({ error: 'missing_required_fields' });
     }
@@ -639,7 +644,7 @@ app.post('/api/locations/:id/beds/:bedNumber/allocate', async (req, res) => {
 
     // Insert allocation
     const q = `
-      INSERT INTO allocations(location_id, bed_number, name, phone, gender, start_date, end_date, aadhar_number, person_photo_key, aadhaar_photo_key)
+      INSERT INTO allocations(location_id, bed_number, name, phone, gender, start_date, end_date, emergency_phone, person_photo_key, aadhaar_photo_key)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
       RETURNING id
     `;
@@ -651,7 +656,7 @@ app.post('/api/locations/:id/beds/:bedNumber/allocate', async (req, res) => {
       normalizedGender,
       startDate,
       endDate,
-      aadharNumber || null,
+      emergencyPhone || null,
       personPhotoKey,
       aadhaarPhotoKey
     ]);
@@ -826,6 +831,8 @@ app.delete('/api/locations/:id/beds/:bedNumber', async (req, res) => {
 
 app.listen(config.port, () => {
   console.log(`API listening on http://localhost:${config.port}`);
+  // Initialize backup scheduler
+  initBackupScheduler();
 });
 
 
@@ -1008,9 +1015,9 @@ async function getAvailableBedsForBlock(blockId, blockSize) {
 }
 
 // POST /api/allocations/smart-reserve
-// body: { phone, contactName?, isFamily, maleCount, femaleCount, startDate, endDate, confirmFallback?, aadharNumber? }
+// body: { phone, contactName?, isFamily, maleCount, femaleCount, startDate, endDate, confirmFallback?, emergencyPhone? }
 app.post('/api/allocations/smart-reserve', async (req, res) => {
-  const { phone, contactName, isFamily, maleCount = 0, femaleCount = 0, startDate, endDate, confirmFallback = false, aadharNumber } = req.body || {};
+  const { phone, contactName, isFamily, maleCount = 0, femaleCount = 0, startDate, endDate, confirmFallback = false, emergencyPhone } = req.body || {};
   
   try {
     if (!phone || typeof isFamily !== 'boolean' || !startDate || !endDate) {
@@ -1393,10 +1400,10 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
 
     await execQuery('BEGIN');
     try {
-      const cols = `location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date, status, batch_id, contact_name, is_family, reserved_expires_at, aadhar_number`;
+      const cols = `location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date, status, batch_id, is_family, reserved_expires_at, emergency_phone`;
       
       // Batch insert to avoid parameter limit (PostgreSQL limit is ~65535 params)
-      const batchSize = 500; // 500 rows * 16 params = 8000 params per batch (safe)
+      const batchSize = 500; // 500 rows * 15 params = 7500 params per batch (safe)
       for (let i = 0; i < finalPlan.items.length; i += batchSize) {
         const chunk = finalPlan.items.slice(i, i + batchSize);
         const values = [];
@@ -1404,11 +1411,11 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
         let p = 1;
         
         for (const item of chunk) {
-          values.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},'reserved',$${p++},$${p++},$${p++},$${p++},$${p++})`);
+          values.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},'reserved',$${p++},$${p++},$${p++},$${p++})`);
           params.push(
             item.locationId, item.tentId, item.blockId, item.tentIndex, item.blockIndex, item.bedNumber,
             contactName || 'Reserved', phone, item.gender, startDate, endDate,
-            batchId, contactName || null, !!isFamily, expiresAt, aadharNumber || null
+            batchId, !!isFamily, expiresAt, emergencyPhone || null
           );
         }
         
@@ -1489,7 +1496,7 @@ app.get('/api/allocations/by-phone/:phone', async (req, res) => {
         a.bed_number,
         a.name,
         a.phone,
-        a.aadhar_number,
+        a.emergency_phone,
         a.gender,
         TO_CHAR(a.start_date, 'YYYY-MM-DD') as start_date,
         TO_CHAR(a.end_date, 'YYYY-MM-DD') as end_date,
@@ -1539,7 +1546,7 @@ app.get('/api/allocations/by-phone', async (req, res) => {
     if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
 
     const rows = await execQuery(`
-      SELECT id, batch_id, status, reserved_expires_at, location_id, tent_index, block_index, bed_number, gender, start_date, end_date
+      SELECT id, batch_id, status, reserved_expires_at, location_id, tent_index, block_index, bed_number, gender, start_date, end_date, emergency_phone
       FROM allocations
       WHERE phone = $1 AND deleted_at IS NULL
       ORDER BY batch_id NULLS LAST, created_at DESC
@@ -1551,7 +1558,7 @@ app.get('/api/allocations/by-phone', async (req, res) => {
       if (!batches[key]) batches[key] = { batchId: r.batch_id || null, items: [], statuses: new Set(), expiresAt: null };
       batches[key].items.push({
         id: Number(r.id), locationId: Number(r.location_id), tentIndex: Number(r.tent_index), blockIndex: Number(r.block_index), bedNumber: Number(r.bed_number),
-        gender: r.gender, status: r.status, startDate: r.start_date, endDate: r.end_date
+        gender: r.gender, status: r.status, startDate: r.start_date, endDate: r.end_date, emergencyPhone: r.emergency_phone
       });
       batches[key].statuses.add(r.status);
       if (r.status === 'reserved' && r.reserved_expires_at && (!batches[key].expiresAt || batches[key].expiresAt < r.reserved_expires_at)) {
@@ -1599,25 +1606,57 @@ app.patch('/api/allocations/by-phone/update-phone', async (req, res) => {
   }
 });
 
-// PATCH /api/allocations/by-phone/update-contact
-// body: { phone, contactName, batchId? }
-app.patch('/api/allocations/by-phone/update-contact', async (req, res) => {
+// PATCH /api/allocations/by-phone/update-name
+// body: { phone, name, batchId?, allocationIds? }
+app.patch('/api/allocations/by-phone/update-name', async (req, res) => {
   try {
     const user = getUserFromRequest(req);
     if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
-    const { phone, contactName, batchId } = req.body || {};
+    const { phone, name, batchId, allocationIds } = req.body || {};
     if (!phone) return res.status(400).json({ error: 'missing_phone' });
 
-    const params = [contactName || null, phone];
-    let q = `UPDATE allocations SET contact_name = $1, updated_at = NOW() WHERE phone = $2 AND deleted_at IS NULL`;
+    const params = [name || null, phone];
+    let q = `UPDATE allocations SET name = $1, updated_at = NOW() WHERE phone = $2 AND deleted_at IS NULL`;
     if (batchId) { q += ` AND batch_id = $3`; params.push(batchId); }
+    if (Array.isArray(allocationIds) && allocationIds.length) {
+      const placeholders = allocationIds.map((_, i) => `$${params.length + i + 1}`).join(',');
+      q += ` AND id IN (${placeholders})`;
+      params.push(...allocationIds);
+    }
 
     const r = await execQuery(q, params);
-    await logAudit(req, 'update_contact', 'allocation', null, { phone, contactName, batchId, updated: r.rowCount });
+    await logAudit(req, 'update_name', 'allocation', null, { phone, name, batchId, allocationIds, updated: r.rowCount });
     res.json({ ok: true, updated: r.rowCount });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'update_contact_failed' });
+    res.status(500).json({ error: 'update_name_failed' });
+  }
+});
+
+// PATCH /api/allocations/by-phone/update-emergency-phone
+// body: { phone, emergencyPhone, batchId?, allocationIds? }
+app.patch('/api/allocations/by-phone/update-emergency-phone', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
+    const { phone, emergencyPhone, batchId, allocationIds } = req.body || {};
+    if (!phone) return res.status(400).json({ error: 'missing_phone' });
+
+    const params = [emergencyPhone || null, phone];
+    let q = `UPDATE allocations SET emergency_phone = $1, updated_at = NOW() WHERE phone = $2 AND deleted_at IS NULL`;
+    if (batchId) { q += ` AND batch_id = $3`; params.push(batchId); }
+    if (Array.isArray(allocationIds) && allocationIds.length) {
+      const placeholders = allocationIds.map((_, i) => `$${params.length + i + 1}`).join(',');
+      q += ` AND id IN (${placeholders})`;
+      params.push(...allocationIds);
+    }
+
+    const r = await execQuery(q, params);
+    await logAudit(req, 'update_emergency_phone', 'allocation', null, { phone, emergencyPhone, batchId, allocationIds, updated: r.rowCount });
+    res.json({ ok: true, updated: r.rowCount });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'update_emergency_phone_failed' });
   }
 });
 
@@ -1682,9 +1721,13 @@ app.get('/api/allocations/departures', async (req, res) => {
     if (!date) return res.status(400).json({ error: 'missing_date' });
 
     const rows = await execQuery(`
-      SELECT a.id, a.phone, a.contact_name, a.location_id, l.name as location_name, a.tent_index, a.block_index, a.bed_number, a.gender, a.status, a.start_date, a.end_date
+      SELECT a.id, a.phone, a.name, a.location_id, l.name as location_name, 
+             a.tent_index, t.name as tent_name, a.block_index, b.name as block_name, 
+             a.bed_number, a.gender, a.status, a.start_date, a.end_date
       FROM allocations a
       LEFT JOIN locations l ON a.location_id = l.id
+      LEFT JOIN tents t ON a.location_id = t.location_id AND a.tent_index = t.tent_index
+      LEFT JOIN blocks b ON t.id = b.tent_id AND a.block_index = b.block_index
       WHERE a.deleted_at IS NULL AND a.end_date = $1
       ORDER BY a.location_id, a.tent_index, a.block_index, a.bed_number
     `, [date]);
@@ -1696,13 +1739,188 @@ app.get('/api/allocations/departures', async (req, res) => {
   }
 });
 
+// GET /api/allocations/currently-occupied
+app.get('/api/allocations/currently-occupied', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
+
+    const rows = await execQuery(`
+      SELECT a.id, a.phone, a.name, a.location_id, l.name as location_name, 
+             a.tent_index, t.name as tent_name, a.block_index, b.name as block_name, 
+             a.bed_number, a.gender, a.status, a.start_date, a.end_date
+      FROM allocations a
+      LEFT JOIN locations l ON a.location_id = l.id
+      LEFT JOIN tents t ON a.location_id = t.location_id AND a.tent_index = t.tent_index
+      LEFT JOIN blocks b ON t.id = b.tent_id AND a.block_index = b.block_index
+      WHERE a.deleted_at IS NULL 
+        AND a.status = 'confirmed'
+        AND a.start_date <= CURRENT_DATE 
+        AND a.end_date >= CURRENT_DATE
+      ORDER BY a.location_id, a.tent_index, a.block_index, a.bed_number
+    `);
+    await logAudit(req, 'view_currently_occupied', 'report', null, { count: rows.rows.length });
+    res.json({ ok: true, items: rows.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'currently_occupied_failed' });
+  }
+});
+
+// GET /api/admin/trigger-backup (manual backup trigger for testing)
+app.get('/api/admin/trigger-backup', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+    
+    const { runBackup } = await import('./common/backup.js');
+    res.json({ ok: true, message: 'Backup triggered, check server logs for status' });
+    
+    // Run backup asynchronously (don't block response)
+    runBackup().catch(err => console.error('[BACKUP] Manual backup failed:', err));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'backup_trigger_failed' });
+  }
+});
+
+// GET /api/admin/analytics - Get analytics data
+app.get('/api/admin/analytics', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+
+    const { startDate, endDate, locationId, tentIndex, blockIndex } = req.query;
+
+    // Build WHERE clause based on filters
+    let whereConditions = ['a.deleted_at IS NULL'];
+    let params = [];
+    let paramCounter = 1;
+
+    if (startDate) {
+      whereConditions.push(`a.created_at >= $${paramCounter}::date`);
+      params.push(startDate);
+      paramCounter++;
+    }
+
+    if (endDate) {
+      whereConditions.push(`a.created_at <= $${paramCounter}::date + interval '1 day'`);
+      params.push(endDate);
+      paramCounter++;
+    }
+
+    if (locationId) {
+      whereConditions.push(`a.location_id = $${paramCounter}`);
+      params.push(locationId);
+      paramCounter++;
+    }
+
+    if (tentIndex) {
+      whereConditions.push(`a.tent_index = $${paramCounter}`);
+      params.push(tentIndex);
+      paramCounter++;
+    }
+
+    if (blockIndex) {
+      whereConditions.push(`a.block_index = $${paramCounter}`);
+      params.push(blockIndex);
+      paramCounter++;
+    }
+
+    const whereClause = whereConditions.join(' AND ');
+
+    // 1. Total lifetime allocations
+    const totalResult = await execQuery(`
+      SELECT COUNT(*) as total
+      FROM allocations a
+      WHERE ${whereClause}
+    `, params);
+
+    // 2. Gender breakdown
+    const genderResult = await execQuery(`
+      SELECT 
+        LOWER(gender) as gender,
+        COUNT(*) as count
+      FROM allocations a
+      WHERE ${whereClause}
+        AND gender IS NOT NULL
+        AND gender != ''
+      GROUP BY LOWER(gender)
+    `, params);
+
+    // 3. Daily allocations timeline
+    const dailyAllocationsResult = await execQuery(`
+      SELECT 
+        DATE(a.created_at) as date,
+        COUNT(*) as count
+      FROM allocations a
+      WHERE ${whereClause}
+      GROUP BY DATE(a.created_at)
+      ORDER BY date
+    `, params);
+
+    // 4. Daily departures timeline
+    const dailyDeparturesResult = await execQuery(`
+      SELECT 
+        a.end_date as date,
+        COUNT(*) as count
+      FROM allocations a
+      WHERE ${whereClause}
+      GROUP BY a.end_date
+      ORDER BY date
+    `, params);
+
+    // 5. Allocations by user (with location info for color coding)
+    // Join with audit_logs to find who created each allocation
+    const userAllocationsResult = await execQuery(`
+      SELECT 
+        DATE(a.created_at) as date,
+        COALESCE(al.username, 'Unknown') as username,
+        al.user_id,
+        a.location_id,
+        l.name as location_name,
+        COUNT(*) as count
+      FROM allocations a
+      LEFT JOIN LATERAL (
+        SELECT user_id, username
+        FROM audit_logs
+        WHERE entity_type = 'allocation'
+          AND entity_id = a.id
+          AND action IN ('allocate', 'bulk_allocate', 'smart_reserve')
+        ORDER BY created_at ASC
+        LIMIT 1
+      ) al ON true
+      LEFT JOIN locations l ON a.location_id = l.id
+      WHERE ${whereClause}
+      GROUP BY DATE(a.created_at), al.username, al.user_id, a.location_id, l.name
+      ORDER BY date, username
+    `, params);
+
+    await logAudit(req, 'view_analytics', 'report', null, { filters: req.query });
+
+    res.json({
+      ok: true,
+      data: {
+        totalAllocations: parseInt(totalResult.rows[0]?.total || 0),
+        genderBreakdown: genderResult.rows,
+        dailyAllocations: dailyAllocationsResult.rows,
+        dailyDepartures: dailyDeparturesResult.rows,
+        userAllocations: userAllocationsResult.rows
+      }
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'analytics_failed' });
+  }
+});
+
 // GET /api/allocations/reserved-active
 app.get('/api/allocations/reserved-active', async (_req, res) => {
   try {
     const user = getUserFromRequest(_req);
     if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
     const rows = await execQuery(`
-      SELECT a.id, a.batch_id, a.phone, a.contact_name, a.location_id, l.name as location_name, a.tent_index, a.block_index, a.bed_number, 
+      SELECT a.id, a.batch_id, a.phone, a.name, a.location_id, l.name as location_name, a.tent_index, a.block_index, a.bed_number, 
              a.reserved_expires_at, a.start_date, a.end_date, a.gender
       FROM allocations a
       LEFT JOIN locations l ON a.location_id = l.id
@@ -1853,7 +2071,7 @@ app.patch('/api/allocations/:id', async (req, res) => {
     if (!user) return res.status(401).json({ error: 'unauthorized' });
 
     const { id } = req.params;
-    const { name, phone, aadharNumber, gender, startDate, endDate, personPhotoKey, aadhaarPhotoKey } = req.body;
+    const { name, phone, emergencyPhone, gender, startDate, endDate, personPhotoKey, aadhaarPhotoKey } = req.body;
 
     // Validate allocation exists and is not deleted
     const existing = await execQuery(
@@ -1880,9 +2098,9 @@ app.patch('/api/allocations/:id', async (req, res) => {
       updates.push(`phone = $${paramIndex++}`);
       values.push(phone);
     }
-    if (aadharNumber !== undefined) {
-      updates.push(`aadhar_number = $${paramIndex++}`);
-      values.push(aadharNumber || null);
+    if (emergencyPhone !== undefined) {
+      updates.push(`emergency_phone = $${paramIndex++}`);
+      values.push(emergencyPhone || null);
     }
     if (gender !== undefined) {
       updates.push(`gender = $${paramIndex++}`);
@@ -1944,14 +2162,14 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
     
     console.log(`[ALLOCATE] Start - Bed ${bedNumber}`);
 
-    const { name, phone, gender, startDate, endDate, aadharNumber, personPhotoKey, aadhaarPhotoKey } = req.body || {};
+    const { name, phone, gender, startDate, endDate, emergencyPhone, personPhotoKey, aadhaarPhotoKey } = req.body || {};
     if (!name || !startDate || !endDate) {
       return res.status(400).json({ error: 'missing_required_fields' });
     }
 
     // Validate photos are provided
     if (!personPhotoKey || !aadhaarPhotoKey) {
-      return res.status(400).json({ error: 'photos_required', message: 'Both person and Aadhaar photos are required' });
+      return res.status(400).json({ error: 'photos_required', message: 'Both person and Identity photos are required' });
     }
 
     // Validate date range
@@ -2016,12 +2234,12 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
     const t4 = Date.now();
     // Combine INSERT + fetch using RETURNING clause (saves 1 round-trip!)
     const q = `
-      INSERT INTO allocations(location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date, aadhar_number, person_photo_key, aadhaar_photo_key)
+      INSERT INTO allocations(location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date, emergency_phone, person_photo_key, aadhaar_photo_key)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
       RETURNING id, name, phone, gender,
                 TO_CHAR(start_date, 'YYYY-MM-DD') as start_date,
                 TO_CHAR(end_date, 'YYYY-MM-DD') as end_date,
-                aadhar_number, person_photo_key, aadhaar_photo_key, status
+                emergency_phone, person_photo_key, aadhaar_photo_key, status
     `;
     const insertResult = await execQuery(q, [
       locationId,
@@ -2035,7 +2253,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       normalizedGender,
       startDate,
       endDate,
-      aadharNumber || null,
+      emergencyPhone || null,
       personPhotoKey,
       aadhaarPhotoKey
     ]);
@@ -2054,7 +2272,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       gender: allocation.gender,
       startDate: allocation.start_date,
       endDate: allocation.end_date,
-      aadharNumber: allocation.aadhar_number,
+      emergencyPhone: allocation.emergency_phone,
       status: allocation.status,
       personPhotoKey: allocation.person_photo_key,
       aadhaarPhotoKey: allocation.aadhaar_photo_key
@@ -2091,7 +2309,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
     const tentIndex = Number(req.params.tent);
     const blockIndex = Number(req.params.block);
     
-    const { name, phone, maleCount, femaleCount, startDate, endDate, aadharNumber } = req.body || {};
+    const { name, phone, maleCount, femaleCount, startDate, endDate, emergencyPhone } = req.body || {};
     
     if (!name || !startDate || !endDate) {
       return res.status(400).json({ error: 'missing_required_fields' });
@@ -2203,7 +2421,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
       for (let i = 0; i < (maleCount || 0); i++) {
         const bedNumber = availableBeds[bedIndex++];
         placeholders.push(`($${paramIndex},$${paramIndex+1},$${paramIndex+2},$${paramIndex+3},$${paramIndex+4},$${paramIndex+5},$${paramIndex+6},$${paramIndex+7},$${paramIndex+8},$${paramIndex+9},$${paramIndex+10},$${paramIndex+11},$${paramIndex+12})`);
-        values.push(locationId, tentId, blockId, tentIndex, blockIndex, bedNumber, name, phone || null, 'Male', startDate, endDate, batchId, aadharNumber || null);
+        values.push(locationId, tentId, blockId, tentIndex, blockIndex, bedNumber, name, phone || null, 'Male', startDate, endDate, batchId, emergencyPhone || null);
         paramIndex += 13;
         success.push({ bedNumber, gender: 'Male', name });
       }
@@ -2212,7 +2430,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
       for (let i = 0; i < (femaleCount || 0); i++) {
         const bedNumber = availableBeds[bedIndex++];
         placeholders.push(`($${paramIndex},$${paramIndex+1},$${paramIndex+2},$${paramIndex+3},$${paramIndex+4},$${paramIndex+5},$${paramIndex+6},$${paramIndex+7},$${paramIndex+8},$${paramIndex+9},$${paramIndex+10},$${paramIndex+11},$${paramIndex+12})`);
-        values.push(locationId, tentId, blockId, tentIndex, blockIndex, bedNumber, name, phone || null, 'Female', startDate, endDate, batchId, aadharNumber || null);
+        values.push(locationId, tentId, blockId, tentIndex, blockIndex, bedNumber, name, phone || null, 'Female', startDate, endDate, batchId, emergencyPhone || null);
         paramIndex += 13;
         success.push({ bedNumber, gender: 'Female', name });
       }
@@ -2220,7 +2438,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
       // Execute single bulk INSERT if we have any beds to allocate
       if (placeholders.length > 0) {
         await execQuery(`
-          INSERT INTO allocations(location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date, batch_id, aadhar_number)
+          INSERT INTO allocations(location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date, batch_id, emergency_phone)
           VALUES ${placeholders.join(', ')}
         `, values);
       }
@@ -2245,8 +2463,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
 });
 
 // PATCH /api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber
-// body: partial { name, phone, gender, startDate, endDate, personPhotoKey, aadhaarPhotoKey }
-// soft deletes current allocation and creates new one (preserves history)
+// body: partial { name, phone, emergencyPhone, gender, startDate, endDate, personPhotoKey, aadhaarPhotoKey }
 app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async (req, res) => {
   const startTime = Date.now();
   try {
@@ -2273,7 +2490,7 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
     // Find current active allocation
     const t2 = Date.now();
     const findQ = `
-      SELECT id, name, phone, gender, 
+      SELECT id, name, phone, gender, emergency_phone,
              TO_CHAR(start_date, 'YYYY-MM-DD') as start_date,
              TO_CHAR(end_date, 'YYYY-MM-DD') as end_date,
              person_photo_key, aadhaar_photo_key
@@ -2290,34 +2507,68 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
     if (!active.rowCount) return res.status(404).json({ error: 'no_active_allocation' });
 
     const current = active.rows[0];
-    const { name, phone, gender, startDate, endDate, personPhotoKey, aadhaarPhotoKey } = req.body || {};
+    const { name, phone, gender, startDate, endDate, emergencyPhone, personPhotoKey, aadhaarPhotoKey } = req.body || {};
 
-    // Use current values as defaults for missing fields
-    const newName = name !== undefined ? name : current.name;
-    const newPhone = phone !== undefined ? phone : current.phone;
-    const newGender = gender !== undefined ? (
-      gender && gender.trim() && ['Male', 'Female', 'Other'].includes(gender.trim()) 
+    // Build dynamic UPDATE query
+    const updates = [];
+    const values = [];
+    let paramIndex = 1;
+
+    if (name !== undefined) {
+      updates.push(`name = $${paramIndex++}`);
+      values.push(name);
+    }
+    if (phone !== undefined) {
+      updates.push(`phone = $${paramIndex++}`);
+      values.push(phone);
+    }
+    if (emergencyPhone !== undefined) {
+      updates.push(`emergency_phone = $${paramIndex++}`);
+      values.push(emergencyPhone || null);
+    }
+    if (gender !== undefined) {
+      const normalizedGender = gender && gender.trim() && ['Male', 'Female', 'Other'].includes(gender.trim()) 
         ? gender.trim() 
-        : 'Other'
-    ) : current.gender;
-    const newStartDate = startDate !== undefined ? startDate : current.start_date;
-    const newEndDate = endDate !== undefined ? endDate : current.end_date;
-    const newPersonPhotoKey = personPhotoKey !== undefined ? personPhotoKey : current.person_photo_key;
-    const newAadhaarPhotoKey = aadhaarPhotoKey !== undefined ? aadhaarPhotoKey : current.aadhaar_photo_key;
-
-    // Validate gender restriction for the block if gender is being changed
-    if (gender !== undefined && gender !== current.gender) {
-      const t2b = Date.now();
-      try {
-        await validateGenderRestriction(locationId, tentIndex, blockIndex, newGender);
-      } catch (e) {
-        return res.status(400).json({ error: 'gender_restriction_violation', message: e.message });
+        : 'Other';
+      
+      // Validate gender restriction for the block if gender is being changed
+      if (normalizedGender !== current.gender) {
+        try {
+          await validateGenderRestriction(locationId, tentIndex, blockIndex, normalizedGender);
+        } catch (e) {
+          return res.status(400).json({ error: 'gender_restriction_violation', message: e.message });
+        }
       }
-      console.log(`[EDIT] Gender validation: ${Date.now() - t2b}ms`);
+      
+      updates.push(`gender = $${paramIndex++}`);
+      values.push(normalizedGender);
+    }
+    if (startDate !== undefined) {
+      updates.push(`start_date = $${paramIndex++}`);
+      values.push(startDate);
+    }
+    if (endDate !== undefined) {
+      updates.push(`end_date = $${paramIndex++}`);
+      values.push(endDate);
+    }
+    if (personPhotoKey !== undefined) {
+      updates.push(`person_photo_key = $${paramIndex++}`);
+      values.push(personPhotoKey);
+    }
+    if (aadhaarPhotoKey !== undefined) {
+      updates.push(`aadhaar_photo_key = $${paramIndex++}`);
+      values.push(aadhaarPhotoKey);
     }
 
+    if (updates.length === 0) {
+      return res.status(400).json({ error: 'no_fields_to_update' });
+    }
+
+    // Always update updated_at
+    updates.push(`updated_at = NOW()`);
+    values.push(current.id);
+
     // Cleanup expired reservations (non-blocking)
-    const t2c = Date.now();
     execQuery(`
       UPDATE allocations
       SET deleted_at = NOW(), updated_at = NOW()
@@ -2331,65 +2582,35 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
           OR end_date < ${todaySQL}
         )
     `, [blockId, bedNumber, current.id]).catch(() => {});
-    console.log(`[EDIT] Cleanup (non-blocking): ${Date.now() - t2c}ms`);
 
-    // Soft delete old allocation first
+    // UPDATE the allocation
     const t3 = Date.now();
-    await execQuery(`
-      UPDATE allocations 
-      SET deleted_at = NOW() 
-      WHERE id = $1
-    `, [current.id]);
-    console.log(`[EDIT] Delete old: ${Date.now() - t3}ms`);
-
-    // Create new allocation with RETURNING
-    const t4 = Date.now();
-    const insertQ = `
-      INSERT INTO allocations(
-        location_id, tent_id, block_id, tent_index, block_index, bed_number, 
-        name, phone, gender, start_date, end_date, 
-        person_photo_key, aadhaar_photo_key
-      )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-      RETURNING id, name, phone, gender,
+    const updateQ = `
+      UPDATE allocations
+      SET ${updates.join(', ')}
+      WHERE id = $${paramIndex}
+      RETURNING id, name, phone, emergency_phone, gender,
                 TO_CHAR(start_date, 'YYYY-MM-DD') as start_date,
                 TO_CHAR(end_date, 'YYYY-MM-DD') as end_date,
                 person_photo_key, aadhaar_photo_key, status
     `;
     
-    const result = await execQuery(insertQ, [
-      locationId,
-      tentId,
-      blockId,
-      tentIndex,
-      blockIndex,
-      bedNumber,
-      newName,
-      newPhone,
-      newGender,
-      newStartDate,
-      newEndDate,
-      newPersonPhotoKey,
-      newAadhaarPhotoKey
-    ]);
-    
+    const result = await execQuery(updateQ, values);
     const updatedAllocation = result.rows[0];
-    const newAllocationId = updatedAllocation.id;
-    console.log(`[EDIT] INSERT: ${Date.now() - t4}ms`);
-    console.log(`[EDIT] Total DB time (delete+insert): ${Date.now() - t3}ms`);
+    console.log(`[EDIT] UPDATE: ${Date.now() - t3}ms`);
 
     // Log audit in background (non-blocking)
-    logAudit(req, 'edit_allocation', 'allocation', newAllocationId, { 
+    logAudit(req, 'edit_allocation', 'allocation', current.id, { 
       locationId, tentIndex, blockIndex, bedNumber, 
-      oldAllocationId: current.id,
-      changes: { name, phone, gender, startDate, endDate }
+      changes: { name, phone, emergencyPhone, gender, startDate, endDate, personPhotoKey, aadhaarPhotoKey }
     });
 
-    // Return keys only (frontend generates view URLs)
+    // Return updated data
     const response = {
       id: updatedAllocation.id,
       name: updatedAllocation.name,
       phone: updatedAllocation.phone,
+      emergencyPhone: updatedAllocation.emergency_phone,
       gender: updatedAllocation.gender,
       startDate: updatedAllocation.start_date,
       endDate: updatedAllocation.end_date,

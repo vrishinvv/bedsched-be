@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS tents (
   id                SERIAL PRIMARY KEY,
   location_id       INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
   tent_index        INTEGER NOT NULL CHECK (tent_index >= 1),
+  name              TEXT,
   size              INTEGER NOT NULL CHECK (size >= 0),
   created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE(location_id, tent_index)
@@ -26,6 +27,7 @@ CREATE TABLE IF NOT EXISTS blocks (
   tent_id      INTEGER NOT NULL REFERENCES tents(id) ON DELETE CASCADE,
   tent_index   INTEGER NOT NULL,
   block_index  INTEGER NOT NULL CHECK (block_index >= 1),
+  name         TEXT,
   size         INTEGER NOT NULL CHECK (size >= 0),
   gender_restriction TEXT NOT NULL DEFAULT 'both' CHECK (gender_restriction IN ('male_only', 'female_only', 'both')),
   created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -50,7 +52,6 @@ CREATE TABLE IF NOT EXISTS allocations (
   -- reservation/confirmation lifecycle
   status       TEXT NOT NULL DEFAULT 'confirmed' CHECK (status IN ('reserved','confirmed','cancelled')),
   batch_id     TEXT,
-  contact_name TEXT,
   is_family    BOOLEAN NOT NULL DEFAULT FALSE,
   reserved_expires_at TIMESTAMPTZ,
   created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),

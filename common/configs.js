@@ -14,6 +14,9 @@ const config = {
     awsAccessKeyId: process.env.AWS_ACCESS_KEY_ID,
     awsSecretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
     s3BucketName: process.env.S3_BUCKET_NAME || 'bedsched-photos',
+    // Backup Configuration
+    resendApiKey: process.env.RESEND_API_KEY,
+    backupEmail: process.env.BACKUP_EMAIL || 'vvnihsirv@gmail.com',
 }
 
 console.log(config)
