@@ -1,4 +1,3 @@
-import cron from 'node-cron';
 import { Resend } from 'resend';
 import { execQuery } from './db.js';
 import { config } from './configs.js';
@@ -80,13 +79,23 @@ async function backupAuditLogs() {
 }
 
 /**
- * Sends backup email with CSV attachments
+ * Sends backup email with CSV attachments to multiple recipients
  */
 async function sendBackupEmail(allocationsCSV, auditLogsCSV, timestamp) {
   try {
+    // Parse comma-separated email list from config
+    const emailList = config.backupEmail
+      .split(',') 
+      .map(email => email.trim())
+      .filter(email => email.length > 0);
+    
+    if (emailList.length === 0) {
+      throw new Error('No valid email addresses found in BACKUP_EMAIL config');
+    }
+
     const { data, error } = await resend.emails.send({
       from: 'BedSched Backups <backups@resend.dev>', // Use your verified domain if available
-      to: [config.backupEmail],
+      to: emailList,
       subject: `BedSched Database Backup - ${timestamp}`,
       html: `
         <h2>Automated Database Backup</h2>
@@ -151,26 +160,4 @@ export async function runBackup() {
   }
 }
 
-/**
- * Initialize backup scheduler - runs every 6 hours
- */
-export function initBackupScheduler() {
-  // Check if backup is enabled
-  if (!config.resendApiKey) {
-    console.log('[BACKUP] Backup scheduler disabled - RESEND_API_KEY not configured');
-    return;
-  }
 
-  // Schedule backup every 6 hours (at 00:00, 06:00, 12:00, 18:00)
-  cron.schedule('0 */6 * * *', async () => {
-    console.log('[BACKUP] Scheduled backup triggered');
-    await runBackup();
-  });
-
-  console.log('[BACKUP] Backup scheduler initialized - running every 6 hours');
-  console.log('[BACKUP] Backup email will be sent to:', config.backupEmail);
-  
-  // Optional: Run backup immediately on startup (comment out if not needed)
-  // console.log('[BACKUP] Running initial backup on startup...');
-  // setTimeout(() => runBackup(), 5000); // Wait 5s for server to fully start
-}

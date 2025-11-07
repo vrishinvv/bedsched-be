@@ -22,8 +22,6 @@ import {
   nowIST
 } from './common/helpers.js';
 import { generateUploadUrl, generateViewUrl } from './common/s3.js';
-import { initBackupScheduler } from './common/backup.js';
-
 
 const app = express();
 
@@ -831,8 +829,6 @@ app.delete('/api/locations/:id/beds/:bedNumber', async (req, res) => {
 
 app.listen(config.port, () => {
   console.log(`API listening on http://localhost:${config.port}`);
-  // Initialize backup scheduler
-  initBackupScheduler();
 });
 
 
@@ -2012,7 +2008,7 @@ app.post('/api/upload-url', async (req, res) => {
     const user = getUserFromRequest(req);
     if (!user) return res.status(401).json({ error: 'unauthorized' });
 
-    const { photoType, locationId, tentIndex, blockIndex, key } = req.body;
+    const { photoType, locationId, tentIndex, blockIndex, key, name, bedNumber } = req.body;
     
     if (!photoType || !locationId) {
       return res.status(400).json({ error: 'missing_required_fields' });
@@ -2022,11 +2018,24 @@ app.post('/api/upload-url', async (req, res) => {
       return res.status(400).json({ error: 'invalid_photo_type' });
     }
 
-    // If frontend provides key, use it; otherwise generate one
+    // If frontend provides key, use it; otherwise generate one with format: {bedNumber}-{ddmmyyyy}-{hhmm}-{name}-{type}
     const photoKey = key || (() => {
-      const timestamp = Date.now();
-      const uuid = crypto.randomUUID();
-      return `location-${locationId}/tent-${tentIndex || 0}/block-${blockIndex || 0}/${timestamp}-${uuid}-${photoType}.jpg`;
+      const now = new Date();
+      const dd = String(now.getDate()).padStart(2, '0');
+      const mm = String(now.getMonth() + 1).padStart(2, '0');
+      const yyyy = now.getFullYear();
+      const hh = String(now.getHours()).padStart(2, '0');
+      const min = String(now.getMinutes()).padStart(2, '0');
+      
+      // Sanitize name for file path (remove special characters, replace spaces with hyphens)
+      const sanitizedName = (name || 'unnamed').replace(/[^a-zA-Z0-9\s]/g, '').replace(/\s+/g, '-').toLowerCase();
+      
+      // Map photoType to desired suffix
+      const typeSuffix = photoType === 'person' ? 'person' : 'identity';
+      
+      const bedNumPrefix = bedNumber ? `${bedNumber}-` : '';
+      
+      return `location-${locationId}/tent-${tentIndex || 0}/block-${blockIndex || 0}/${bedNumPrefix}${dd}${mm}${yyyy}-${hh}${min}-${sanitizedName}-${typeSuffix}.jpg`;
     })();
 
     const { uploadUrl } = await generateUploadUrl(
