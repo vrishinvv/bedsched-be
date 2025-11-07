@@ -1751,8 +1751,8 @@ app.get('/api/allocations/currently-occupied', async (req, res) => {
       LEFT JOIN blocks b ON t.id = b.tent_id AND a.block_index = b.block_index
       WHERE a.deleted_at IS NULL 
         AND a.status = 'confirmed'
-        AND a.start_date <= CURRENT_DATE 
-        AND a.end_date >= CURRENT_DATE
+        AND a.start_date <= ${todaySQL}
+        AND a.end_date >= ${todaySQL}
       ORDER BY a.location_id, a.tent_index, a.block_index, a.bed_number
     `);
     await logAudit(req, 'view_currently_occupied', 'report', null, { count: rows.rows.length });
