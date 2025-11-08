@@ -52,7 +52,7 @@ async function logAudit(req, action, entityType, entityId, details = {}) {
 
 // Configure CORS for production
 const corsOptions = {
-  origin: ['http://localhost:3000', 'https://sssnivas.vercel.app', 'https://bedsched-fe.vercel.app'],
+  origin: ['http://localhost:3000', 'https://sssenclave.vercel.app', 'https://bedsched-fe.vercel.app'],
   credentials: true,
   optionsSuccessStatus: 200,
   allowedHeaders: ['Content-Type', 'Authorization']
