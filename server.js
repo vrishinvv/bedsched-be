@@ -315,9 +315,9 @@ app.post('/api/seed', async (req, res) => {
 
     // Location data with shortcodes for user generation
     const locationData = [
-      { name: 'Anand Vilas Enclave', shortcode: 'ave', capacity: 850, tents: 1, gender: 'both', landmark: 'Chaitanya Jothi' },
+      { name: 'Anand Vilas Enclave', shortcode: 'ave', capacity: 850, tents: 1, gender: 'both', landmark: 'Chaitanya Jyoti' },
       { name: 'Brindavan Enclave', shortcode: 'be', capacity: 2100, tents: 3, gender: 'both', landmark: 'Electricity Board' },
-      { name: 'Sai Sruthi Enclave', shortcode: 'sse', capacity: 1800, tents: 2, gender: 'both', landmark: 'APSRTC Bus Depo' },
+      { name: 'Sai Sruthi Enclave', shortcode: 'sse', capacity: 1800, tents: 2, gender: 'both', landmark: 'APSRTC Bus Depot' },
       { name: 'Dharmakshetra Enclave', shortcode: 'de', capacity: 1400, tents: 2, gender: 'both', landmark: 'Sai Hira Hall' },
       { name: 'Shivam Enclave', shortcode: 'she', capacity: 4000, tents: 4, gender: 'both', landmark: 'West South' },
       { name: 'Sundaram Enclave', shortcode: 'sue', capacity: 6000, tents: 6, gender: 'both', landmark: 'West North' },
