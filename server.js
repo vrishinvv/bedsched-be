@@ -361,8 +361,7 @@ app.post('/api/seed', async (req, res) => {
     
     // Helper to generate block name
     const getBlockName = (blockIndex) => {
-      const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-      return `Block ${letters[blockIndex - 1]}`;
+      return `Block ${blockIndex}`;
     };
     
     // Prepare all tent data
