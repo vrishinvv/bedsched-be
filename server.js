@@ -2097,6 +2097,20 @@ app.patch('/api/allocations/:id', async (req, res) => {
 
     const current = existing.rows[0];
 
+    // If gender is being updated, validate gender restrictions
+    if (gender !== undefined && gender !== current.gender) {
+      try {
+        await validateGenderRestriction(
+          current.location_id,
+          current.tent_index,
+          current.block_index,
+          gender
+        );
+      } catch (e) {
+        return res.status(400).json({ error: 'validation_failed', message: e.message });
+      }
+    }
+
     // Build update query dynamically based on provided fields
     const updates = [];
     const values = [];
@@ -2487,13 +2501,24 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
     
     console.log(`[EDIT] Start - Bed ${bedNumber}`);
     
-    // Combined validation - gets blockId, tentId in one query
+    // Validate bed exists - skip gender validation since we'll check it later if gender changes
     const t1 = Date.now();
     let blockId, tentId;
     try {
-      const result = await validateAndGetBlockInfo(locationId, tentIndex, blockIndex, bedNumber, null);
-      blockId = result.blockId;
-      tentId = result.tentId;
+      const result = await execQuery(`
+        SELECT b.id as block_id, b.size, t.id as tent_id
+        FROM blocks b
+        JOIN tents t ON t.id = b.tent_id
+        WHERE t.location_id = $1 AND t.tent_index = $2 AND b.block_index = $3
+      `, [locationId, tentIndex, blockIndex]);
+      
+      if (result.rowCount === 0) throw new Error('Block not found');
+      const block = result.rows[0];
+      
+      if (bedNumber < 1 || bedNumber > block.size) throw new Error('Bed out of range');
+      
+      blockId = block.block_id;
+      tentId = block.tent_id;
     } catch (e) {
       return res.status(400).json({ error: 'validation_failed', message: e.message });
     }
