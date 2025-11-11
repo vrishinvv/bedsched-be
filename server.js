@@ -4,6 +4,8 @@ import morgan from 'morgan';
 import cookieParser from 'cookie-parser';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
+import multer from 'multer';
+import { parse } from 'csv-parse/sync';
 import { config } from './common/configs.js';
 import { execQuery } from './common/db.js';
 import {   
@@ -4445,3 +4447,289 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/batch-edit', async (
     res.status(500).json({ error: 'batch_edit_failed' });
   }
 });
+
+/* --------------------------------- Bulk CSV Import -------------------------------- */
+
+// Configure multer for CSV file upload (memory storage)
+const csvUpload = multer({ 
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype === 'text/csv' || file.originalname.endsWith('.csv')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Only CSV files are allowed'));
+    }
+  }
+});
+
+// POST /api/locations/:id/tents/:tent/blocks/:block/bulk-import-csv
+// Upload CSV and bulk allocate to a specific block
+app.post('/api/locations/:id/tents/:tent/blocks/:block/bulk-import-csv', 
+  csvUpload.single('csv'), 
+  async (req, res) => {
+    try {
+      const user = getUserFromRequest(req);
+      if (!user || !['admin', 'location_user'].includes(user.role)) {
+        return res.status(403).json({ error: 'forbidden' });
+      }
+
+      const locationId = Number(req.params.id);
+      const tentIndex = Number(req.params.tent);
+      const blockIndex = Number(req.params.block);
+
+      if (!req.file) {
+        return res.status(400).json({ error: 'no_csv_file', message: 'CSV file is required' });
+      }
+
+      // Parse CSV
+      const csvContent = req.file.buffer.toString('utf-8');
+      let records;
+      try {
+        records = parse(csvContent, {
+          columns: true,
+          skip_empty_lines: true,
+          trim: true,
+          bom: true // Handle UTF-8 BOM
+        });
+      } catch (parseErr) {
+        return res.status(400).json({ 
+          error: 'csv_parse_failed', 
+          message: 'Failed to parse CSV file: ' + parseErr.message 
+        });
+      }
+
+      if (!records || records.length === 0) {
+        return res.status(400).json({ error: 'empty_csv', message: 'CSV file is empty' });
+      }
+
+      // Validate block exists and get block_id, tent_id, size, and gender_restriction in one query
+      const blockInfo = await execQuery(`
+        SELECT b.id as block_id, b.size, b.gender_restriction, t.id as tent_id
+        FROM blocks b
+        JOIN tents t ON t.id = b.tent_id
+        WHERE t.location_id = $1 AND t.tent_index = $2 AND b.block_index = $3
+      `, [locationId, tentIndex, blockIndex]);
+      
+      if (!blockInfo.rows.length) {
+        return res.status(404).json({ error: 'block_not_found' });
+      }
+      
+      const { block_id: blockId, tent_id: tentId, size: blockSize, gender_restriction: genderRestriction } = blockInfo.rows[0];
+
+      // Track results
+      const results = {
+        total: records.length,
+        success: 0,
+        failed: 0,
+        errors: []
+      };
+
+      // Collect valid allocations for bulk insert
+      const allocationsToInsert = [];
+      const auditLogsToInsert = [];
+
+      // Process each record and validate
+      for (let i = 0; i < records.length; i++) {
+        const row = records[i];
+        const rowNum = i + 2; // Account for header row
+
+        try {
+          // Extract and validate fields
+          const name = row['Name']?.trim();
+          const gender = row['Gender']?.trim();
+          const phone = row['Phone']?.trim();
+          const emergencyPhone = row['Emergency Phone']?.trim() || null;
+          const startDate = row['Start date']?.trim();
+          const endDate = row['End date']?.trim();
+
+          // Validate required fields
+          if (!name) throw new Error('Name is required');
+          if (!phone) throw new Error('Phone is required');
+          if (!startDate) throw new Error('Start date is required');
+          if (!endDate) throw new Error('End date is required');
+
+          // Normalize gender
+          const validGenders = ['Male', 'Female', 'Other'];
+          const normalizedGender = validGenders.find(g => g.toLowerCase() === gender?.toLowerCase()) || 'Other';
+
+          // Validate gender restriction
+          if (genderRestriction === 'male_only' && normalizedGender.toLowerCase() !== 'male') {
+            throw new Error('Block is male-only');
+          }
+          if (genderRestriction === 'female_only' && normalizedGender.toLowerCase() !== 'female') {
+            throw new Error('Block is female-only');
+          }
+
+          // Add to batch for insertion
+          allocationsToInsert.push({
+            rowNum,
+            name,
+            phone,
+            emergencyPhone,
+            gender: normalizedGender,
+            startDate,
+            endDate
+          });
+
+        } catch (rowErr) {
+          results.failed++;
+          results.errors.push({
+            row: rowNum,
+            name: row['Name'],
+            error: rowErr.message
+          });
+          console.error(`[CSV-IMPORT] Row ${rowNum} validation failed:`, rowErr.message);
+        }
+      }
+
+      // If no valid records, return early
+      if (allocationsToInsert.length === 0) {
+        return res.json({
+          ok: true,
+          message: 'No valid records to import',
+          results
+        });
+      }
+
+      // Find available beds for all allocations
+      const bedsNeeded = allocationsToInsert.length;
+      const availableBedsQuery = `
+        SELECT bed_num
+        FROM generate_series(1, $1) AS bed_num
+        WHERE bed_num NOT IN (
+          SELECT bed_number 
+          FROM allocations 
+          WHERE block_id = $2 
+            AND deleted_at IS NULL 
+            AND end_date >= ${todaySQL}
+            AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > NOW()))
+        )
+        ORDER BY bed_num
+        LIMIT $3
+      `;
+      const availableResult = await execQuery(availableBedsQuery, [blockSize, blockId, bedsNeeded]);
+
+      if (availableResult.rows.length < bedsNeeded) {
+        const shortage = bedsNeeded - availableResult.rows.length;
+        return res.status(400).json({
+          error: 'insufficient_beds',
+          message: `Only ${availableResult.rows.length} beds available, but ${bedsNeeded} needed. ${shortage} records cannot be allocated.`,
+          available: availableResult.rows.length,
+          needed: bedsNeeded
+        });
+      }
+
+      // Assign bed numbers
+      const availableBeds = availableResult.rows.map(r => r.bed_num);
+      allocationsToInsert.forEach((alloc, idx) => {
+        alloc.bedNumber = availableBeds[idx];
+      });
+
+      // Bulk insert allocations
+      const insertValues = allocationsToInsert.map((alloc, idx) => {
+        const offset = idx * 12;
+        return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, $${offset + 9}, $${offset + 10}, $${offset + 11}, $${offset + 12}, 'confirmed')`;
+      }).join(',');
+
+      const insertParams = allocationsToInsert.flatMap(alloc => [
+        blockId,
+        tentId,
+        locationId,
+        tentIndex,
+        blockIndex,
+        alloc.bedNumber,
+        alloc.name,
+        alloc.phone,
+        alloc.emergencyPhone,
+        alloc.gender,
+        alloc.startDate,
+        alloc.endDate
+      ]);
+
+      const bulkInsertQuery = `
+        INSERT INTO allocations(
+          block_id, tent_id, location_id, tent_index, block_index, bed_number,
+          name, phone, emergency_phone, gender, start_date, end_date, status
+        )
+        VALUES ${insertValues}
+        RETURNING id, bed_number, name
+      `;
+      
+      const insertResult = await execQuery(bulkInsertQuery, insertParams);
+      const insertedAllocations = insertResult.rows;
+
+      // Prepare bulk audit logs
+      const userId = user?.id || null;
+      const username = user?.username || 'anonymous';
+      const ipAddress = (
+        req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 
+        req.headers['x-real-ip'] || 
+        req.ip || 
+        req.connection?.remoteAddress || 
+        'unknown'
+      );
+
+      const auditValues = insertedAllocations.map((alloc, idx) => {
+        const offset = idx * 7;
+        const originalRow = allocationsToInsert.find(a => a.bedNumber === alloc.bed_number);
+        return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7})`;
+      }).join(',');
+
+      const auditParams = insertedAllocations.flatMap((alloc, idx) => {
+        const originalRow = allocationsToInsert.find(a => a.bedNumber === alloc.bed_number);
+        return [
+          userId,
+          username,
+          'allocate',
+          'allocation',
+          alloc.id,
+          JSON.stringify({
+            source: 'csv_import',
+            rowNumber: originalRow.rowNum,
+            name: alloc.name,
+            phone: originalRow.phone,
+            bedNumber: alloc.bed_number,
+            locationId,
+            tentIndex,
+            blockIndex,
+            startDate: originalRow.startDate,
+            endDate: originalRow.endDate
+          }),
+          ipAddress
+        ];
+      });
+
+      const bulkAuditQuery = `
+        INSERT INTO audit_logs(user_id, username, action, entity_type, entity_id, details, ip_address)
+        VALUES ${auditValues}
+      `;
+      
+      await execQuery(bulkAuditQuery, auditParams);
+
+      results.success = insertedAllocations.length;
+
+      // Log overall import result
+      await logAudit(req, 'bulk_csv_import', 'block', blockId, {
+        locationId,
+        tentIndex,
+        blockIndex,
+        totalRows: results.total,
+        successful: results.success,
+        failed: results.failed,
+        filename: req.file.originalname
+      });
+
+      res.json({
+        ok: true,
+        message: `Import completed: ${results.success} successful, ${results.failed} failed`,
+        results
+      });
+
+    } catch (e) {
+      console.error('[CSV-IMPORT] Error:', e);
+      res.status(500).json({ error: 'csv_import_failed', message: e.message });
+    }
+  }
+);
+

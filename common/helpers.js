@@ -20,7 +20,7 @@ export function getTodayIST() {
 export async function getLocationsWithStats() {
   // Clean up expired reservations before fetching stats
   try {
-    await execQuery(`
+    const cleanupResult = await execQuery(`
       UPDATE allocations
       SET deleted_at = NOW(), updated_at = NOW()
       WHERE deleted_at IS NULL
@@ -29,7 +29,12 @@ export async function getLocationsWithStats() {
           (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
           OR end_date < ${todaySQL}
         )
+      RETURNING id, name, phone, status, bed_number
     `);
+    if (cleanupResult.rowCount > 0) {
+      console.log(`[CLEANUP-RESERVATIONS] getLocationsWithStats deleted ${cleanupResult.rowCount} expired reservations:`, 
+        cleanupResult.rows.map(r => ({ id: r.id, name: r.name, bed: r.bed_number })));
+    }
   } catch (cleanupErr) {
     console.error('[getLocationsWithStats] Cleanup error:', cleanupErr.message);
   }
@@ -74,7 +79,7 @@ export async function getLocationsWithStats() {
 export async function getLocationDetail(locationId) {
   // Clean up expired reservations before fetching location detail
   try {
-    await execQuery(`
+    const cleanupResult = await execQuery(`
       UPDATE allocations
       SET deleted_at = NOW(), updated_at = NOW()
       WHERE deleted_at IS NULL
@@ -83,7 +88,12 @@ export async function getLocationDetail(locationId) {
           (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
           OR end_date < ${todaySQL}
         )
+      RETURNING id, name, phone, status, bed_number
     `);
+    if (cleanupResult.rowCount > 0) {
+      console.log(`[CLEANUP-RESERVATIONS] getLocationDetail deleted ${cleanupResult.rowCount} expired reservations:`, 
+        cleanupResult.rows.map(r => ({ id: r.id, name: r.name, bed: r.bed_number })));
+    }
   } catch (cleanupErr) {
     console.error('[getLocationDetail] Cleanup error:', cleanupErr.message);
   }
@@ -224,7 +234,7 @@ export async function getLocationTents(locationId) {
 export async function getTentBlocks(locationId, tentIndex) {
   // Clean up expired reservations before fetching tent blocks
   try {
-    await execQuery(`
+    const cleanupResult = await execQuery(`
       UPDATE allocations
       SET deleted_at = NOW(), updated_at = NOW()
       WHERE deleted_at IS NULL
@@ -233,7 +243,12 @@ export async function getTentBlocks(locationId, tentIndex) {
           (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
           OR end_date < ${todaySQL}
         )
+      RETURNING id, name, phone, status, bed_number
     `);
+    if (cleanupResult.rowCount > 0) {
+      console.log(`[CLEANUP-RESERVATIONS] getTentBlocks deleted ${cleanupResult.rowCount} expired reservations:`, 
+        cleanupResult.rows.map(r => ({ id: r.id, name: r.name, bed: r.bed_number })));
+    }
   } catch (cleanupErr) {
     console.error('[getTentBlocks] Cleanup error:', cleanupErr.message);
   }
@@ -305,7 +320,7 @@ export async function getTentBlocks(locationId, tentIndex) {
 export async function getBlockDetail(locationId, tentIndex, blockIndex) {
   // Clean up expired reservations before fetching block detail
   try {
-    await execQuery(`
+    const cleanupResult = await execQuery(`
       UPDATE allocations
       SET deleted_at = NOW(), updated_at = NOW()
       WHERE deleted_at IS NULL
@@ -314,7 +329,12 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
           (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
           OR end_date < ${todaySQL}
         )
+      RETURNING id, name, phone, status, bed_number
     `);
+    if (cleanupResult.rowCount > 0) {
+      console.log(`[CLEANUP-RESERVATIONS] getBlockDetail deleted ${cleanupResult.rowCount} expired reservations:`, 
+        cleanupResult.rows.map(r => ({ id: r.id, name: r.name, bed: r.bed_number })));
+    }
   } catch (cleanupErr) {
     console.error('[getBlockDetail] Cleanup error:', cleanupErr.message);
   }
