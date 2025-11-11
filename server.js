@@ -38,7 +38,14 @@ async function logAudit(req, action, entityType, entityId, details = {}) {
       userId = userQuery.rows[0]?.id || null;
     }
     
-    const ipAddress = req.ip || req.headers['x-forwarded-for'] || req.connection?.remoteAddress;
+    // Get real client IP (handles proxies correctly)
+    const ipAddress = (
+      req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 
+      req.headers['x-real-ip'] || 
+      req.ip || 
+      req.connection?.remoteAddress || 
+      'unknown'
+    );
     
     await execQuery(`
       INSERT INTO audit_logs (user_id, username, action, entity_type, entity_id, details, ip_address)
@@ -60,6 +67,9 @@ const corsOptions = {
   optionsSuccessStatus: 200,
   allowedHeaders: ['Content-Type', 'Authorization']
 };
+
+// Trust proxy to get real client IP (important for accurate audit logs)
+app.set('trust proxy', true);
 
 app.use(cors(corsOptions));
 app.use(express.json());
