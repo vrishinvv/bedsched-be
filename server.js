@@ -825,7 +825,1064 @@ app.delete('/api/locations/:id/beds/:bedNumber', async (req, res) => {
   }
 });
 
+/* --------------------------------- Table View -------------------------------- */
+app.get('/api/allocations/table-view', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
 
+    let { 
+      page = 1, 
+      limit = 50, 
+      sortField = 'updated_at', 
+      sortOrder = 'desc',
+      search = '',
+      startDate = '',
+      endDate = '',
+      gender = '',
+      status = '', // comma-separated: active,expired,left_early,no_show,booking_error,other
+      allocatedBy = '', // filter by username who allocated
+      location_id = '',
+      tent_index = '',
+      block_index = ''
+    } = req.query;
+
+    // Force location_user to only see their location's data
+    if (user.role === 'location_user' && user.locationId) {
+      location_id = String(user.locationId);
+    }
+    
+    const offset = (Number(page) - 1) * Number(limit);
+    
+    // Validate sortField to prevent SQL injection
+    const allowedSortFields = ['name', 'phone', 'start_date', 'end_date', 'created_at', 'updated_at'];
+    const validSortField = allowedSortFields.includes(sortField) ? sortField : 'updated_at';
+    const validSortOrder = sortOrder?.toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+
+    // Build WHERE conditions
+    let whereConditions = [];
+    let params = [];
+    let paramCounter = 1;
+
+    // Search filter
+    if (search) {
+      whereConditions.push(`(LOWER(a.name) LIKE $${paramCounter} OR a.phone LIKE $${paramCounter})`);
+      params.push(`%${search.toLowerCase()}%`);
+      paramCounter++;
+    }
+
+    // Date range filters - filter by record creation date
+    if (startDate) {
+      whereConditions.push(`DATE(a.created_at) >= $${paramCounter}`);
+      params.push(startDate);
+      paramCounter++;
+    }
+
+    if (endDate) {
+      whereConditions.push(`DATE(a.created_at) <= $${paramCounter}`);
+      params.push(endDate);
+      paramCounter++;
+    }
+
+    // Gender filter
+    if (gender) {
+      whereConditions.push(`LOWER(a.gender) = $${paramCounter}`);
+      params.push(gender.toLowerCase());
+      paramCounter++;
+    }
+
+    // Location filter
+    if (location_id) {
+      whereConditions.push(`a.location_id = $${paramCounter}`);
+      params.push(location_id);
+      paramCounter++;
+    }
+
+    // Tent filter
+    if (tent_index) {
+      whereConditions.push(`a.tent_index = $${paramCounter}`);
+      params.push(tent_index);
+      paramCounter++;
+    }
+
+    // Block filter
+    if (block_index) {
+      whereConditions.push(`a.block_index = $${paramCounter}`);
+      params.push(block_index);
+      paramCounter++;
+    }
+
+    // Status filter
+    if (status) {
+      const statuses = status.split(',').map(s => s.trim());
+      const statusConditions = [];
+      
+      const today = new Date().toISOString().split('T')[0];
+      
+      if (statuses.includes('active')) {
+        statusConditions.push(`(a.deleted_at IS NULL AND a.end_date >= '${today}')`);
+      }
+      if (statuses.includes('expired')) {
+        statusConditions.push(`(a.deleted_at IS NULL AND a.end_date < '${today}')`);
+      }
+      if (statuses.includes('left_early')) {
+        statusConditions.push(`(a.deleted_at IS NOT NULL AND EXISTS (
+          SELECT 1 FROM audit_logs al 
+          WHERE al.action = 'deallocate' 
+            AND al.entity_type = 'allocation' 
+            AND al.entity_id = a.id 
+            AND al.details->>'reason' = 'left_early'
+        ))`);
+      }
+      if (statuses.includes('no_show')) {
+        statusConditions.push(`(a.deleted_at IS NOT NULL AND EXISTS (
+          SELECT 1 FROM audit_logs al 
+          WHERE al.action = 'deallocate' 
+            AND al.entity_type = 'allocation' 
+            AND al.entity_id = a.id 
+            AND al.details->>'reason' = 'no_show'
+        ))`);
+      }
+      if (statuses.includes('booking_error')) {
+        statusConditions.push(`(a.deleted_at IS NOT NULL AND EXISTS (
+          SELECT 1 FROM audit_logs al 
+          WHERE al.action = 'deallocate' 
+            AND al.entity_type = 'allocation' 
+            AND al.entity_id = a.id 
+            AND al.details->>'reason' = 'booking_error'
+        ))`);
+      }
+      if (statuses.includes('other')) {
+        statusConditions.push(`(a.deleted_at IS NOT NULL AND NOT EXISTS (
+          SELECT 1 FROM audit_logs al 
+          WHERE al.action = 'deallocate' 
+            AND al.entity_type = 'allocation' 
+            AND al.entity_id = a.id 
+            AND al.details->>'reason' IN ('left_early', 'no_show', 'booking_error')
+        ))`);
+      }
+      
+      if (statusConditions.length > 0) {
+        whereConditions.push(`(${statusConditions.join(' OR ')})`);
+      }
+    }
+
+    const whereClause = whereConditions.join(' AND ');
+
+    const countQuery = `
+      SELECT COUNT(*) as total
+      FROM allocations a
+      WHERE ${whereClause}
+    `;
+    const countResult = await execQuery(countQuery, params);
+    const total = Number(countResult.rows[0]?.total || 0);
+
+    const dataQuery = `
+      SELECT 
+        a.id,
+        a.name,
+        a.phone,
+        a.gender,
+        a.start_date,
+        a.end_date,
+        a.created_at,
+        a.updated_at,
+        a.deleted_at,
+        a.bed_number,
+        l.id as location_id,
+        l.name as location_name,
+        t.tent_index,
+        t.name as tent_name,
+        b.block_index,
+        b.name as block_name,
+        COALESCE(creator.username, 'Unknown') as allocated_by,
+        CASE 
+          WHEN a.deleted_at IS NOT NULL THEN
+            COALESCE(
+              (SELECT al.details->>'reason' 
+               FROM audit_logs al 
+               WHERE al.action = 'deallocate' 
+                 AND al.entity_type = 'allocation' 
+                 AND al.entity_id = a.id 
+               ORDER BY al.created_at DESC 
+               LIMIT 1
+              ), 'not_specified'
+            )
+          ELSE NULL
+        END as reason
+      FROM allocations a
+      JOIN blocks b ON a.block_id = b.id
+      JOIN tents t ON b.tent_id = t.id
+      JOIN locations l ON t.location_id = l.id
+      LEFT JOIN LATERAL (
+        SELECT username
+        FROM audit_logs
+        WHERE entity_type = 'allocation'
+          AND entity_id = a.id
+          AND action IN ('allocate', 'bulk_allocate', 'smart_reserve')
+        ORDER BY created_at ASC
+        LIMIT 1
+      ) creator ON true
+      WHERE ${whereClause}
+      ${allocatedBy ? `AND LOWER(creator.username) = $${paramCounter}` : ''}
+      ORDER BY a.${validSortField} ${validSortOrder}
+      LIMIT $${paramCounter + (allocatedBy ? 1 : 0)} OFFSET $${paramCounter + (allocatedBy ? 2 : 1)}
+    `;
+    if (allocatedBy) {
+      params.push(allocatedBy.toLowerCase());
+      paramCounter++;
+    }
+    params.push(Number(limit), offset);
+    const dataResult = await execQuery(dataQuery, params);
+
+    res.json({
+      items: dataResult.rows,
+      total,
+      page: Number(page),
+      limit: Number(limit),
+    });
+  } catch (e) {
+    console.error('Table view error:', e);
+    res.status(500).json({ error: 'fetch_table_view_failed' });
+  }
+});
+
+/* --------------------------------- Get Users for Filter -------------------------------- */
+app.get('/api/users/list', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
+
+    const result = await execQuery(`
+      SELECT DISTINCT username 
+      FROM users 
+      ORDER BY username
+    `);
+    
+    res.json({ users: result.rows.map(r => r.username) });
+  } catch (e) {
+    console.error('Get users error:', e);
+    res.status(500).json({ error: 'fetch_users_failed' });
+  }
+});
+
+/* --------------------------------- Send CSV via Email -------------------------------- */
+app.post('/api/allocations/send-csv', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+
+    const { email, filters } = req.body;
+    
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ error: 'invalid_email', message: 'Valid email address is required' });
+    }
+
+    const {
+      search = '',
+      startDate = '',
+      endDate = '',
+      gender = '',
+      status = '',
+      allocatedBy = '',
+      location_id = '',
+      tent_index = '',
+      block_index = '',
+      sortField = 'updated_at',
+      sortOrder = 'desc'
+    } = filters || {};
+
+    // Validate sortField to prevent SQL injection
+    const allowedSortFields = ['name', 'phone', 'start_date', 'end_date', 'created_at', 'updated_at'];
+    const validSortField = allowedSortFields.includes(sortField) ? sortField : 'updated_at';
+    const validSortOrder = sortOrder?.toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+
+    // Build WHERE conditions (same as table-view)
+    let whereConditions = [];
+    let params = [];
+    let paramCounter = 1;
+
+    if (search) {
+      whereConditions.push(`(LOWER(a.name) LIKE $${paramCounter} OR a.phone LIKE $${paramCounter})`);
+      params.push(`%${search.toLowerCase()}%`);
+      paramCounter++;
+    }
+
+    if (startDate) {
+      whereConditions.push(`DATE(a.created_at) >= $${paramCounter}`);
+      params.push(startDate);
+      paramCounter++;
+    }
+
+    if (endDate) {
+      whereConditions.push(`DATE(a.created_at) <= $${paramCounter}`);
+      params.push(endDate);
+      paramCounter++;
+    }
+
+    if (gender) {
+      whereConditions.push(`LOWER(a.gender) = $${paramCounter}`);
+      params.push(gender.toLowerCase());
+      paramCounter++;
+    }
+
+    if (location_id) {
+      whereConditions.push(`a.location_id = $${paramCounter}`);
+      params.push(location_id);
+      paramCounter++;
+    }
+
+    if (tent_index) {
+      whereConditions.push(`a.tent_index = $${paramCounter}`);
+      params.push(tent_index);
+      paramCounter++;
+    }
+
+    if (block_index) {
+      whereConditions.push(`a.block_index = $${paramCounter}`);
+      params.push(block_index);
+      paramCounter++;
+    }
+
+    if (status) {
+      const statuses = status.split(',').map(s => s.trim());
+      const statusConditions = [];
+      const today = new Date().toISOString().split('T')[0];
+      
+      if (statuses.includes('active')) {
+        statusConditions.push(`(a.deleted_at IS NULL AND a.end_date >= '${today}')`);
+      }
+      if (statuses.includes('expired')) {
+        statusConditions.push(`(a.deleted_at IS NULL AND a.end_date < '${today}')`);
+      }
+      if (statuses.includes('left_early')) {
+        statusConditions.push(`(a.deleted_at IS NOT NULL AND EXISTS (
+          SELECT 1 FROM audit_logs al 
+          WHERE al.action = 'deallocate' 
+            AND al.entity_type = 'allocation' 
+            AND al.entity_id = a.id 
+            AND al.details->>'reason' = 'left_early'
+        ))`);
+      }
+      if (statuses.includes('no_show')) {
+        statusConditions.push(`(a.deleted_at IS NOT NULL AND EXISTS (
+          SELECT 1 FROM audit_logs al 
+          WHERE al.action = 'deallocate' 
+            AND al.entity_type = 'allocation' 
+            AND al.entity_id = a.id 
+            AND al.details->>'reason' = 'no_show'
+        ))`);
+      }
+      if (statuses.includes('booking_error')) {
+        statusConditions.push(`(a.deleted_at IS NOT NULL AND EXISTS (
+          SELECT 1 FROM audit_logs al 
+          WHERE al.action = 'deallocate' 
+            AND al.entity_type = 'allocation' 
+            AND al.entity_id = a.id 
+            AND al.details->>'reason' = 'booking_error'
+        ))`);
+      }
+      if (statuses.includes('other')) {
+        statusConditions.push(`(a.deleted_at IS NOT NULL AND NOT EXISTS (
+          SELECT 1 FROM audit_logs al 
+          WHERE al.action = 'deallocate' 
+            AND al.entity_type = 'allocation' 
+            AND al.entity_id = a.id 
+            AND al.details->>'reason' IN ('left_early', 'no_show', 'booking_error')
+        ))`);
+      }
+      
+      if (statusConditions.length > 0) {
+        whereConditions.push(`(${statusConditions.join(' OR ')})`);
+      }
+    }
+
+    const whereClause = whereConditions.length > 0 ? whereConditions.join(' AND ') : '1=1';
+
+    // Fetch ALL data (no pagination)
+    const dataQuery = `
+      SELECT 
+        a.id,
+        a.name,
+        a.phone,
+        a.gender,
+        a.start_date,
+        a.end_date,
+        a.created_at,
+        a.updated_at,
+        a.deleted_at,
+        a.bed_number,
+        l.id as location_id,
+        l.name as location_name,
+        t.tent_index,
+        t.name as tent_name,
+        b.block_index,
+        b.name as block_name,
+        COALESCE(creator.username, 'Unknown') as allocated_by,
+        CASE 
+          WHEN a.deleted_at IS NOT NULL THEN
+            COALESCE(
+              (SELECT al.details->>'reason' 
+               FROM audit_logs al 
+               WHERE al.action = 'deallocate' 
+                 AND al.entity_type = 'allocation' 
+                 AND al.entity_id = a.id 
+               ORDER BY al.created_at DESC 
+               LIMIT 1
+              ), 'not_specified'
+            )
+          ELSE NULL
+        END as reason
+      FROM allocations a
+      JOIN blocks b ON a.block_id = b.id
+      JOIN tents t ON b.tent_id = t.id
+      JOIN locations l ON t.location_id = l.id
+      LEFT JOIN LATERAL (
+        SELECT username
+        FROM audit_logs
+        WHERE entity_type = 'allocation'
+          AND entity_id = a.id
+          AND action IN ('allocate', 'bulk_allocate', 'smart_reserve')
+        ORDER BY created_at ASC
+        LIMIT 1
+      ) creator ON true
+      WHERE ${whereClause}
+      ${allocatedBy ? `AND LOWER(creator.username) = $${paramCounter}` : ''}
+      ORDER BY a.${validSortField} ${validSortOrder}
+    `;
+    
+    if (allocatedBy) {
+      params.push(allocatedBy.toLowerCase());
+    }
+
+    const dataResult = await execQuery(dataQuery, params);
+
+    // Generate CSV
+    const columns = [
+      'id', 'name', 'phone', 'gender', 'location_name', 'tent_name', 'block_name', 'bed_number',
+      'start_date', 'end_date', 'created_at', 'updated_at', 'allocated_by', 'deleted_at', 'reason'
+    ];
+
+    const headers = columns.join(',');
+    const csvRows = dataResult.rows.map(row => {
+      return columns.map(col => {
+        const val = row[col];
+        if (val === null || val === undefined) return '';
+        const str = String(val).replace(/"/g, '""');
+        return `"${str}"`;
+      }).join(',');
+    });
+
+    const csvContent = [headers, ...csvRows].join('\n');
+
+    // Import Resend
+    const { Resend } = await import('resend');
+    const resend = new Resend(config.resendApiKey);
+
+    // Send email - For now, send to verified email (Resend limitation in dev mode)
+    // In production, verify a domain and use that for 'from' address
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const recipientEmail = config.backupEmail; // Send to verified email
+    
+    const { data, error } = await resend.emails.send({
+      from: 'BedSched <onboarding@resend.dev>',
+      to: [recipientEmail],
+      subject: `BedSched Export for ${email} - ${timestamp}`,
+      html: `
+        <h2>BedSched Allocations Export</h2>
+        <p><strong>Note:</strong> This export was requested by <strong>${user.username}</strong> to be sent to <strong>${email}</strong></p>
+        <p>Due to Resend email limitations in development mode, this is being sent to the verified email address. Please forward this to ${email} if needed.</p>
+        <hr />
+        <p>The filtered allocations data is attached.</p>
+        <p><strong>Export Details:</strong></p>
+        <ul>
+          <li>Total Records: ${dataResult.rows.length}</li>
+          <li>Generated: ${new Date().toLocaleString()}</li>
+          <li>Requested by: ${user.username}</li>
+          <li>Intended recipient: ${email}</li>
+        </ul>
+        <p>The CSV file contains all allocations matching the filter criteria.</p>
+      `,
+      attachments: [
+        {
+          filename: `allocations-export-${timestamp}.csv`,
+          content: Buffer.from(csvContent).toString('base64')
+        }
+      ]
+    });
+
+    if (error) {
+      console.error('[SEND_CSV] Error sending email:', error);
+      return res.status(500).json({ error: 'email_send_failed', message: error.message });
+    }
+
+    await logAudit(req, 'send_csv_export', 'allocations', null, { 
+      requestedEmail: email,
+      actualRecipient: recipientEmail,
+      recordCount: dataResult.rows.length,
+      filters 
+    });
+
+    res.json({ 
+      ok: true, 
+      message: `CSV sent to ${recipientEmail} (intended for ${email}). Please check your email.`,
+      recordCount: dataResult.rows.length 
+    });
+
+  } catch (e) {
+    console.error('Send CSV error:', e);
+    res.status(500).json({ error: 'send_csv_failed', message: e.message });
+  }
+});
+
+/* --------------------------------- Historical Deallocations -------------------------------- */
+// GET /api/allocations/historical-deallocations?date=YYYY-MM-DD
+app.get('/api/allocations/historical-deallocations', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
+
+    let { date, location_id, tent_index, block_index } = req.query;
+    if (!date) {
+      return res.status(400).json({ error: 'missing_date', message: 'Date parameter is required' });
+    }
+
+    // Force location_user to only see their location's data
+    if (user.role === 'location_user' && user.locationId) {
+      location_id = String(user.locationId);
+    }
+
+    // Build WHERE conditions for filters
+    let filterConditions = '';
+    let filterParams = [];
+    let paramCounter = 2; // Start at 2 since $1 is used for date
+
+    if (location_id) {
+      filterConditions += ` AND l.id = $${paramCounter}`;
+      filterParams.push(location_id);
+      paramCounter++;
+    }
+    if (tent_index) {
+      filterConditions += ` AND t.tent_index = $${paramCounter}`;
+      filterParams.push(tent_index);
+      paramCounter++;
+    }
+    if (block_index) {
+      filterConditions += ` AND b.block_index = $${paramCounter}`;
+      filterParams.push(block_index);
+      paramCounter++;
+    }
+
+    // Get manual deallocations for the selected date (with or without audit logs)
+    const manualDeallocationsQuery = `
+      SELECT 
+        a.id,
+        a.name,
+        a.phone,
+        a.gender,
+        a.start_date,
+        a.end_date,
+        a.bed_number,
+        a.deleted_at,
+        l.id as location_id,
+        l.name as location_name,
+        t.tent_index,
+        t.name as tent_name,
+        b.block_index,
+        b.name as block_name,
+        COALESCE(al.details->>'reason', 'not_specified') as reason,
+        u.username as deallocated_by
+      FROM allocations a
+      JOIN blocks b ON a.block_id = b.id
+      JOIN tents t ON b.tent_id = t.id
+      JOIN locations l ON t.location_id = l.id
+      LEFT JOIN audit_logs al ON al.action = 'deallocate' 
+        AND al.entity_type = 'allocation' 
+        AND al.entity_id = a.id
+      LEFT JOIN users u ON al.user_id = u.id
+      WHERE a.deleted_at IS NOT NULL
+        AND DATE(a.deleted_at) = $1
+        ${filterConditions}
+      ORDER BY a.deleted_at DESC
+    `;
+
+    // Get allocations that expired on the previous day only
+    const previousDate = new Date(date);
+    previousDate.setDate(previousDate.getDate() - 1);
+    const previousDateStr = previousDate.toISOString().split('T')[0];
+
+    const expiredAllocationsQuery = `
+      SELECT 
+        a.id,
+        a.name,
+        a.phone,
+        a.gender,
+        a.start_date,
+        a.end_date,
+        a.bed_number,
+        l.id as location_id,
+        l.name as location_name,
+        t.tent_index,
+        t.name as tent_name,
+        b.block_index,
+        b.name as block_name
+      FROM allocations a
+      JOIN blocks b ON a.block_id = b.id
+      JOIN tents t ON b.tent_id = t.id
+      JOIN locations l ON t.location_id = l.id
+      WHERE a.deleted_at IS NULL
+        AND DATE(a.end_date) = $1
+        AND a.status = 'confirmed'
+        ${filterConditions}
+      ORDER BY a.end_date DESC
+    `;
+
+    const manualParams = [date, ...filterParams];
+    const expiredParams = [previousDateStr, ...filterParams];
+
+    const [manualResult, expiredResult] = await Promise.all([
+      execQuery(manualDeallocationsQuery, manualParams),
+      execQuery(expiredAllocationsQuery, expiredParams)
+    ]);
+
+    res.json({
+      ok: true,
+      date,
+      previousDate: previousDateStr,
+      manualDeallocations: manualResult.rows,
+      expiredAllocations: expiredResult.rows,
+      manualCount: manualResult.rows.length,
+      expiredCount: expiredResult.rows.length
+    });
+  } catch (e) {
+    console.error('Historical deallocations error:', e);
+    res.status(500).json({ error: 'fetch_historical_deallocations_failed' });
+  }
+});
+
+/* --------------------------------- Send Historical Deallocations CSV via Email -------------------------------- */
+app.post('/api/allocations/historical-deallocations/send-csv', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+
+    const { email, date, location_id = '', tent_index = '', block_index = '' } = req.body;
+    
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ error: 'invalid_email', message: 'Valid email address is required' });
+    }
+
+    if (!date) {
+      return res.status(400).json({ error: 'missing_date', message: 'Date is required' });
+    }
+
+    // Build WHERE conditions for filters
+    let manualWhereConditions = ['a.deleted_at IS NOT NULL', 'DATE(a.deleted_at) = $1'];
+    let expiredWhereConditions = ['a.deleted_at IS NULL', 'DATE(a.end_date) = $1', "a.status = 'confirmed'"];
+    let params = [date];
+    let paramCounter = 2;
+
+    if (location_id) {
+      manualWhereConditions.push(`l.id = $${paramCounter}`);
+      expiredWhereConditions.push(`l.id = $${paramCounter}`);
+      params.push(location_id);
+      paramCounter++;
+    }
+    if (tent_index) {
+      manualWhereConditions.push(`t.tent_index = $${paramCounter}`);
+      expiredWhereConditions.push(`t.tent_index = $${paramCounter}`);
+      params.push(tent_index);
+      paramCounter++;
+    }
+    if (block_index) {
+      manualWhereConditions.push(`b.block_index = $${paramCounter}`);
+      expiredWhereConditions.push(`b.block_index = $${paramCounter}`);
+      params.push(block_index);
+      paramCounter++;
+    }
+
+    const manualWhereClause = manualWhereConditions.join(' AND ');
+    const expiredWhereClause = expiredWhereConditions.join(' AND ');
+
+    // Get manual deallocations
+    const manualDeallocationsQuery = `
+      SELECT 
+        a.id,
+        a.name,
+        a.phone,
+        a.gender,
+        a.start_date,
+        a.end_date,
+        a.bed_number,
+        a.deleted_at,
+        l.id as location_id,
+        l.name as location_name,
+        t.tent_index,
+        t.name as tent_name,
+        b.block_index,
+        b.name as block_name,
+        COALESCE(al.details->>'reason', 'not_specified') as reason,
+        u.username as deallocated_by
+      FROM allocations a
+      JOIN blocks b ON a.block_id = b.id
+      JOIN tents t ON b.tent_id = t.id
+      JOIN locations l ON t.location_id = l.id
+      LEFT JOIN audit_logs al ON al.action = 'deallocate' 
+        AND al.entity_type = 'allocation' 
+        AND al.entity_id = a.id
+      LEFT JOIN users u ON al.user_id = u.id
+      WHERE ${manualWhereClause}
+      ORDER BY a.deleted_at DESC
+    `;
+
+    // Get expired allocations
+    const previousDate = new Date(date);
+    previousDate.setDate(previousDate.getDate() - 1);
+    const previousDateStr = previousDate.toISOString().split('T')[0];
+    
+    const expiredParams = [previousDateStr, ...params.slice(1)];
+    const expiredAllocationsQuery = `
+      SELECT 
+        a.id,
+        a.name,
+        a.phone,
+        a.gender,
+        a.start_date,
+        a.end_date,
+        a.bed_number,
+        l.id as location_id,
+        l.name as location_name,
+        t.tent_index,
+        t.name as tent_name,
+        b.block_index,
+        b.name as block_name
+      FROM allocations a
+      JOIN blocks b ON a.block_id = b.id
+      JOIN tents t ON b.tent_id = t.id
+      JOIN locations l ON t.location_id = l.id
+      WHERE ${expiredWhereClause}
+      ORDER BY a.end_date DESC
+    `;
+
+    const [manualResult, expiredResult] = await Promise.all([
+      execQuery(manualDeallocationsQuery, params),
+      execQuery(expiredAllocationsQuery, expiredParams)
+    ]);
+
+    // Generate CSV
+    const csvRows = [];
+    
+    // Add expired allocations section
+    csvRows.push(`"Section","Expired Allocations on ${previousDateStr}"`);
+    csvRows.push('"ID","Name","Phone","Gender","Location","Tent","Block","Bed","Start Date","End Date"');
+    expiredResult.rows.forEach(row => {
+      csvRows.push([
+        row.id,
+        row.name || '',
+        row.phone || '',
+        row.gender || '',
+        row.location_name || '',
+        row.tent_name || `Tent ${row.tent_index}`,
+        row.block_name || `Block ${row.block_index}`,
+        row.bed_number,
+        row.start_date ? new Date(row.start_date).toISOString().split('T')[0] : '',
+        row.end_date ? new Date(row.end_date).toISOString().split('T')[0] : ''
+      ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(','));
+    });
+
+    csvRows.push(''); // Empty row separator
+
+    // Add manual deallocations section
+    csvRows.push(`"Section","Manual Deallocations on ${date}"`);
+    csvRows.push('"ID","Name","Phone","Gender","Location","Tent","Block","Bed","Start Date","End Date","Deallocated At","Reason","Deallocated By"');
+    manualResult.rows.forEach(row => {
+      csvRows.push([
+        row.id,
+        row.name || '',
+        row.phone || '',
+        row.gender || '',
+        row.location_name || '',
+        row.tent_name || `Tent ${row.tent_index}`,
+        row.block_name || `Block ${row.block_index}`,
+        row.bed_number,
+        row.start_date ? new Date(row.start_date).toISOString().split('T')[0] : '',
+        row.end_date ? new Date(row.end_date).toISOString().split('T')[0] : '',
+        row.deleted_at ? new Date(row.deleted_at).toISOString() : '',
+        row.reason || 'not_specified',
+        row.deallocated_by || 'System'
+      ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(','));
+    });
+
+    const csvContent = csvRows.join('\n');
+
+    // Import Resend
+    const { Resend } = await import('resend');
+    const resend = new Resend(config.resendApiKey);
+
+    // Send email
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const recipientEmail = config.backupEmail;
+    const csvBase64 = Buffer.from(csvContent, 'utf-8').toString('base64');
+    
+    const { data, error } = await resend.emails.send({
+      from: 'BedSched <onboarding@resend.dev>',
+      to: [recipientEmail],
+      subject: `BedSched Historical Deallocations for ${email} - ${date} - ${timestamp}`,
+      html: `
+        <h2>Historical Deallocations Export</h2>
+        <p><strong>Intended recipient:</strong> ${email}</p>
+        <p><strong>Note:</strong> Due to Resend limitations in development mode, this email was sent to the verified address.</p>
+        <p><strong>Date:</strong> ${date}</p>
+        <p><strong>Expired Allocations:</strong> ${expiredResult.rows.length} (expired on ${previousDateStr})</p>
+        <p><strong>Manual Deallocations:</strong> ${manualResult.rows.length} (deallocated on ${date})</p>
+        <p><strong>Total Records:</strong> ${expiredResult.rows.length + manualResult.rows.length}</p>
+        ${location_id ? `<p><strong>Filtered by Location ID:</strong> ${location_id}</p>` : ''}
+        ${tent_index ? `<p><strong>Filtered by Tent:</strong> ${tent_index}</p>` : ''}
+        ${block_index ? `<p><strong>Filtered by Block:</strong> ${block_index}</p>` : ''}
+        <p>The CSV file is attached to this email.</p>
+      `,
+      attachments: [{
+        filename: `historical-deallocations-${date}.csv`,
+        content: csvBase64
+      }]
+    });
+
+    if (error) {
+      console.error('Resend error:', error);
+      return res.status(500).json({ error: 'email_send_failed', message: error.message });
+    }
+
+    await logAudit(req, 'export_historical_deallocations', 'allocation', null, { 
+      date, 
+      email,
+      recordCount: expiredResult.rows.length + manualResult.rows.length,
+      expiredCount: expiredResult.rows.length,
+      manualCount: manualResult.rows.length
+    });
+
+    res.json({
+      ok: true,
+      message: 'CSV email sent successfully',
+      recordCount: expiredResult.rows.length + manualResult.rows.length,
+      expiredCount: expiredResult.rows.length,
+      manualCount: manualResult.rows.length,
+      emailId: data?.id
+    });
+  } catch (e) {
+    console.error('Send historical deallocations CSV error:', e);
+    res.status(500).json({ error: 'send_csv_failed', message: e.message });
+  }
+});
+
+/* --------------------------------- TEST DATA GENERATOR -------------------------------- */
+
+// POST /api/test/generate-dummy-allocations
+// WARNING: Only use in development/testing environments!
+app.post('/api/test/generate-dummy-allocations', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+
+    const { count = 20 } = req.body || {};
+    
+    // Get multiple locations, tents, and blocks for variety
+    const locationsResult = await execQuery('SELECT id FROM locations');
+    if (locationsResult.rows.length === 0) {
+      return res.status(400).json({ error: 'no_locations_found', message: 'Create locations first' });
+    }
+    const locations = locationsResult.rows;
+
+    const tentsResult = await execQuery(`
+      SELECT t.id, t.tent_index, t.location_id 
+      FROM tents t
+      WHERE t.location_id = ANY($1)
+    `, [locations.map(l => l.id)]);
+    if (tentsResult.rows.length === 0) {
+      return res.status(400).json({ error: 'no_tents_found', message: 'Create tents first' });
+    }
+    const tents = tentsResult.rows;
+
+    const blocksResult = await execQuery(`
+      SELECT b.id, b.block_index, b.size, b.tent_id, b.location_id
+      FROM blocks b
+      WHERE b.tent_id = ANY($1)
+    `, [tents.map(t => t.id)]);
+    if (blocksResult.rows.length === 0) {
+      return res.status(400).json({ error: 'no_blocks_found', message: 'Create blocks first' });
+    }
+    const blocks = blocksResult.rows;
+
+    const names = ['Amit Kumar', 'Priya Sharma', 'Rahul Verma', 'Anjali Patel', 'Vikram Singh', 
+                   'Neha Gupta', 'Sanjay Reddy', 'Kavita Desai', 'Arjun Nair', 'Pooja Iyer',
+                   'Rajesh Kumar', 'Meera Shah', 'Suresh Rao', 'Divya Menon', 'Karan Joshi'];
+    const genders = ['Male', 'Female'];
+    const reasons = ['left_early', 'no_show', 'booking_error'];
+
+    const today = new Date();
+    const allocationsToInsert = [];
+    const allocationsToDelete = [];
+
+    // Prepare all allocations data first
+    for (let i = 0; i < count; i++) {
+      // Randomly select location, tent, and block for variety
+      const block = blocks[Math.floor(Math.random() * blocks.length)];
+      const tent = tents.find(t => t.id === block.tent_id);
+      const bedNumber = (i % block.size) + 1;
+      const name = names[Math.floor(Math.random() * names.length)];
+      const gender = genders[Math.floor(Math.random() * genders.length)];
+      const phone = `98${Math.floor(10000000 + Math.random() * 90000000)}`;
+      
+      // Create different scenarios
+      const scenario = Math.floor(Math.random() * 5);
+      let startDate, endDate, shouldDelete = false, deleteReason = null;
+
+      switch(scenario) {
+        case 0: // Expired booking (past dates)
+          startDate = new Date(today.getTime() - (15 * 24 * 60 * 60 * 1000)); // 15 days ago
+          endDate = new Date(today.getTime() - (2 * 24 * 60 * 60 * 1000)); // 2 days ago
+          break;
+        
+        case 1: // Current active booking
+          startDate = new Date(today.getTime() - (3 * 24 * 60 * 60 * 1000)); // 3 days ago
+          endDate = new Date(today.getTime() + (5 * 24 * 60 * 60 * 1000)); // 5 days from now
+          break;
+        
+        case 2: // Future booking
+          startDate = new Date(today.getTime() + (2 * 24 * 60 * 60 * 1000)); // 2 days from now
+          endDate = new Date(today.getTime() + (10 * 24 * 60 * 60 * 1000)); // 10 days from now
+          break;
+        
+        case 3: // Manually deleted (left early)
+          startDate = new Date(today.getTime() - (10 * 24 * 60 * 60 * 1000)); // 10 days ago
+          endDate = new Date(today.getTime() + (5 * 24 * 60 * 60 * 1000)); // would have ended 5 days from now
+          shouldDelete = true;
+          deleteReason = 'left_early';
+          break;
+        
+        case 4: // Manually deleted (no show / booking error)
+          startDate = new Date(today.getTime() - (5 * 24 * 60 * 60 * 1000)); // 5 days ago
+          endDate = new Date(today.getTime() + (7 * 24 * 60 * 60 * 1000)); // 7 days from now
+          shouldDelete = true;
+          deleteReason = reasons[Math.floor(Math.random() * reasons.length)]; // left_early, no_show, or booking_error
+          break;
+      }
+
+      const startDateStr = startDate.toISOString().split('T')[0];
+      const endDateStr = endDate.toISOString().split('T')[0];
+
+      allocationsToInsert.push({
+        locationId: block.location_id,
+        tentId: block.tent_id,
+        blockId: block.id,
+        tentIndex: tent.tent_index,
+        blockIndex: block.block_index,
+        bedNumber,
+        name, phone, gender, startDateStr, endDateStr,
+        shouldDelete, deleteReason, scenario
+      });
+    }
+
+    // Bulk insert all allocations
+    const valuesClauses = [];
+    const allParams = [];
+    let paramIndex = 1;
+
+    for (const alloc of allocationsToInsert) {
+      const valuesClause = `($${paramIndex}, $${paramIndex+1}, $${paramIndex+2}, $${paramIndex+3}, $${paramIndex+4}, $${paramIndex+5}, $${paramIndex+6}, $${paramIndex+7}, $${paramIndex+8}, $${paramIndex+9}, $${paramIndex+10}, $${paramIndex+11}, $${paramIndex+12}, $${paramIndex+13}, $${paramIndex+14})`;
+      valuesClauses.push(valuesClause);
+      // Set was_occupied = false for no_show/booking_error, true otherwise (including left_early)
+      const wasOccupied = !alloc.shouldDelete || (alloc.shouldDelete && alloc.deleteReason === 'left_early');
+      allParams.push(
+        alloc.locationId, alloc.tentId, alloc.blockId, alloc.tentIndex, alloc.blockIndex, alloc.bedNumber,
+        alloc.name, alloc.phone, alloc.gender, alloc.startDateStr, alloc.endDateStr, 
+        'confirmed', wasOccupied, 'test-person-photo.jpg', 'test-aadhaar-photo.jpg'
+      );
+      paramIndex += 15;
+    }
+
+    const bulkInsertQuery = `
+      INSERT INTO allocations(
+        location_id, tent_id, block_id, tent_index, block_index, bed_number, 
+        name, phone, gender, start_date, end_date, status, was_occupied,
+        person_photo_key, aadhaar_photo_key
+      )
+      VALUES ${valuesClauses.join(', ')}
+      ON CONFLICT DO NOTHING
+      RETURNING id
+    `;
+
+    const insertResult = await execQuery(bulkInsertQuery, allParams);
+    const insertedIds = insertResult.rows.map(row => row.id);
+
+    // Prepare bulk deletions and audit logs
+    const idsToDelete = [];
+    const auditLogValues = [];
+    const auditParams = [];
+    let auditParamIndex = 1;
+
+    for (let i = 0; i < insertedIds.length; i++) {
+      const allocationId = insertedIds[i];
+      const originalData = allocationsToInsert[i];
+
+      if (originalData.shouldDelete) {
+        idsToDelete.push(allocationId);
+        
+        // Prepare audit log values
+        const auditValuesClause = `($${auditParamIndex}, $${auditParamIndex+1}, $${auditParamIndex+2}, $${auditParamIndex+3}, $${auditParamIndex+4}, $${auditParamIndex+5}, NOW())`;
+        auditLogValues.push(auditValuesClause);
+        auditParams.push(
+          user.id,
+          user.username,
+          'deallocate',
+          'allocation',
+          allocationId,
+          JSON.stringify({ reason: originalData.deleteReason, phone: originalData.phone, test_data: true })
+        );
+        auditParamIndex += 6;
+      }
+    }
+
+    // Bulk soft delete
+    if (idsToDelete.length > 0) {
+      const deletePlaceholders = idsToDelete.map((_, i) => `$${i + 1}`).join(',');
+      await execQuery(
+        `UPDATE allocations SET deleted_at = NOW() WHERE id IN (${deletePlaceholders})`,
+        idsToDelete
+      );
+
+      // Bulk insert audit logs
+      const bulkAuditQuery = `
+        INSERT INTO audit_logs (user_id, username, action, entity_type, entity_id, details, created_at)
+        VALUES ${auditLogValues.join(', ')}
+      `;
+      await execQuery(bulkAuditQuery, auditParams);
+    }
+
+    const createdAllocations = insertedIds.map((id, i) => ({
+      id,
+      name: allocationsToInsert[i].name,
+      bedNumber: allocationsToInsert[i].bedNumber,
+      startDate: allocationsToInsert[i].startDateStr,
+      endDate: allocationsToInsert[i].endDateStr,
+      scenario: ['expired', 'active', 'future', 'deleted_early', 'deleted_other'][allocationsToInsert[i].scenario],
+      deleted: allocationsToInsert[i].shouldDelete,
+      deleteReason: allocationsToInsert[i].deleteReason
+    }));
+
+    res.json({
+      ok: true,
+      message: 'Dummy allocations created',
+      created: insertedIds.length,
+      deleted: idsToDelete.length,
+      active: insertedIds.length - idsToDelete.length,
+      allocations: createdAllocations
+    });
+
+  } catch (e) {
+    console.error('Generate dummy allocations error:', e);
+    res.status(500).json({ error: 'generation_failed', message: e.message });
+  }
+});
 
 /* --------------------------------- Start -------------------------------- */
 
@@ -1501,12 +2558,17 @@ app.get('/api/allocations/by-phone/:phone', async (req, res) => {
         a.status,
         a.person_photo_key,
         a.aadhaar_photo_key,
+        a.deleted_at,
         TO_CHAR(a.created_at, 'YYYY-MM-DD HH24:MI:SS') as created_at,
-        l.name as location_name
+        l.name as location_name,
+        t.name as tent_name,
+        b.name as block_name
       FROM allocations a
       JOIN locations l ON l.id = a.location_id
-      WHERE a.phone = $1 
-        AND a.deleted_at IS NULL
+      LEFT JOIN tents t ON t.location_id = a.location_id AND t.tent_index = a.tent_index
+      LEFT JOIN blocks b ON b.tent_id = a.tent_id AND b.block_index = a.block_index
+      WHERE a.phone = $1
+        AND a.end_date >= ${todaySQL}
       ORDER BY a.created_at DESC
     `, [phone]);
 
@@ -1686,14 +2748,28 @@ app.patch('/api/allocations/by-phone/update-end-date', async (req, res) => {
 });
 
 // POST /api/allocations/by-phone/deallocate
-// body: { phone, batchId?, allocationIds? }
+// body: { phone, batchId?, allocationIds?, reason? }
 app.post('/api/allocations/by-phone/deallocate', async (req, res) => {
   try {
     const user = getUserFromRequest(req);
     if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
-    const { phone, batchId, allocationIds } = req.body || {};
+    const { phone, batchId, allocationIds, reason } = req.body || {};
     if (!phone) return res.status(400).json({ error: 'missing_phone' });
 
+    // First, get the allocation IDs that will be deallocated
+    let selectBase = `SELECT id FROM allocations WHERE phone = $1 AND deleted_at IS NULL`;
+    const selectParams = [phone];
+    if (batchId) { 
+      selectBase += ` AND batch_id = $${selectParams.push(batchId)}`; 
+    }
+    if (Array.isArray(allocationIds) && allocationIds.length) {
+      const placeholders = allocationIds.map((_, i) => `$${selectParams.length + i + 1}`).join(',');
+      selectBase += ` AND id IN (${placeholders})`;
+      selectParams.push(...allocationIds);
+    }
+    const allocationsToDelete = await execQuery(selectBase, selectParams);
+
+    // Now perform the update
     let base = `UPDATE allocations SET deleted_at = NOW(), updated_at = NOW() WHERE phone = $1 AND deleted_at IS NULL`;
     const params = [phone];
     if (batchId) { base += ` AND batch_id = $${params.push(batchId)}`; }
@@ -1703,6 +2779,24 @@ app.post('/api/allocations/by-phone/deallocate', async (req, res) => {
       params.push(...allocationIds);
     }
     const r = await execQuery(base, params);
+
+    // Create audit log entries for each deallocated allocation
+    if (allocationsToDelete.rows.length > 0) {
+      for (const alloc of allocationsToDelete.rows) {
+        await execQuery(
+          `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, details, created_at)
+           VALUES ($1, $2, $3, $4, $5, NOW())`,
+          [
+            user.id,
+            'deallocate',
+            'allocation',
+            alloc.id,
+            JSON.stringify({ reason: reason || 'not_specified', phone })
+          ]
+        );
+      }
+    }
+
     res.json({ ok: true, deallocated: r.rowCount });
   } catch (e) {
     console.error(e);
@@ -1710,7 +2804,7 @@ app.post('/api/allocations/by-phone/deallocate', async (req, res) => {
   }
 });
 
-// GET /api/allocations/departures?date=YYYY-MM-DD
+// GET /api/allocations/departures?date=YYYY-MM-DD&page=1&limit=50&sortField=name&sortOrder=asc
 app.get('/api/allocations/departures', async (req, res) => {
   try {
     const user = getUserFromRequest(req);
@@ -1718,6 +2812,48 @@ app.get('/api/allocations/departures', async (req, res) => {
     const date = String(req.query.date || '').trim();
     if (!date) return res.status(400).json({ error: 'missing_date' });
 
+    const { page = 1, limit = 50, sortField = 'bed_number', sortOrder = 'asc', location_id = '', tent_index = '', block_index = '' } = req.query;
+    const offset = (Number(page) - 1) * Number(limit);
+    
+    // Validate sortField to prevent SQL injection
+    const allowedSortFields = ['name', 'phone', 'location_name', 'tent_index', 'block_index', 'bed_number', 'start_date', 'end_date', 'gender'];
+    const validSortField = allowedSortFields.includes(sortField) ? sortField : 'bed_number';
+    const validSortOrder = sortOrder?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+
+    // Build WHERE conditions
+    let whereConditions = ['a.deleted_at IS NULL', 'a.end_date = $1'];
+    let params = [date];
+    let paramCounter = 2;
+
+    if (location_id) {
+      whereConditions.push(`a.location_id = $${paramCounter}`);
+      params.push(location_id);
+      paramCounter++;
+    }
+    if (tent_index) {
+      whereConditions.push(`a.tent_index = $${paramCounter}`);
+      params.push(tent_index);
+      paramCounter++;
+    }
+    if (block_index) {
+      whereConditions.push(`a.block_index = $${paramCounter}`);
+      params.push(block_index);
+      paramCounter++;
+    }
+
+    const whereClause = whereConditions.join(' AND ');
+
+    // Get total count
+    const countQuery = `
+      SELECT COUNT(*) as total
+      FROM allocations a
+      WHERE ${whereClause}
+    `;
+    const countResult = await execQuery(countQuery, params);
+    const total = Number(countResult.rows[0]?.total || 0);
+
+    // Get paginated data
+    params.push(Number(limit), offset);
     const rows = await execQuery(`
       SELECT a.id, a.phone, a.name, a.location_id, l.name as location_name, 
              a.tent_index, t.name as tent_name, a.block_index, b.name as block_name, 
@@ -1726,23 +2862,228 @@ app.get('/api/allocations/departures', async (req, res) => {
       LEFT JOIN locations l ON a.location_id = l.id
       LEFT JOIN tents t ON a.location_id = t.location_id AND a.tent_index = t.tent_index
       LEFT JOIN blocks b ON t.id = b.tent_id AND a.block_index = b.block_index
-      WHERE a.deleted_at IS NULL AND a.end_date = $1
-      ORDER BY a.location_id, a.tent_index, a.block_index, a.bed_number
-    `, [date]);
-    await logAudit(req, 'download_departures', 'report', null, { date, count: rows.rows.length });
-    res.json({ ok: true, items: rows.rows });
+      WHERE ${whereClause}
+      ORDER BY ${validSortField === 'location_name' ? 'l.name' : 'a.' + validSortField} ${validSortOrder}
+      LIMIT $${paramCounter} OFFSET $${paramCounter + 1}
+    `, params);
+    
+    await logAudit(req, 'view_departures', 'report', null, { date, count: rows.rows.length });
+    res.json({ 
+      ok: true, 
+      items: rows.rows,
+      total,
+      page: Number(page),
+      limit: Number(limit)
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'departures_failed' });
   }
 });
 
-// GET /api/allocations/currently-occupied
+/* --------------------------------- Send Departures CSV via Email -------------------------------- */
+app.post('/api/allocations/departures/send-csv', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
+
+    const { email, date, sortField = 'bed_number', sortOrder = 'asc', location_id = '', tent_index = '', block_index = '' } = req.body;
+    
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ error: 'invalid_email', message: 'Valid email address is required' });
+    }
+
+    if (!date) {
+      return res.status(400).json({ error: 'missing_date', message: 'Date is required' });
+    }
+
+    // Validate sortField to prevent SQL injection
+    const allowedSortFields = ['name', 'phone', 'location_name', 'tent_index', 'block_index', 'bed_number', 'start_date', 'end_date', 'gender'];
+    const validSortField = allowedSortFields.includes(sortField) ? sortField : 'bed_number';
+    const validSortOrder = sortOrder?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+
+    // Build WHERE conditions
+    let whereConditions = ['a.deleted_at IS NULL', 'a.end_date = $1'];
+    let params = [date];
+    let paramCounter = 2;
+
+    if (location_id) {
+      whereConditions.push(`a.location_id = $${paramCounter}`);
+      params.push(location_id);
+      paramCounter++;
+    }
+    if (tent_index) {
+      whereConditions.push(`a.tent_index = $${paramCounter}`);
+      params.push(tent_index);
+      paramCounter++;
+    }
+    if (block_index) {
+      whereConditions.push(`a.block_index = $${paramCounter}`);
+      params.push(block_index);
+      paramCounter++;
+    }
+
+    const whereClause = whereConditions.join(' AND ');
+
+    // Fetch ALL data (no pagination)
+    const dataQuery = `
+      SELECT 
+        a.id, 
+        a.phone, 
+        a.name, 
+        a.gender,
+        a.location_id, 
+        l.name as location_name, 
+        a.tent_index, 
+        t.name as tent_name, 
+        a.block_index, 
+        b.name as block_name, 
+        a.bed_number, 
+        a.status, 
+        a.start_date, 
+        a.end_date,
+        a.created_at
+      FROM allocations a
+      LEFT JOIN locations l ON a.location_id = l.id
+      LEFT JOIN tents t ON a.location_id = t.location_id AND a.tent_index = t.tent_index
+      LEFT JOIN blocks b ON t.id = b.tent_id AND a.block_index = b.block_index
+      WHERE ${whereClause}
+      ORDER BY ${validSortField === 'location_name' ? 'l.name' : 'a.' + validSortField} ${validSortOrder}
+    `;
+
+    const dataResult = await execQuery(dataQuery, params);
+
+    // Generate CSV
+    const columns = [
+      'id', 'name', 'phone', 'gender', 'location_name', 'tent_name', 'block_name', 'bed_number',
+      'start_date', 'end_date', 'status', 'created_at'
+    ];
+
+    const headers = columns.join(',');
+    const csvRows = dataResult.rows.map(row => {
+      return columns.map(col => {
+        const val = row[col];
+        if (val === null || val === undefined) return '';
+        const str = String(val).replace(/"/g, '""');
+        return `"${str}"`;
+      }).join(',');
+    });
+
+    const csvContent = [headers, ...csvRows].join('\n');
+
+    // Import Resend
+    const { Resend } = await import('resend');
+    const resend = new Resend(config.resendApiKey);
+
+    // Send email - For now, send to verified email (Resend limitation in dev mode)
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const recipientEmail = config.backupEmail;
+    
+    const { data, error } = await resend.emails.send({
+      from: 'BedSched <onboarding@resend.dev>',
+      to: [recipientEmail],
+      subject: `BedSched Departures Export for ${email} - ${date} - ${timestamp}`,
+      html: `
+        <h2>BedSched Departures Export</h2>
+        <p><strong>Note:</strong> This export was requested by <strong>${user.username}</strong> to be sent to <strong>${email}</strong></p>
+        <p>Due to Resend email limitations in development mode, this is being sent to the verified email address. Please forward this to ${email} if needed.</p>
+        <hr />
+        <p>The departures data for <strong>${date}</strong> is attached.</p>
+        <p><strong>Export Details:</strong></p>
+        <ul>
+          <li>Total Records: ${dataResult.rows.length}</li>
+          <li>Date: ${date}</li>
+          <li>Generated: ${new Date().toLocaleString()}</li>
+          <li>Requested by: ${user.username}</li>
+          <li>Intended recipient: ${email}</li>
+        </ul>
+        <p>The CSV file contains all departures for the selected date.</p>
+      `,
+      attachments: [
+        {
+          filename: `departures-${date}-${timestamp}.csv`,
+          content: Buffer.from(csvContent).toString('base64')
+        }
+      ]
+    });
+
+    if (error) {
+      console.error('[SEND_DEPARTURES_CSV] Error sending email:', error);
+      return res.status(500).json({ error: 'email_send_failed', message: error.message });
+    }
+
+    await logAudit(req, 'send_departures_csv_export', 'allocations', null, { 
+      requestedEmail: email,
+      actualRecipient: recipientEmail,
+      date,
+      recordCount: dataResult.rows.length
+    });
+
+    res.json({ 
+      ok: true, 
+      message: `CSV sent to ${recipientEmail} (intended for ${email}). Please check your email.`,
+      recordCount: dataResult.rows.length 
+    });
+
+  } catch (e) {
+    console.error('Send departures CSV error:', e);
+    res.status(500).json({ error: 'send_csv_failed', message: e.message });
+  }
+});
+
+// GET /api/allocations/currently-occupied?page=1&limit=50&sortField=name&sortOrder=asc
 app.get('/api/allocations/currently-occupied', async (req, res) => {
   try {
     const user = getUserFromRequest(req);
     if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
 
+    const { page = 1, limit = 50, sortField = 'bed_number', sortOrder = 'asc', location_id = '', tent_index = '', block_index = '' } = req.query;
+    const offset = (Number(page) - 1) * Number(limit);
+    
+    // Validate sortField to prevent SQL injection
+    const allowedSortFields = ['name', 'phone', 'location_name', 'tent_index', 'block_index', 'bed_number', 'start_date', 'end_date', 'gender'];
+    const validSortField = allowedSortFields.includes(sortField) ? sortField : 'bed_number';
+    const validSortOrder = sortOrder?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+
+    // Build WHERE conditions
+    let whereConditions = [
+      'a.deleted_at IS NULL',
+      "a.status = 'confirmed'",
+      `a.start_date <= ${todaySQL}`,
+      `a.end_date >= ${todaySQL}`
+    ];
+    let params = [];
+    let paramCounter = 1;
+
+    if (location_id) {
+      whereConditions.push(`a.location_id = $${paramCounter}`);
+      params.push(location_id);
+      paramCounter++;
+    }
+    if (tent_index) {
+      whereConditions.push(`a.tent_index = $${paramCounter}`);
+      params.push(tent_index);
+      paramCounter++;
+    }
+    if (block_index) {
+      whereConditions.push(`a.block_index = $${paramCounter}`);
+      params.push(block_index);
+      paramCounter++;
+    }
+
+    const whereClause = whereConditions.join(' AND ');
+
+    // Get total count
+    const countQuery = `
+      SELECT COUNT(*) as total
+      FROM allocations a
+      WHERE ${whereClause}
+    `;
+    const countResult = await execQuery(countQuery, params);
+    const total = Number(countResult.rows[0]?.total || 0);
+
+    // Get paginated data
+    params.push(Number(limit), offset);
     const rows = await execQuery(`
       SELECT a.id, a.phone, a.name, a.location_id, l.name as location_name, 
              a.tent_index, t.name as tent_name, a.block_index, b.name as block_name, 
@@ -1751,17 +3092,164 @@ app.get('/api/allocations/currently-occupied', async (req, res) => {
       LEFT JOIN locations l ON a.location_id = l.id
       LEFT JOIN tents t ON a.location_id = t.location_id AND a.tent_index = t.tent_index
       LEFT JOIN blocks b ON t.id = b.tent_id AND a.block_index = b.block_index
-      WHERE a.deleted_at IS NULL 
-        AND a.status = 'confirmed'
-        AND a.start_date <= ${todaySQL}
-        AND a.end_date >= ${todaySQL}
-      ORDER BY a.location_id, a.tent_index, a.block_index, a.bed_number
-    `);
+      WHERE ${whereClause}
+      ORDER BY ${validSortField === 'location_name' ? 'l.name' : 'a.' + validSortField} ${validSortOrder}
+      LIMIT $${paramCounter} OFFSET $${paramCounter + 1}
+    `, params);
+    
     await logAudit(req, 'view_currently_occupied', 'report', null, { count: rows.rows.length });
-    res.json({ ok: true, items: rows.rows });
+    res.json({ 
+      ok: true, 
+      items: rows.rows,
+      total,
+      page: Number(page),
+      limit: Number(limit)
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'currently_occupied_failed' });
+  }
+});
+
+/* --------------------------------- Send Currently Occupied CSV via Email -------------------------------- */
+app.post('/api/allocations/currently-occupied/send-csv', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
+
+    const { email, sortField = 'bed_number', sortOrder = 'asc', location_id = '', tent_index = '', block_index = '' } = req.body;
+    
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ error: 'invalid_email', message: 'Valid email address is required' });
+    }
+
+    // Validate sortField
+    const allowedSortFields = ['name', 'phone', 'location_name', 'tent_index', 'block_index', 'bed_number', 'start_date', 'end_date', 'gender'];
+    const validSortField = allowedSortFields.includes(sortField) ? sortField : 'bed_number';
+    const validSortOrder = sortOrder?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+
+    // Build WHERE conditions
+    let whereConditions = [
+      'a.deleted_at IS NULL',
+      "a.status = 'confirmed'",
+      `a.start_date <= ${todaySQL}`,
+      `a.end_date >= ${todaySQL}`
+    ];
+    let params = [];
+    let paramCounter = 1;
+
+    if (location_id) {
+      whereConditions.push(`a.location_id = $${paramCounter}`);
+      params.push(location_id);
+      paramCounter++;
+    }
+    if (tent_index) {
+      whereConditions.push(`a.tent_index = $${paramCounter}`);
+      params.push(tent_index);
+      paramCounter++;
+    }
+    if (block_index) {
+      whereConditions.push(`a.block_index = $${paramCounter}`);
+      params.push(block_index);
+      paramCounter++;
+    }
+
+    const whereClause = whereConditions.join(' AND ');
+
+    // Fetch ALL data (no pagination)
+    const dataQuery = `
+      SELECT 
+        a.id, 
+        a.phone, 
+        a.name, 
+        a.gender,
+        a.location_id, 
+        l.name as location_name, 
+        a.tent_index, 
+        t.name as tent_name, 
+        a.block_index, 
+        b.name as block_name, 
+        a.bed_number, 
+        a.status, 
+        a.start_date, 
+        a.end_date,
+        a.created_at
+      FROM allocations a
+      LEFT JOIN locations l ON a.location_id = l.id
+      LEFT JOIN tents t ON a.location_id = t.location_id AND a.tent_index = t.tent_index
+      LEFT JOIN blocks b ON t.id = b.tent_id AND a.block_index = b.block_index
+      WHERE ${whereClause}
+      ORDER BY ${validSortField === 'location_name' ? 'l.name' : 'a.' + validSortField} ${validSortOrder}
+    `;
+
+    const dataResult = await execQuery(dataQuery, params);
+
+    // Generate CSV
+    const columns = [
+      'id', 'name', 'phone', 'gender', 'location_name', 'tent_name', 'block_name', 'bed_number',
+      'start_date', 'end_date', 'status', 'created_at'
+    ];
+
+    const headers = columns.join(',');
+    const csvRows = dataResult.rows.map(row => {
+      return columns.map(col => {
+        const val = row[col];
+        if (val === null || val === undefined) return '';
+        const str = String(val).replace(/"/g, '""');
+        return `"${str}"`;
+      }).join(',');
+    });
+
+    const csvContent = [headers, ...csvRows].join('\n');
+
+    // Import Resend
+    const { Resend } = await import('resend');
+    const resend = new Resend(config.resendApiKey);
+
+    // Send email
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const recipientEmail = config.backupEmail;
+    const csvBase64 = Buffer.from(csvContent, 'utf-8').toString('base64');
+    
+    const { data, error } = await resend.emails.send({
+      from: 'BedSched <onboarding@resend.dev>',
+      to: [recipientEmail],
+      subject: `BedSched Currently Occupied Export for ${email} - ${timestamp}`,
+      html: `
+        <h2>Currently Occupied Export</h2>
+        <p><strong>Intended recipient:</strong> ${email}</p>
+        <p><strong>Note:</strong> Due to Resend limitations in development mode, this email was sent to the verified address.</p>
+        <p><strong>Total Records:</strong> ${dataResult.rows.length}</p>
+        ${location_id ? `<p><strong>Filtered by Location ID:</strong> ${location_id}</p>` : ''}
+        ${tent_index ? `<p><strong>Filtered by Tent:</strong> ${tent_index}</p>` : ''}
+        ${block_index ? `<p><strong>Filtered by Block:</strong> ${block_index}</p>` : ''}
+        <p>The CSV file is attached to this email.</p>
+      `,
+      attachments: [{
+        filename: `currently-occupied-${new Date().toISOString().slice(0, 10)}.csv`,
+        content: csvBase64
+      }]
+    });
+
+    if (error) {
+      console.error('Resend error:', error);
+      return res.status(500).json({ error: 'email_send_failed', message: error.message });
+    }
+
+    await logAudit(req, 'export_currently_occupied', 'allocation', null, { 
+      email,
+      recordCount: dataResult.rows.length
+    });
+
+    res.json({
+      ok: true,
+      message: 'CSV email sent successfully',
+      recordCount: dataResult.rows.length,
+      emailId: data?.id
+    });
+  } catch (e) {
+    console.error('Send currently occupied CSV error:', e);
+    res.status(500).json({ error: 'send_csv_failed', message: e.message });
   }
 });
 
@@ -1791,9 +3279,23 @@ app.get('/api/admin/analytics', async (req, res) => {
     const { startDate, endDate, locationId, tentIndex, blockIndex } = req.query;
 
     // Build WHERE clause based on filters
-    let whereConditions = ['a.deleted_at IS NULL'];
+    // Exclude only booking_error and no_show deallocations
+    let whereConditions = [
+      'a.was_occupied = true'
+    ];
     let params = [];
     let paramCounter = 1;
+
+    // Subquery to check if allocation should be excluded (no_show or booking_error)
+    const exclusionSubquery = `
+      AND NOT EXISTS (
+        SELECT 1 FROM audit_logs al_ex
+        WHERE al_ex.action = 'deallocate'
+          AND al_ex.entity_type = 'allocation'
+          AND al_ex.entity_id = a.id
+          AND al_ex.details->>'reason' IN ('no_show', 'booking_error')
+      )
+    `;
 
     if (startDate) {
       whereConditions.push(`a.created_at >= $${paramCounter}::date`);
@@ -1827,23 +3329,25 @@ app.get('/api/admin/analytics', async (req, res) => {
 
     const whereClause = whereConditions.join(' AND ');
 
-    // 1. Total lifetime allocations
+    // 1. Total lifetime allocations (exclude booking errors and no-shows)
     const totalResult = await execQuery(`
       SELECT COUNT(*) as total
       FROM allocations a
       WHERE ${whereClause}
+        ${exclusionSubquery}
     `, params);
 
     // 2. Gender breakdown
     const genderResult = await execQuery(`
       SELECT 
-        LOWER(gender) as gender,
+        LOWER(a.gender) as gender,
         COUNT(*) as count
       FROM allocations a
       WHERE ${whereClause}
-        AND gender IS NOT NULL
-        AND gender != ''
-      GROUP BY LOWER(gender)
+        ${exclusionSubquery}
+        AND a.gender IS NOT NULL
+        AND a.gender != ''
+      GROUP BY LOWER(a.gender)
     `, params);
 
     // 3. Daily allocations timeline
@@ -1853,6 +3357,7 @@ app.get('/api/admin/analytics', async (req, res) => {
         COUNT(*) as count
       FROM allocations a
       WHERE ${whereClause}
+        ${exclusionSubquery}
       GROUP BY DATE(a.created_at)
       ORDER BY date
     `, params);
@@ -1864,17 +3369,67 @@ app.get('/api/admin/analytics', async (req, res) => {
         COUNT(*) as count
       FROM allocations a
       WHERE ${whereClause}
+        ${exclusionSubquery}
       GROUP BY a.end_date
       ORDER BY date
     `, params);
 
-    // 5. Allocations by user (with location info for color coding)
-    // Join with audit_logs to find who created each allocation
+    // 5. Daily deallocations timeline by reason (from audit logs)
+    // Build separate params for deallocations query to match the same filters
+    let deallocParams = [];
+    let deallocConditions = ['al.action = \'deallocate\'', 'al.entity_type = \'allocation\''];
+    let deallocParamCounter = 1;
+
+    if (startDate) {
+      deallocConditions.push(`DATE(al.created_at) >= $${deallocParamCounter}::date`);
+      deallocParams.push(startDate);
+      deallocParamCounter++;
+    }
+
+    if (endDate) {
+      deallocConditions.push(`DATE(al.created_at) <= $${deallocParamCounter}::date + interval '1 day'`);
+      deallocParams.push(endDate);
+      deallocParamCounter++;
+    }
+
+    if (locationId) {
+      deallocConditions.push(`(al.details->>'locationId')::int = $${deallocParamCounter}`);
+      deallocParams.push(locationId);
+      deallocParamCounter++;
+    }
+
+    if (tentIndex) {
+      deallocConditions.push(`(al.details->>'tentIndex')::int = $${deallocParamCounter}`);
+      deallocParams.push(tentIndex);
+      deallocParamCounter++;
+    }
+
+    if (blockIndex) {
+      deallocConditions.push(`(al.details->>'blockIndex')::int = $${deallocParamCounter}`);
+      deallocParams.push(blockIndex);
+      deallocParamCounter++;
+    }
+
+    const deallocWhereClause = deallocConditions.join(' AND ');
+
+    const dailyDeallocationsResult = await execQuery(`
+      SELECT 
+        DATE(al.created_at) as date,
+        COALESCE(al.details->>'reason', 'not_specified') as reason,
+        COUNT(*) as count
+      FROM audit_logs al
+      WHERE ${deallocWhereClause}
+      GROUP BY DATE(al.created_at), al.details->>'reason'
+      ORDER BY date, reason
+    `, deallocParams);
+
+    // 6. Allocations by user (with location info for color coding)
+    // Join with audit_logs to find who created each allocation, exclude booking errors and no-shows
     const userAllocationsResult = await execQuery(`
       SELECT 
         DATE(a.created_at) as date,
-        COALESCE(al.username, 'Unknown') as username,
-        al.user_id,
+        COALESCE(creator.username, 'Unknown') as username,
+        creator.user_id,
         a.location_id,
         l.name as location_name,
         COUNT(*) as count
@@ -1887,10 +3442,11 @@ app.get('/api/admin/analytics', async (req, res) => {
           AND action IN ('allocate', 'bulk_allocate', 'smart_reserve')
         ORDER BY created_at ASC
         LIMIT 1
-      ) al ON true
+      ) creator ON true
       LEFT JOIN locations l ON a.location_id = l.id
       WHERE ${whereClause}
-      GROUP BY DATE(a.created_at), al.username, al.user_id, a.location_id, l.name
+        ${exclusionSubquery}
+      GROUP BY DATE(a.created_at), creator.username, creator.user_id, a.location_id, l.name
       ORDER BY date, username
     `, params);
 
@@ -1903,6 +3459,7 @@ app.get('/api/admin/analytics', async (req, res) => {
         genderBreakdown: genderResult.rows,
         dailyAllocations: dailyAllocationsResult.rows,
         dailyDepartures: dailyDeparturesResult.rows,
+        dailyDeallocations: dailyDeallocationsResult.rows,
         userAllocations: userAllocationsResult.rows
       }
     });
@@ -2179,12 +3736,12 @@ app.patch('/api/allocations/:id', async (req, res) => {
 // POST /api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate
 app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate', async (req, res) => {
   const startTime = Date.now();
+  const locationId = Number(req.params.id);
+  const tentIndex = Number(req.params.tent);
+  const blockIndex = Number(req.params.block);
+  const bedNumber = Number(req.params.bedNumber);
+  
   try {
-    const locationId = Number(req.params.id);
-    const tentIndex = Number(req.params.tent);
-    const blockIndex = Number(req.params.block);
-    const bedNumber = Number(req.params.bedNumber);
-    
     console.log(`[ALLOCATE] Start - Bed ${bedNumber}`);
 
     const { name, phone, gender, startDate, endDate, emergencyPhone, personPhotoKey, aadhaarPhotoKey } = req.body || {};
@@ -2686,25 +4243,31 @@ app.delete('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async
     const tentIndex = Number(req.params.tent);
     const blockIndex = Number(req.params.block);
     const bedNumber = Number(req.params.bedNumber);
+    const { wasOccupied, reason } = req.body || {}; // Get wasOccupied flag and reason from request body (default to empty object)
     
     const blockId = await validateBedWithinBlock(locationId, tentIndex, blockIndex, bedNumber);
 
+    // First, get the allocation ID before deletion
+    const getIdQ = `
+      SELECT id FROM allocations
+      WHERE block_id = $1
+        AND bed_number = $2
+        AND deleted_at IS NULL
+        AND end_date >= ${todaySQL}
+      ORDER BY created_at DESC
+      LIMIT 1
+    `;
+    const idResult = await execQuery(getIdQ, [blockId, bedNumber]);
+    if (idResult.rowCount === 0) return res.status(404).json({ error: 'no_active_allocation' });
+    const allocationId = idResult.rows[0].id;
+
     const delQ = `
       UPDATE allocations 
-      SET deleted_at = NOW(), updated_at = NOW()
-      WHERE id IN (
-        SELECT id FROM allocations
-        WHERE block_id = $1
-          AND bed_number = $2
-          AND deleted_at IS NULL
-          AND end_date >= ${todaySQL}
-        ORDER BY created_at DESC
-        LIMIT 1
-      )
+      SET deleted_at = NOW(), updated_at = NOW(), was_occupied = $1
+      WHERE id = $2
     `;
-    const r = await execQuery(delQ, [blockId, bedNumber]);
-    if (r.rowCount === 0) return res.status(404).json({ error: 'no_active_allocation' });
-    await logAudit(req, 'deallocate', 'allocation', null, { locationId, tentIndex, blockIndex, bedNumber });
+    const r = await execQuery(delQ, [wasOccupied !== false, allocationId]); // Default to true if not specified
+    await logAudit(req, 'deallocate', 'allocation', allocationId, { locationId, tentIndex, blockIndex, bedNumber, wasOccupied: wasOccupied !== false, reason: reason || 'not_specified' });
     res.json({ ok: true });
   } catch (e) {
     console.error(e);
