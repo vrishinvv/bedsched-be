@@ -328,11 +328,11 @@ app.post('/api/seed', async (req, res) => {
     // Location data with shortcodes for user generation
     const locationData = [
       { name: 'Anand Vilas Enclave', shortcode: 'ave', capacity: 850, tents: 1, gender: 'both', landmark: 'Chaitanya Jyoti' },
-      { name: 'Brindavan Enclave', shortcode: 'be', capacity: 2100, tents: 3, gender: 'both', landmark: 'Electricity Board' },
-      { name: 'Sai Sruthi Enclave', shortcode: 'sse', capacity: 1800, tents: 2, gender: 'both', landmark: 'APSRTC Bus Depot' },
+      { name: 'Brindavan Enclave', shortcode: 'be', capacity: 2100, tents: 2, gender: 'both', landmark: 'Electricity Board' },
+      { name: 'Sai Sruthi Enclave', shortcode: 'sse', capacity: 1800, tents: 1, gender: 'both', landmark: 'APSRTC Bus Depot' },
       { name: 'Dharmakshetra Enclave', shortcode: 'de', capacity: 1400, tents: 2, gender: 'both', landmark: 'Sai Hira Hall' },
-      { name: 'Shivam Enclave', shortcode: 'she', capacity: 4000, tents: 4, gender: 'both', landmark: 'West South' },
-      { name: 'Sundaram Enclave', shortcode: 'sue', capacity: 6000, tents: 6, gender: 'both', landmark: 'West North' },
+      { name: 'Shivam Enclave', shortcode: 'she', capacity: 4000, tents: 3, gender: 'both', landmark: 'West South' },
+      { name: 'Sundaram Enclave', shortcode: 'sue', capacity: 6000, tents: 7, gender: 'both', landmark: 'West North' },
       { name: 'New Block B Basement', shortcode: 'nbbb', capacity: 650, tents: 1, tentName: 'Basement', blocksPerTent: 7, gender: 'female_only', landmark: 'New Block B Basement' },
       { name: 'New Block A', shortcode: 'nba', capacity: 950, tents: 1, tentName: 'First Floor', blocksPerTent: 6, gender: 'female_only', landmark: 'New Block A' },
       { name: 'New Block B', shortcode: 'nbb', capacity: 480, tents: 1, tentName: 'First Floor', blocksPerTent: 3, gender: 'male_only', landmark: 'New Block B' }
