@@ -1686,6 +1686,534 @@ app.post('/api/allocations/historical-deallocations/send-csv', async (req, res) 
   }
 });
 
+/* --------------------------------- Reallocation APIs -------------------------------- */
+
+// GET /api/allocations/:allocationId/reallocate-options
+// Returns available locations/tents/blocks/beds for reallocation based on query params
+app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || !['admin', 'location_user'].includes(user.role)) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    const allocationId = Number(req.params.allocationId);
+    
+    // Validate allocation ID
+    if (!allocationId || isNaN(allocationId) || allocationId <= 0) {
+      console.error('[REALLOCATE_OPTIONS ERROR] Invalid allocation ID:', req.params.allocationId);
+      return res.status(400).json({ 
+        error: 'invalid_allocation_id', 
+        message: 'Allocation ID must be a valid positive number',
+        received: req.params.allocationId
+      });
+    }
+    
+    const { location_id, tent_id, block_id } = req.query;
+
+    // Get the allocation details
+    const allocationQuery = await execQuery(`
+      SELECT 
+        a.id,
+        a.location_id,
+        a.start_date,
+        a.end_date,
+        a.gender,
+        a.created_at,
+        l.name as location_name,
+        b.tent_id as current_tent_id,
+        b.id as current_block_id
+      FROM allocations a
+      JOIN blocks b ON a.block_id = b.id
+      JOIN locations l ON a.location_id = l.id
+      WHERE a.id = $1 AND a.deleted_at IS NULL
+    `, [allocationId]);
+
+    if (allocationQuery.rowCount === 0) {
+      return res.status(404).json({ error: 'allocation_not_found' });
+    }
+
+    const allocation = allocationQuery.rows[0];
+
+    // Step 1: Return available locations
+    if (!location_id) {
+      let locationsQuery;
+      if (user.role === 'location_user' && user.locationId) {
+        // Location users can only reallocate within their location
+        locationsQuery = await execQuery(`
+          SELECT id, name, capacity 
+          FROM locations 
+          WHERE id = $1
+          ORDER BY name
+        `, [user.locationId]);
+      } else {
+        // Admin can reallocate to any location
+        locationsQuery = await execQuery(`
+          SELECT id, name, capacity 
+          FROM locations 
+          ORDER BY name
+        `);
+      }
+
+      return res.json({
+        step: 'locations',
+        allocation: {
+          id: allocation.id,
+          current_location: allocation.location_name,
+          start_date: allocation.start_date,
+          end_date: allocation.end_date,
+          gender: allocation.gender
+        },
+        locations: locationsQuery.rows
+      });
+    }
+
+    // Step 2: Return available tents for selected location
+    if (!tent_id) {
+      const tentsQuery = await execQuery(`
+        SELECT 
+          t.id,
+          t.tent_index,
+          t.name,
+          t.size,
+          COUNT(DISTINCT b.id) as block_count
+        FROM tents t
+        LEFT JOIN blocks b ON b.tent_id = t.id
+        WHERE t.location_id = $1
+        GROUP BY t.id, t.tent_index, t.name, t.size
+        ORDER BY t.tent_index
+      `, [location_id]);
+
+      return res.json({
+        step: 'tents',
+        allocation: {
+          id: allocation.id,
+          start_date: allocation.start_date,
+          end_date: allocation.end_date,
+          gender: allocation.gender
+        },
+        tents: tentsQuery.rows
+      });
+    }
+
+    // Step 3: Return available blocks for selected tent (filtered by gender compatibility)
+    if (!block_id) {
+      console.log('[REALLOCATE_OPTIONS] Step 3 - Getting blocks for tent:', {
+        tent_id,
+        allocation_gender: allocation.gender,
+        allocation_id: allocationId
+      });
+      
+      // First, get ALL blocks in this tent to see what's there
+      const allBlocksQuery = await execQuery(`
+        SELECT 
+          b.id,
+          b.block_index,
+          b.name,
+          b.size,
+          b.gender_restriction
+        FROM blocks b
+        WHERE b.tent_id = $1
+        ORDER BY b.block_index
+      `, [tent_id]);
+      
+      console.log('[REALLOCATE_OPTIONS] ALL blocks in tent (unfiltered):', allBlocksQuery.rows);
+      
+      const blocksQuery = await execQuery(`
+        SELECT 
+          b.id,
+          b.block_index,
+          b.name,
+          b.size,
+          b.gender_restriction
+        FROM blocks b
+        WHERE b.tent_id = $1
+          AND (
+            b.gender_restriction IS NULL 
+            OR LOWER(b.gender_restriction) LIKE LOWER($2) || '%'
+          )
+        ORDER BY b.block_index
+      `, [tent_id, allocation.gender]);
+      
+      console.log('[REALLOCATE_OPTIONS] Filtered blocks:', blocksQuery.rows);
+
+      return res.json({
+        step: 'blocks',
+        allocation: {
+          id: allocation.id,
+          start_date: allocation.start_date,
+          end_date: allocation.end_date,
+          gender: allocation.gender
+        },
+        blocks: blocksQuery.rows
+      });
+    }
+
+    // Step 4: Return available beds for selected block
+    // Check for date overlap with the allocation's date range (excluding the current allocation being moved)
+    
+    // First get block info
+    const blockInfo = await execQuery(`
+      SELECT b.size, b.name, b.gender_restriction
+      FROM blocks b
+      WHERE b.id = $1
+    `, [block_id]);
+    
+    if (blockInfo.rowCount === 0) {
+      return res.status(404).json({ error: 'block_not_found' });
+    }
+    
+    const block = blockInfo.rows[0];
+    
+    // Check gender compatibility (case-insensitive, handles male_only/female_only format)
+    if (block.gender_restriction && !block.gender_restriction.toLowerCase().startsWith(allocation.gender.toLowerCase())) {
+      return res.status(400).json({ 
+        error: 'gender_mismatch',
+        message: `This block is restricted to ${block.gender_restriction} only. The allocation is for ${allocation.gender}.`
+      });
+    }
+    
+    console.log('[REALLOCATE_OPTIONS] Step 4 - Getting beds for block:', {
+      block_id,
+      block_name: block.name,
+      block_size: block.size,
+      gender_restriction: block.gender_restriction,
+      allocation_gender: allocation.gender,
+      allocation_id: allocationId,
+      start_date: allocation.start_date,
+      end_date: allocation.end_date
+    });
+    
+    // Get all allocations in this block for debugging
+    const debugAllocations = await execQuery(`
+      SELECT id, name, bed_number, start_date, end_date, status, deleted_at
+      FROM allocations
+      WHERE block_id = $1
+      ORDER BY bed_number
+    `, [block_id]);
+    
+    console.log('[REALLOCATE_OPTIONS] All allocations in block:', debugAllocations.rows);
+    
+    // Debug: Check which beds are blocked
+    const blockedBedsQuery = await execQuery(`
+      SELECT bed_number, id, name, start_date, end_date, status, deleted_at
+      FROM allocations a
+      WHERE a.block_id = $1
+        AND a.id != $4
+        AND a.deleted_at IS NULL
+        AND a.status = 'confirmed'
+        AND (
+          (a.start_date <= $2 AND a.end_date >= $2) OR
+          (a.start_date <= $3 AND a.end_date >= $3) OR
+          (a.start_date >= $2 AND a.end_date <= $3)
+        )
+    `, [block_id, allocation.start_date, allocation.end_date, allocationId]);
+    
+    console.log('[REALLOCATE_OPTIONS] Blocked beds by query:', blockedBedsQuery.rows);
+    
+    // Let's try a simpler query to diagnose
+    const bedsQuery = await execQuery(`
+      WITH block_info AS (
+        SELECT size FROM blocks WHERE id = $1
+      ),
+      occupied_beds AS (
+        SELECT DISTINCT bed_number
+        FROM allocations a
+        WHERE a.block_id = $1
+          AND a.id != $4
+          AND a.deleted_at IS NULL
+          AND a.status = 'confirmed'
+          AND (
+            (a.start_date <= $2 AND a.end_date >= $2) OR
+            (a.start_date <= $3 AND a.end_date >= $3) OR
+            (a.start_date >= $2 AND a.end_date <= $3)
+          )
+      )
+      SELECT bed_num AS bed_number
+      FROM generate_series(1, (SELECT size FROM block_info)) AS bed_num
+      WHERE bed_num NOT IN (SELECT bed_number FROM occupied_beds)
+      ORDER BY bed_num
+    `, [block_id, allocation.start_date, allocation.end_date, allocationId]);
+    
+    console.log('[REALLOCATE_OPTIONS] Available beds count:', bedsQuery.rows.length);
+    console.log('[REALLOCATE_OPTIONS] First 10 available beds:', bedsQuery.rows.slice(0, 10).map(r => r.bed_number));
+
+    return res.json({
+      step: 'beds',
+      allocation: {
+        id: allocation.id,
+        start_date: allocation.start_date,
+        end_date: allocation.end_date,
+        gender: allocation.gender
+      },
+      block: blockInfo.rows[0],
+      available_beds: bedsQuery.rows.map(r => r.bed_number),
+      total_beds: blockInfo.rows[0]?.size || 0
+    });
+
+  } catch (e) {
+    console.error('[REALLOCATE_OPTIONS ERROR]', e);
+    res.status(500).json({ error: 'fetch_reallocate_options_failed', message: e.message });
+  }
+});
+
+// POST /api/allocations/:allocationId/reallocate
+// Reallocates an allocation to a new bed (deallocate old + allocate new)
+app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || !['admin', 'location_user'].includes(user.role)) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    const allocationId = Number(req.params.allocationId);
+    const { newLocationId, newTentId, newBlockId, newBedNumber } = req.body || {};
+
+    console.log('[REALLOCATE] Request:', {
+      allocationId,
+      body: req.body,
+      newLocationId,
+      newTentId,
+      newBlockId,
+      newBedNumber
+    });
+
+    if (!newLocationId || !newTentId || !newBlockId || !newBedNumber) {
+      return res.status(400).json({ 
+        error: 'missing_required_fields',
+        message: 'newLocationId, newTentId, newBlockId, and newBedNumber are required',
+        received: { newLocationId, newTentId, newBlockId, newBedNumber }
+      });
+    }
+
+    // Get the current allocation with all details
+    const allocationQuery = await execQuery(`
+      SELECT 
+        a.id,
+        a.location_id,
+        a.bed_number,
+        a.block_id,
+        a.name,
+        a.phone,
+        a.gender,
+        a.start_date,
+        a.end_date,
+        a.emergency_phone,
+        a.person_photo_key,
+        a.aadhaar_photo_key,
+        l.name as location_name,
+        t.tent_index,
+        t.name as tent_name,
+        b.block_index,
+        b.name as block_name
+      FROM allocations a
+      JOIN blocks b ON a.block_id = b.id
+      JOIN tents t ON b.tent_id = t.id
+      JOIN locations l ON a.location_id = l.id
+      WHERE a.id = $1 AND a.deleted_at IS NULL
+    `, [allocationId]);
+
+    if (allocationQuery.rowCount === 0) {
+      return res.status(404).json({ error: 'allocation_not_found' });
+    }
+
+    const oldAllocation = allocationQuery.rows[0];
+
+    // Permission check: location_user can only reallocate within their location
+    if (user.role === 'location_user') {
+      if (user.locationId !== oldAllocation.location_id || Number(newLocationId) !== user.locationId) {
+        return res.status(403).json({ 
+          error: 'forbidden',
+          message: 'You can only reallocate within your assigned location' 
+        });
+      }
+    }
+
+    // Verify new block exists and get tent_index
+    const newBlockQuery = await execQuery(`
+      SELECT b.id, b.size, b.tent_index, b.block_index, b.gender_restriction, t.tent_index
+      FROM blocks b
+      JOIN tents t ON b.tent_id = t.id
+      WHERE b.id = $1 AND t.id = $2 AND t.location_id = $3
+    `, [newBlockId, newTentId, newLocationId]);
+
+    if (newBlockQuery.rowCount === 0) {
+      return res.status(404).json({ 
+        error: 'invalid_target',
+        message: 'The selected block/tent/location combination is invalid' 
+      });
+    }
+
+    const newBlock = newBlockQuery.rows[0];
+
+    // Validate bed number is within block size
+    if (Number(newBedNumber) < 1 || Number(newBedNumber) > newBlock.size) {
+      return res.status(400).json({ 
+        error: 'invalid_bed_number',
+        message: `Bed number must be between 1 and ${newBlock.size}` 
+      });
+    }
+    
+    // Validate gender compatibility (case-insensitive, handles male_only/female_only format)
+    if (newBlock.gender_restriction && !newBlock.gender_restriction.toLowerCase().startsWith(oldAllocation.gender.toLowerCase())) {
+      return res.status(400).json({ 
+        error: 'gender_mismatch',
+        message: `Cannot reallocate ${oldAllocation.gender} person to a ${newBlock.gender_restriction} block` 
+      });
+    }
+
+    // Check if new bed is available for the date range (excluding the current allocation being moved)
+    const availabilityCheck = await execQuery(`
+      SELECT id, name, start_date, end_date
+      FROM allocations
+      WHERE block_id = $1
+        AND bed_number = $2
+        AND id != $3
+        AND deleted_at IS NULL
+        AND (
+          (start_date, end_date) OVERLAPS ($4::date, $5::date)
+        )
+      LIMIT 1
+    `, [newBlockId, newBedNumber, allocationId, oldAllocation.start_date, oldAllocation.end_date]);
+
+    if (availabilityCheck.rowCount > 0) {
+      const conflict = availabilityCheck.rows[0];
+      return res.status(409).json({ 
+        error: 'bed_not_available',
+        message: `The selected bed is not available for the allocation date range. Conflicting allocation: ${conflict.name} (${conflict.start_date} to ${conflict.end_date})`
+      });
+    }
+
+    // Begin transaction
+    await execQuery('BEGIN');
+
+    try {
+      // Step 1: Soft delete old allocation with "booking_error" reason
+      await execQuery(`
+        UPDATE allocations 
+        SET deleted_at = NOW(), updated_at = NOW()
+        WHERE id = $1
+      `, [allocationId]);
+
+      // Log deallocation with reallocation flag
+      await logAudit(req, 'deallocate', 'allocation', allocationId, {
+        reason: 'booking_error',
+        reallocation: true,
+        from_location_id: oldAllocation.location_id,
+        from_location: oldAllocation.location_name,
+        from_tent_index: oldAllocation.tent_index,
+        from_tent: oldAllocation.tent_name,
+        from_block_index: oldAllocation.block_index,
+        from_block: oldAllocation.block_name,
+        from_bed: oldAllocation.bed_number,
+        to_location_id: newLocationId,
+        to_tent_id: newTentId,
+        to_block_id: newBlockId,
+        to_bed: newBedNumber
+      });
+
+      // Step 2: Create new allocation with same data
+      const insertResult = await execQuery(`
+        INSERT INTO allocations(
+          location_id,
+          tent_id,
+          block_id,
+          tent_index,
+          block_index,
+          bed_number, 
+          name, 
+          phone, 
+          gender, 
+          start_date, 
+          end_date, 
+          emergency_phone, 
+          person_photo_key, 
+          aadhaar_photo_key
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        RETURNING id
+      `, [
+        newLocationId,
+        newTentId,
+        newBlockId,
+        newBlock.tent_index,
+        newBlock.block_index,
+        newBedNumber,
+        oldAllocation.name,
+        oldAllocation.phone,
+        oldAllocation.gender,
+        oldAllocation.start_date,
+        oldAllocation.end_date,
+        oldAllocation.emergency_phone,
+        oldAllocation.person_photo_key,
+        oldAllocation.aadhaar_photo_key
+      ]);
+
+      const newAllocationId = insertResult.rows[0].id;
+
+      // Log allocation with reallocation flag
+      await logAudit(req, 'allocate', 'allocation', newAllocationId, {
+        reallocation: true,
+        from_allocation_id: allocationId,
+        from_location_id: oldAllocation.location_id,
+        from_location: oldAllocation.location_name,
+        from_tent_index: oldAllocation.tent_index,
+        from_tent: oldAllocation.tent_name,
+        from_block_index: oldAllocation.block_index,
+        from_block: oldAllocation.block_name,
+        from_bed: oldAllocation.bed_number,
+        name: oldAllocation.name,
+        phone: oldAllocation.phone,
+        gender: oldAllocation.gender
+      });
+
+      await execQuery('COMMIT');
+
+      res.json({ 
+        ok: true, 
+        message: 'Reallocation successful',
+        old_allocation_id: allocationId,
+        new_allocation_id: newAllocationId,
+        from: {
+          location: oldAllocation.location_name,
+          tent: oldAllocation.tent_name,
+          block: oldAllocation.block_name,
+          bed: oldAllocation.bed_number
+        },
+        to: {
+          location_id: newLocationId,
+          tent_id: newTentId,
+          block_id: newBlockId,
+          bed: newBedNumber
+        }
+      });
+
+    } catch (e) {
+      await execQuery('ROLLBACK');
+      throw e;
+    }
+
+  } catch (e) {
+    console.error('[REALLOCATE ERROR]', {
+      error: e.message,
+      code: e.code,
+      detail: e.detail,
+      allocationId: req.params.allocationId,
+      timestamp: new Date().toISOString()
+    });
+
+    if (e.code === '23P01') {
+      return res.status(409).json({ 
+        error: 'overlapping_allocation',
+        message: 'Cannot reallocate: The new bed is already booked for the selected dates',
+        detail: e.detail
+      });
+    }
+
+    res.status(500).json({ error: 'reallocate_failed', message: e.message });
+  }
+});
+
 /* --------------------------------- TEST DATA GENERATOR -------------------------------- */
 
 // POST /api/test/generate-dummy-allocations

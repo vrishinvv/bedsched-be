@@ -357,6 +357,7 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
   // For reserved: reserved_expires_at > NOW (regardless of end_date)
   const allocRes = await execQuery(`
     SELECT 
+      id,
       bed_number, 
       name, 
       phone, 
@@ -367,7 +368,8 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
       person_photo_key,
       aadhaar_photo_key,
       status, 
-      reserved_expires_at
+      reserved_expires_at,
+      created_at
     FROM allocations
     WHERE block_id = $1 
       AND deleted_at IS NULL
@@ -381,6 +383,7 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
   const beds = {};
   for (const r of allocRes.rows) {
     const bedData = {
+      id: r.id, // Include allocation ID for reallocation feature
       name: r.name,
       phone: r.phone,
       emergencyPhone: r.emergency_phone,
@@ -389,6 +392,7 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
       endDate: r.end_date_str,     // Already formatted as YYYY-MM-DD string from TO_CHAR
       status: r.status,
       reservedExpiresAt: r.reserved_expires_at ? r.reserved_expires_at.toISOString() : null,
+      createdAt: r.created_at ? r.created_at.toISOString() : null, // Include creation timestamp
     };
 
     // Include photo keys and generate URLs if keys exist
