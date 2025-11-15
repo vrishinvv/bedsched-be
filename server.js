@@ -1830,6 +1830,7 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
         WHERE b.tent_id = $1
           AND (
             b.gender_restriction IS NULL 
+            OR b.gender_restriction = 'both'
             OR LOWER(b.gender_restriction) LIKE LOWER($2) || '%'
           )
         ORDER BY b.block_index
@@ -1866,7 +1867,10 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
     const block = blockInfo.rows[0];
     
     // Check gender compatibility (case-insensitive, handles male_only/female_only format)
-    if (block.gender_restriction && !block.gender_restriction.toLowerCase().startsWith(allocation.gender.toLowerCase())) {
+    // Allow blocks with 'both' or NULL gender restriction
+    if (block.gender_restriction && 
+        block.gender_restriction.toLowerCase() !== 'both' && 
+        !block.gender_restriction.toLowerCase().startsWith(allocation.gender.toLowerCase())) {
       return res.status(400).json({ 
         error: 'gender_mismatch',
         message: `This block is restricted to ${block.gender_restriction} only. The allocation is for ${allocation.gender}.`
@@ -2055,7 +2059,10 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
     }
     
     // Validate gender compatibility (case-insensitive, handles male_only/female_only format)
-    if (newBlock.gender_restriction && !newBlock.gender_restriction.toLowerCase().startsWith(oldAllocation.gender.toLowerCase())) {
+    // Allow blocks with 'both' or NULL gender restriction
+    if (newBlock.gender_restriction && 
+        newBlock.gender_restriction.toLowerCase() !== 'both' && 
+        !newBlock.gender_restriction.toLowerCase().startsWith(oldAllocation.gender.toLowerCase())) {
       return res.status(400).json({ 
         error: 'gender_mismatch',
         message: `Cannot reallocate ${oldAllocation.gender} person to a ${newBlock.gender_restriction} block` 
