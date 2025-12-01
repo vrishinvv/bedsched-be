@@ -1269,16 +1269,23 @@ app.post('/api/allocations/send-csv', async (req, res) => {
 
     const dataResult = await execQuery(dataQuery, params);
 
-    // Generate CSV
+    // Generate CSV with human-friendly headers and prefer name fields for location/tent/block
     const columns = [
       'id', 'name', 'phone', 'gender', 'location_name', 'tent_name', 'block_name', 'bed_number',
       'start_date', 'end_date', 'created_at', 'updated_at', 'allocated_by', 'deleted_at', 'reason'
     ];
 
-    const headers = columns.join(',');
+    const headerLabels = ['ID','Name','Phone','Gender','Location','Tent','Block','Bed','Start Date','End Date','Created At','Updated At','Allocated By','Deleted At','Reason'];
+    const headers = headerLabels.join(',');
+
     const csvRows = dataResult.rows.map(row => {
       return columns.map(col => {
-        const val = row[col];
+        // Prefer name fields when available; fall back to index/id strings for tent/block if necessary
+        let val = row[col];
+        if (col === 'location_name') val = row.location_name || '';
+        if (col === 'tent_name') val = row.tent_name || (row.tent_index ? `Tent ${row.tent_index}` : '');
+        if (col === 'block_name') val = row.block_name || (row.block_index ? `Block ${row.block_index}` : '');
+
         if (val === null || val === undefined) return '';
         const str = String(val).replace(/"/g, '""');
         return `"${str}"`;

@@ -31,18 +31,38 @@ function generateCSV(rows, columns) {
  */
 async function backupAllocations() {
   try {
+    // Join to include human-readable location / tent / block names instead of numeric ids
     const result = await execQuery(`
       SELECT 
-        id, location_id, tent_id, block_id, tent_index, block_index, bed_number,
-        name, phone, gender, start_date, end_date, status, batch_id, is_family,
-        reserved_expires_at, created_at, updated_at, deleted_at
-      FROM allocations
-      ORDER BY id
+        a.id,
+        l.name as location_name,
+        t.name as tent_name,
+        b.name as block_name,
+        a.tent_index,
+        a.block_index,
+        a.bed_number,
+        a.name as person_name,
+        a.phone,
+        a.gender,
+        a.start_date,
+        a.end_date,
+        a.status,
+        a.batch_id,
+        a.is_family,
+        a.reserved_expires_at,
+        a.created_at,
+        a.updated_at,
+        a.deleted_at
+      FROM allocations a
+      LEFT JOIN blocks b ON a.block_id = b.id
+      LEFT JOIN tents t ON b.tent_id = t.id
+      LEFT JOIN locations l ON t.location_id = l.id
+      ORDER BY a.id
     `);
 
     const columns = [
-      'id', 'location_id', 'tent_id', 'block_id', 'tent_index', 'block_index', 'bed_number',
-      'name', 'phone', 'gender', 'start_date', 'end_date', 'status', 'batch_id', 'is_family',
+      'id', 'location_name', 'tent_name', 'block_name', 'tent_index', 'block_index', 'bed_number',
+      'person_name', 'phone', 'gender', 'start_date', 'end_date', 'status', 'batch_id', 'is_family',
       'reserved_expires_at', 'created_at', 'updated_at', 'deleted_at'
     ];
 
