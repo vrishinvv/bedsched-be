@@ -4,7 +4,7 @@
     "schedule": "0 0 * * *"
   }],
   "functions": {
-    "api/cron/backup.js": {
+    "server.js": {
       "maxDuration": 60
     }
   }

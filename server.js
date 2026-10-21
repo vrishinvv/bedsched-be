@@ -8,6 +8,7 @@ import multer from 'multer';
 import { parse } from 'csv-parse/sync';
 import { config } from './common/configs.js';
 import { execQuery } from './common/db.js';
+import { isCronAuthorized, isSeedAllowed } from './common/runtimeGuards.js';
 import {   
   getLocationsWithStats, 
   getLocationDetail, 
@@ -107,12 +108,15 @@ function getUserFromRequest(req) {
   return null;
 }
 
-// Global guard for API routes, excluding auth/health/seed
+// Global guard for API routes, excluding auth/health/seed.
+// The seed route has its own production hard-stop so an empty development
+// database can still be initialized without existing credentials.
 app.use((req, res, next) => {
   if (!req.path.startsWith('/api')) return next();
   if (req.path.startsWith('/api/auth')) return next();
   if (req.path === '/api/health') return next();
   if (req.path === '/api/seed') return next();
+  if (req.path === '/api/cron/backup') return next();
 
   const user = getUserFromRequest(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
@@ -278,6 +282,10 @@ app.get('/api/debug/block-allocations/:blockId', async (req, res) => {
 
 // Seed quick convenience (optional)
 app.post('/api/seed', async (req, res) => {
+  if (!isSeedAllowed(config.nodeEnv)) {
+    return res.status(404).json({ error: 'not_found' });
+  }
+
   try {
     // Start transaction
     await execQuery('BEGIN');
@@ -3831,13 +3839,9 @@ app.get('/api/cron/backup', async (req, res) => {
   try {
     // Verify this is a Vercel Cron request
     const authHeader = req.headers['authorization'];
-    if (config.nodeEnv === 'production') {
-      // In production, verify Vercel Cron secret
-      const cronSecret = process.env.CRON_SECRET || 'dev-secret';
-      if (authHeader !== `Bearer ${cronSecret}`) {
-        console.warn('[BACKUP] Unauthorized cron request');
-        return res.status(401).json({ error: 'unauthorized' });
-      }
+    if (!isCronAuthorized(config.nodeEnv, authHeader, process.env.CRON_SECRET)) {
+      console.warn('[BACKUP] Unauthorized cron request');
+      return res.status(401).json({ error: 'unauthorized' });
     }
 
     console.log('[BACKUP] Cron backup started');
