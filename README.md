@@ -173,8 +173,8 @@ nowIST = `(NOW() AT TIME ZONE 'Asia/Kolkata')`
   isFamily: true,                // Required: Family preference flag
   maleCount: 2,                  // Required: Number of males
   femaleCount: 2,                // Required: Number of females
-  startDate: "2025-11-03",       // Required: Check-in date (YYYY-MM-DD)
-  endDate: "2025-11-24",         // Required: Check-out date (YYYY-MM-DD)
+  startDate: "2026-11-05",       // Required: Check-in date (YYYY-MM-DD)
+  endDate: "2026-11-24",         // Required: Check-out date (YYYY-MM-DD)
   confirmFallback: false         // Optional: Auto-confirm fallback strategies
 }
 ```
@@ -182,7 +182,7 @@ nowIST = `(NOW() AT TIME ZONE 'Asia/Kolkata')`
 **Validation Rules**:
 - Phone: Exactly 10 digits
 - Aadhar: Exactly 12 digits (if provided)
-- Date Range: Must be within November 3-24, 2025
+- Date Range: Must be within November 5-24, 2026
 - Start date ≤ End date
 - Total count (maleCount + femaleCount) > 0
 
@@ -228,8 +228,8 @@ WHERE deleted_at IS NULL
   phone: "9876543210",           // Required: 10-digit phone number
   aadharNumber: "123456789012",  // Optional: 12-digit Aadhar (sent without spaces)
   gender: "Male",                // Required: 'Male', 'Female', or 'Other'
-  startDate: "2025-11-03",       // Required: YYYY-MM-DD
-  endDate: "2025-11-24",         // Required: YYYY-MM-DD
+  startDate: "2026-11-05",       // Required: YYYY-MM-DD
+  endDate: "2026-11-24",         // Required: YYYY-MM-DD
   status: "confirmed"            // Optional: 'confirmed' or 'reserved' (default: 'confirmed')
 }
 ```
@@ -261,8 +261,8 @@ LIMIT 1
   aadharNumber: "123456789012",  // Optional: 12-digit Aadhar (sent without spaces)
   maleCount: 10,                 // Required: Number of male beds
   femaleCount: 5,                // Required: Number of female beds
-  startDate: "2025-11-03",       // Required: YYYY-MM-DD
-  endDate: "2025-11-24"          // Required: YYYY-MM-DD
+  startDate: "2026-11-05",       // Required: YYYY-MM-DD
+  endDate: "2026-11-24"          // Required: YYYY-MM-DD
 }
 ```
 
@@ -620,10 +620,10 @@ SELECT EXISTS (
 - **Search**: Buttons disabled until 10 digits entered
 
 #### Date Range Restrictions
-- **Allowed Range**: November 3-24, 2025
-- **Implementation**: `min="2025-11-03"` and `max="2025-11-24"` on date inputs
-- **Validation**: Both frontend and backend enforce this range
-- **Helper Text**: "Nov 3-24, 2025" displayed below date pickers
+- **Allowed Range**: November 5-24, 2026
+- **Implementation**: shared `BOOKING_MIN_DATE` and `BOOKING_MAX_DATE` values on date inputs
+- **Validation**: Frontend allocation and editing flows enforce this range
+- **Helper Text**: "Nov 5-24, 2026" displayed below date pickers
 
 ### Allocation Display Rules
 - Bed grid shows allocations where `end_date >= TODAY`

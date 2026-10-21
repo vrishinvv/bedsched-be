@@ -33,13 +33,13 @@ async function logAudit(req, action, entityType, entityId, details = {}) {
     const user = getUserFromRequest(req);
     let userId = user?.id || null;
     const username = user?.username || 'anonymous';
-    
+
     // If user_id is not in token/cookie, fetch it from database
     if (!userId && username !== 'anonymous') {
       const userQuery = await execQuery('SELECT id FROM users WHERE username = $1', [username]);
       userId = userQuery.rows[0]?.id || null;
     }
-    
+
     // Get real client IP (handles proxies correctly)
     const ipAddress = (
       req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 
@@ -3808,19 +3808,52 @@ app.post('/api/allocations/currently-occupied/send-csv', async (req, res) => {
 });
 
 // GET /api/admin/trigger-backup (manual backup trigger for testing)
+// NOTE: This runs asynchronously - response comes before backup completes
 app.get('/api/admin/trigger-backup', async (req, res) => {
   try {
     const user = getUserFromRequest(req);
     if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
     
-    const { runBackup } = await import('./common/backup.js');
-    res.json({ ok: true, message: 'Backup triggered, check server logs for status' });
+    // Respond immediately to avoid timeout
+    res.json({ ok: true, message: 'Backup started. Check logs for status. Note: On Vercel, use /api/cron/backup endpoint for reliable backups.' });
     
     // Run backup asynchronously (don't block response)
+    const { runBackup } = await import('./common/backup.js');
     runBackup().catch(err => console.error('[BACKUP] Manual backup failed:', err));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'backup_trigger_failed' });
+  }
+});
+
+// GET /api/cron/backup (Vercel Cron endpoint - protected by Vercel headers)
+app.get('/api/cron/backup', async (req, res) => {
+  try {
+    // Verify this is a Vercel Cron request
+    const authHeader = req.headers['authorization'];
+    if (config.nodeEnv === 'production') {
+      // In production, verify Vercel Cron secret
+      const cronSecret = process.env.CRON_SECRET || 'dev-secret';
+      if (authHeader !== `Bearer ${cronSecret}`) {
+        console.warn('[BACKUP] Unauthorized cron request');
+        return res.status(401).json({ error: 'unauthorized' });
+      }
+    }
+
+    console.log('[BACKUP] Cron backup started');
+    const { runBackup } = await import('./common/backup.js');
+
+    try {
+      await runBackup();
+      console.log('[BACKUP] Cron backup completed successfully');
+      res.json({ ok: true, message: 'Backup completed successfully' });
+    } catch (backupError) {
+      console.error('[BACKUP] Cron backup failed:', backupError);
+      res.status(500).json({ error: 'backup_failed', message: backupError.message });
+    }
+  } catch (e) {
+    console.error('[BACKUP] Cron endpoint error:', e);
+    res.status(500).json({ error: 'cron_failed', message: e.message });
   }
 });
 
@@ -5274,4 +5307,3 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/bulk-import-csv',
     }
   }
 );
-

@@ -64,7 +64,7 @@
 						}
 					]
 				},
-				"description": "Bulk import allocations from CSV file to a specific block.\n\n**CSV Format Required:**\n```\nName,Gender,Phone,Emergency Phone,Start date,End date\nJohn Doe,Male,9876543210,9876543211,2025-11-12,2025-11-20\nJane Smith,Female,9876543212,,2025-11-15,2025-11-25\n```\n\n**Features:**\n- Auto-assigns beds sequentially\n- Validates gender restrictions\n- Checks bed availability upfront\n- Bulk inserts for performance\n- Full audit logging\n\n**Response Example:**\n```json\n{\n  \"ok\": true,\n  \"message\": \"Import completed: 45 successful, 2 failed\",\n  \"results\": {\n    \"total\": 47,\n    \"success\": 45,\n    \"failed\": 2,\n    \"errors\": [\n      {\n        \"row\": 15,\n        \"name\": \"John Doe\",\n        \"error\": \"No available beds in block\"\n      }\n    ]\n  }\n}\n```"
+				"description": "Bulk import allocations from CSV file to a specific block.\n\n**CSV Format Required:**\n```\nName,Gender,Phone,Emergency Phone,Start date,End date\nJohn Doe,Male,9876543210,9876543211,2026-11-12,2026-11-20\nJane Smith,Female,9876543212,,2026-11-15,2026-11-24\n```\n\n**Features:**\n- Auto-assigns beds sequentially\n- Validates gender restrictions\n- Checks bed availability upfront\n- Bulk inserts for performance\n- Full audit logging\n\n**Response Example:**\n```json\n{\n  \"ok\": true,\n  \"message\": \"Import completed: 45 successful, 2 failed\",\n  \"results\": {\n    \"total\": 47,\n    \"success\": 45,\n    \"failed\": 2,\n    \"errors\": [\n      {\n        \"row\": 15,\n        \"name\": \"John Doe\",\n        \"error\": \"No available beds in block\"\n      }\n    ]\n  }\n}\n```"
 			},
 			"response": [
 				{

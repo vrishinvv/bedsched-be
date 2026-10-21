@@ -1,6 +1,11 @@
 {
   "crons": [{
-    "path": "/api/admin/trigger-backup",
+    "path": "/api/cron/backup",
     "schedule": "0 0 * * *"
-  }]
+  }],
+  "functions": {
+    "api/cron/backup.js": {
+      "maxDuration": 60
+    }
+  }
 }

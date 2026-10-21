@@ -31,7 +31,9 @@ function generateCSV(rows, columns) {
  */
 async function backupAllocations() {
   try {
+    console.log('[BACKUP] Executing allocations query...');
     // Join to include human-readable location / tent / block names instead of numeric ids
+    // LIMIT to recent records to avoid timeout on large datasets
     const result = await execQuery(`
       SELECT 
         a.id,
@@ -57,8 +59,12 @@ async function backupAllocations() {
       LEFT JOIN blocks b ON a.block_id = b.id
       LEFT JOIN tents t ON b.tent_id = t.id
       LEFT JOIN locations l ON t.location_id = l.id
-      ORDER BY a.id
+      WHERE a.created_at >= NOW() - INTERVAL '90 days'
+      ORDER BY a.id DESC
+      LIMIT 50000
     `);
+
+    console.log(`[BACKUP] Query returned ${result.rows.length} allocation records`);
 
     const columns = [
       'id', 'location_name', 'tent_name', 'block_name', 'tent_index', 'block_index', 'bed_number',
@@ -66,7 +72,9 @@ async function backupAllocations() {
       'reserved_expires_at', 'created_at', 'updated_at', 'deleted_at'
     ];
 
-    return generateCSV(result.rows, columns);
+    const csv = generateCSV(result.rows, columns);
+    console.log(`[BACKUP] Generated allocations CSV (${csv.length} bytes)`);
+    return csv;
   } catch (err) {
     console.error('[BACKUP] Error backing up allocations:', err);
     throw err;
@@ -78,20 +86,28 @@ async function backupAllocations() {
  */
 async function backupAuditLogs() {
   try {
+    console.log('[BACKUP] Executing audit_logs query...');
+    // LIMIT to recent records to avoid timeout
     const result = await execQuery(`
       SELECT 
         id, user_id, username, action, entity_type, entity_id,
         details, ip_address, created_at
       FROM audit_logs
-      ORDER BY id
+      WHERE created_at >= NOW() - INTERVAL '90 days'
+      ORDER BY id DESC
+      LIMIT 50000
     `);
+
+    console.log(`[BACKUP] Query returned ${result.rows.length} audit log records`);
 
     const columns = [
       'id', 'user_id', 'username', 'action', 'entity_type', 'entity_id',
       'details', 'ip_address', 'created_at'
     ];
 
-    return generateCSV(result.rows, columns);
+    const csv = generateCSV(result.rows, columns);
+    console.log(`[BACKUP] Generated audit_logs CSV (${csv.length} bytes)`);
+    return csv;
   } catch (err) {
     console.error('[BACKUP] Error backing up audit_logs:', err);
     throw err;
@@ -108,13 +124,27 @@ async function sendBackupEmail(allocationsCSV, auditLogsCSV, timestamp) {
       .split(',') 
       .map(email => email.trim())
       .filter(email => email.length > 0);
-    
+
     if (emailList.length === 0) {
       throw new Error('No valid email addresses found in BACKUP_EMAIL config');
     }
 
+    // Log attachment sizes
+    const allocationsSize = Buffer.from(allocationsCSV).length;
+    const auditLogsSize = Buffer.from(auditLogsCSV).length;
+    const totalSize = allocationsSize + auditLogsSize;
+
+    console.log(`[BACKUP] Attachment sizes: allocations=${(allocationsSize/1024).toFixed(2)}KB, audit_logs=${(auditLogsSize/1024).toFixed(2)}KB, total=${(totalSize/1024).toFixed(2)}KB`);
+
+    // Warn if attachments are large (Resend has 40MB limit)
+    if (totalSize > 40 * 1024 * 1024) {
+      console.warn(`[BACKUP] WARNING: Total attachment size (${(totalSize/1024/1024).toFixed(2)}MB) exceeds 40MB limit`);
+    }
+
+    console.log(`[BACKUP] Sending to ${emailList.length} recipient(s): ${emailList.join(', ')}`);
+
     const { data, error } = await resend.emails.send({
-      from: 'BedSched Backups <backups@resend.dev>', // Use your verified domain if available
+      from: 'BedSched Backups <onboarding@resend.dev>', // Use onboarding address for dev
       to: emailList,
       subject: `BedSched Database Backup - ${timestamp}`,
       html: `
@@ -123,8 +153,8 @@ async function sendBackupEmail(allocationsCSV, auditLogsCSV, timestamp) {
         <p><strong>Timestamp:</strong> ${timestamp}</p>
         <p><strong>Tables included:</strong></p>
         <ul>
-          <li>allocations</li>
-          <li>audit_logs</li>
+          <li>allocations (${(allocationsSize/1024).toFixed(2)}KB)</li>
+          <li>audit_logs (${(auditLogsSize/1024).toFixed(2)}KB)</li>
         </ul>
         <p>All CSV files are attached to this email.</p>
         <hr>
@@ -144,6 +174,7 @@ async function sendBackupEmail(allocationsCSV, auditLogsCSV, timestamp) {
 
     if (error) {
       console.error('[BACKUP] Resend API error:', error);
+      console.error('[BACKUP] Error details:', JSON.stringify(error, null, 2));
       throw error;
     }
 
@@ -162,22 +193,58 @@ export async function runBackup() {
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   console.log(`[BACKUP] Starting backup at ${timestamp}`);
 
+  // Set a timeout to avoid hanging forever (especially on Vercel)
+  const timeoutMs = 50000; // 50 seconds (Vercel free tier is 10s, Pro is 60s)
+  const timeoutPromise = new Promise((_, reject) => {
+    setTimeout(() => reject(new Error('Backup timeout exceeded')), timeoutMs);
+  });
+
   try {
-    // Generate all CSVs
-    console.log('[BACKUP] Generating allocations CSV...');
-    const allocationsCSV = await backupAllocations();
-    
-    console.log('[BACKUP] Generating audit_logs CSV...');
-    const auditLogsCSV = await backupAuditLogs();
+    // Race between backup completion and timeout
+    await Promise.race([
+      (async () => {
+        // Generate all CSVs
+        console.log('[BACKUP] Generating allocations CSV...');
+        const allocationsCSV = await backupAllocations();
 
-    // Send email with attachments
-    console.log('[BACKUP] Sending backup email...');
-    await sendBackupEmail(allocationsCSV, auditLogsCSV, timestamp);
+        console.log('[BACKUP] Generating audit_logs CSV...');
+        const auditLogsCSV = await backupAuditLogs();
 
-    console.log('[BACKUP] Backup completed successfully');
+        // Send email with attachments
+        console.log('[BACKUP] Sending backup email...');
+        try {
+          await sendBackupEmail(allocationsCSV, auditLogsCSV, timestamp);
+          console.log('[BACKUP] Backup completed successfully');
+        } catch (emailError) {
+          console.error('[BACKUP] Email sending failed, saving CSVs locally as fallback...');
+
+          // Save to local files as fallback
+          const fs = await import('fs');
+          const path = await import('path');
+
+          const backupDir = path.join(process.cwd(), 'backups');
+          if (!fs.existsSync(backupDir)) {
+            fs.mkdirSync(backupDir, { recursive: true });
+          }
+
+          const allocationsPath = path.join(backupDir, `allocations_${timestamp}.csv`);
+          const auditLogsPath = path.join(backupDir, `audit_logs_${timestamp}.csv`);
+
+          fs.writeFileSync(allocationsPath, allocationsCSV);
+          fs.writeFileSync(auditLogsPath, auditLogsCSV);
+
+          console.log(`[BACKUP] CSVs saved locally:`);
+          console.log(`[BACKUP]   - ${allocationsPath}`);
+          console.log(`[BACKUP]   - ${auditLogsPath}`);
+          console.log('[BACKUP] Backup completed with local files (email failed)');
+
+          throw emailError; // Re-throw to indicate partial failure
+        }
+      })(),
+      timeoutPromise
+    ]);
   } catch (err) {
     console.error('[BACKUP] Backup failed:', err.message);
+    throw err;
   }
 }
-
-
