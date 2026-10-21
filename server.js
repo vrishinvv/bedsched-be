@@ -9,6 +9,12 @@ import { parse } from 'csv-parse/sync';
 import { config } from './common/configs.js';
 import { execQuery } from './common/db.js';
 import { isCronAuthorized, isSeedAllowed } from './common/runtimeGuards.js';
+import {
+  UserValidationError,
+  hashPassword,
+  validateCreateUserInput,
+  verifyPassword,
+} from './common/userManagement.js';
 import {   
   getLocationsWithStats, 
   getLocationDetail, 
@@ -147,7 +153,9 @@ app.post('/api/auth/login', async (req, res) => {
     );
     if (!r.rowCount) return res.status(401).json({ error: 'invalid_credentials' });
     const u = r.rows[0];
-    if (u.password !== password) return res.status(401).json({ error: 'invalid_credentials' });
+    if (!(await verifyPassword(password, u.password))) {
+      return res.status(401).json({ error: 'invalid_credentials' });
+    }
 
     // Set cookies for auth - use 'none' for cross-site with secure, or 'lax' for same-site
     const cookieOptions = {
@@ -1083,6 +1091,89 @@ app.get('/api/users/list', async (req, res) => {
   } catch (e) {
     console.error('Get users error:', e);
     res.status(500).json({ error: 'fetch_users_failed' });
+  }
+});
+
+/* ------------------------------ Admin User Management ------------------------------ */
+app.get('/api/admin/users', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+
+    const result = await execQuery(`
+      SELECT
+        u.id,
+        u.username,
+        u.role,
+        u.location_id,
+        l.name AS location_name,
+        u.created_at
+      FROM users u
+      LEFT JOIN locations l ON l.id = u.location_id
+      ORDER BY LOWER(u.username), u.id
+    `);
+
+    res.json({ users: result.rows });
+  } catch (e) {
+    console.error('List admin users error:', e);
+    res.status(500).json({ error: 'fetch_users_failed' });
+  }
+});
+
+app.post('/api/admin/users', async (req, res) => {
+  try {
+    const actingUser = getUserFromRequest(req);
+    if (!actingUser || actingUser.role !== 'admin') {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    const input = validateCreateUserInput(req.body);
+
+    if (input.locationId !== null) {
+      const location = await execQuery('SELECT id FROM locations WHERE id = $1', [input.locationId]);
+      if (!location.rowCount) {
+        return res.status(400).json({
+          error: 'invalid_location',
+          message: 'The selected location does not exist.',
+          field: 'locationId',
+        });
+      }
+    }
+
+    const passwordHash = await hashPassword(input.password);
+    const result = await execQuery(`
+      WITH inserted AS (
+        INSERT INTO users (username, password, role, location_id)
+        VALUES ($1, $2, $3, $4)
+        RETURNING id, username, role, location_id, created_at
+      )
+      SELECT inserted.*, locations.name AS location_name
+      FROM inserted
+      LEFT JOIN locations ON locations.id = inserted.location_id
+    `, [input.username, passwordHash, input.role, input.locationId]);
+
+    const createdUser = result.rows[0];
+    await logAudit(req, 'create_user', 'user', createdUser.id, {
+      createdUsername: createdUser.username,
+      role: createdUser.role,
+      locationId: createdUser.location_id,
+    });
+
+    res.status(201).json({ ok: true, user: createdUser });
+  } catch (e) {
+    if (e instanceof UserValidationError) {
+      return res.status(400).json({ error: e.code, message: e.message, field: e.field });
+    }
+    if (e?.code === '23505') {
+      return res.status(409).json({
+        error: 'username_exists',
+        message: 'An account with that username already exists.',
+        field: 'username',
+      });
+    }
+
+    console.error('Create admin user error:', e);
+    res.status(500).json({ error: 'create_user_failed' });
   }
 });
 
