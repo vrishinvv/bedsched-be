@@ -17,6 +17,7 @@ import {
 } from './common/userManagement.js';
 import {
   StructureValidationError,
+  canManageAccommodationStructure,
   validateBlockUpdateInput,
   validateCreateBlockInput,
   validateCreateTentInput,
@@ -1232,7 +1233,7 @@ app.post('/api/admin/users', async (req, res) => {
 app.get('/api/admin/structure', async (req, res) => {
   try {
     const user = getUserFromRequest(req);
-    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+    if (!canManageAccommodationStructure(user)) return res.status(403).json({ error: 'forbidden' });
 
     const [locationsResult, tentsResult, blocksResult] = await Promise.all([
       execQuery(`
@@ -1315,7 +1316,7 @@ app.get('/api/admin/structure', async (req, res) => {
 app.patch('/api/admin/structure/locations/:locationId', async (req, res) => {
   try {
     const user = getUserFromRequest(req);
-    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+    if (!canManageAccommodationStructure(user)) return res.status(403).json({ error: 'forbidden' });
 
     const locationId = validateEntityId(req.params.locationId, 'locationId');
     const name = validateStructureName(req.body?.name, 'name', 'Location');
@@ -1350,7 +1351,7 @@ app.patch('/api/admin/structure/locations/:locationId', async (req, res) => {
 app.post('/api/admin/structure/locations/:locationId/tents', async (req, res) => {
   try {
     const user = getUserFromRequest(req);
-    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+    if (!canManageAccommodationStructure(user)) return res.status(403).json({ error: 'forbidden' });
 
     const locationId = validateEntityId(req.params.locationId, 'locationId');
     const input = validateCreateTentInput(req.body);
@@ -1400,7 +1401,7 @@ app.post('/api/admin/structure/locations/:locationId/tents', async (req, res) =>
 app.patch('/api/admin/structure/tents/:tentId', async (req, res) => {
   try {
     const user = getUserFromRequest(req);
-    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+    if (!canManageAccommodationStructure(user)) return res.status(403).json({ error: 'forbidden' });
 
     const tentId = validateEntityId(req.params.tentId, 'tentId');
     const name = validateStructureName(req.body?.name, 'name', 'Tent');
@@ -1445,7 +1446,7 @@ app.patch('/api/admin/structure/tents/:tentId', async (req, res) => {
 app.post('/api/admin/structure/tents/:tentId/blocks', async (req, res) => {
   try {
     const user = getUserFromRequest(req);
-    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+    if (!canManageAccommodationStructure(user)) return res.status(403).json({ error: 'forbidden' });
 
     const tentId = validateEntityId(req.params.tentId, 'tentId');
     const input = validateCreateBlockInput(req.body);
@@ -1536,7 +1537,7 @@ app.post('/api/admin/structure/tents/:tentId/blocks', async (req, res) => {
 app.patch('/api/admin/structure/blocks/:blockId', async (req, res) => {
   try {
     const user = getUserFromRequest(req);
-    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+    if (!canManageAccommodationStructure(user)) return res.status(403).json({ error: 'forbidden' });
 
     const blockId = validateEntityId(req.params.blockId, 'blockId');
     const input = validateBlockUpdateInput(req.body);
@@ -3111,6 +3112,11 @@ app.get('/api/locations/:id/tents/:tent/blocks', async (req, res) => {
 // body: { genderRestriction }
 app.patch('/api/locations/:id/tents/:tent/blocks/:block', async (req, res) => {
   try {
+    const user = getUserFromRequest(req);
+    if (!canManageAccommodationStructure(user)) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
     const locationId = Number(req.params.id);
     const tentIndex = Number(req.params.tent);
     const blockIndex = Number(req.params.block);

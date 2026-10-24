@@ -16,6 +16,10 @@ function fail(code, message, field) {
   throw new StructureValidationError(code, message, field);
 }
 
+export function canManageAccommodationStructure(user) {
+  return user?.role === 'admin';
+}
+
 export function validateEntityId(value, field = 'id') {
   const id = Number(value);
   if (!Number.isSafeInteger(id) || id <= 0) {

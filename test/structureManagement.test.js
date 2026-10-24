@@ -2,12 +2,20 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   StructureValidationError,
+  canManageAccommodationStructure,
   validateBlockUpdateInput,
   validateCreateBlockInput,
   validateCreateTentInput,
   validateEntityId,
   validateStructureName,
 } from '../common/structureManagement.js';
+
+test('only admins can manage accommodation structure', () => {
+  assert.equal(canManageAccommodationStructure({ role: 'admin' }), true);
+  assert.equal(canManageAccommodationStructure({ role: 'location_user' }), false);
+  assert.equal(canManageAccommodationStructure({ role: 'dashboard' }), false);
+  assert.equal(canManageAccommodationStructure(null), false);
+});
 
 test('normalizes names and positive entity IDs', () => {
   assert.equal(validateStructureName('  Main Hall  ', 'name', 'Location'), 'Main Hall');
