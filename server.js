@@ -5,7 +5,7 @@ import cookieParser from 'cookie-parser';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import multer from 'multer';
-import { parse } from 'csv-parse/sync';
+import { parseCsvContent } from './common/csvImport.js';
 import { config } from './common/configs.js';
 import { db, execQuery } from './common/db.js';
 import { isCronAuthorized, isSeedAllowed } from './common/runtimeGuards.js';
@@ -5667,12 +5667,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/bulk-import-csv',
       const csvContent = req.file.buffer.toString('utf-8');
       let records;
       try {
-        records = parse(csvContent, {
-          columns: true,
-          skip_empty_lines: true,
-          trim: true,
-          bom: true // Handle UTF-8 BOM
-        });
+        records = parseCsvContent(csvContent);
       } catch (parseErr) {
         return res.status(400).json({ 
           error: 'csv_parse_failed', 
