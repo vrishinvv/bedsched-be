@@ -19,9 +19,6 @@ const config = {
     backupEmail: process.env.BACKUP_EMAIL || 'vvnihsirv@gmail.com',
 }
 
-console.log(config)
-
-
 export {
     config,
 }

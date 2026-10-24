@@ -7,7 +7,7 @@ import crypto from 'crypto';
 import multer from 'multer';
 import { parse } from 'csv-parse/sync';
 import { config } from './common/configs.js';
-import { execQuery } from './common/db.js';
+import { db, execQuery } from './common/db.js';
 import { isCronAuthorized, isSeedAllowed } from './common/runtimeGuards.js';
 import {
   UserValidationError,
@@ -15,6 +15,14 @@ import {
   validateCreateUserInput,
   verifyPassword,
 } from './common/userManagement.js';
+import {
+  StructureValidationError,
+  validateBlockUpdateInput,
+  validateCreateBlockInput,
+  validateCreateTentInput,
+  validateEntityId,
+  validateStructureName,
+} from './common/structureManagement.js';
 import {   
   getLocationsWithStats, 
   getLocationDetail, 
@@ -33,6 +41,49 @@ import {
 import { generateUploadUrl, generateViewUrl } from './common/s3.js';
 
 const app = express();
+
+class StructureRequestError extends Error {
+  constructor(status, code, message, details = {}) {
+    super(message);
+    this.name = 'StructureRequestError';
+    this.status = status;
+    this.code = code;
+    this.details = details;
+  }
+}
+
+async function withTransaction(operation) {
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await operation(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackError) {
+      console.error('[STRUCTURE] Rollback failed:', rollbackError.message);
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function handleStructureError(res, error, fallbackCode) {
+  if (error instanceof StructureValidationError) {
+    return res.status(400).json({ error: error.code, message: error.message, field: error.field });
+  }
+  if (error instanceof StructureRequestError) {
+    return res.status(error.status).json({ error: error.code, message: error.message, ...error.details });
+  }
+  if (error?.code === '23505') {
+    return res.status(409).json({ error: 'duplicate_name', message: 'That name is already in use.' });
+  }
+  console.error(`[STRUCTURE] ${fallbackCode}:`, error);
+  return res.status(500).json({ error: fallbackCode });
+}
 
 // Audit logging helper
 async function logAudit(req, action, entityType, entityId, details = {}) {
@@ -1174,6 +1225,460 @@ app.post('/api/admin/users', async (req, res) => {
 
     console.error('Create admin user error:', e);
     res.status(500).json({ error: 'create_user_failed' });
+  }
+});
+
+/* ------------------------------ Admin Structure Management ------------------------------ */
+app.get('/api/admin/structure', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+
+    const [locationsResult, tentsResult, blocksResult] = await Promise.all([
+      execQuery(`
+        SELECT id, name, capacity
+        FROM locations
+        ORDER BY name, id
+      `),
+      execQuery(`
+        SELECT id, location_id, tent_index, name, size
+        FROM tents
+        ORDER BY location_id, tent_index
+      `),
+      execQuery(`
+        SELECT
+          b.id,
+          b.location_id,
+          b.tent_id,
+          b.block_index,
+          b.name,
+          b.size,
+          b.gender_restriction,
+          COUNT(a.id) FILTER (
+            WHERE a.deleted_at IS NULL AND (
+              (a.status = 'confirmed' AND a.end_date >= ${todaySQL})
+              OR (a.status = 'reserved' AND a.reserved_expires_at > ${nowIST})
+            )
+          ) AS active_allocations,
+          COALESCE(MAX(a.bed_number) FILTER (
+            WHERE a.deleted_at IS NULL AND (
+              (a.status = 'confirmed' AND a.end_date >= ${todaySQL})
+              OR (a.status = 'reserved' AND a.reserved_expires_at > ${nowIST})
+            )
+          ), 0) AS highest_active_bed
+        FROM blocks b
+        LEFT JOIN allocations a ON a.block_id = b.id
+        GROUP BY b.id
+        ORDER BY b.location_id, b.tent_id, b.block_index
+      `),
+    ]);
+
+    const locations = locationsResult.rows.map((location) => ({
+      id: Number(location.id),
+      name: location.name,
+      capacity: Number(location.capacity),
+      tents: [],
+    }));
+    const locationById = new Map(locations.map((location) => [location.id, location]));
+    const tentById = new Map();
+
+    for (const row of tentsResult.rows) {
+      const tent = {
+        id: Number(row.id),
+        index: Number(row.tent_index),
+        name: row.name,
+        size: Number(row.size),
+        blocks: [],
+      };
+      tentById.set(tent.id, tent);
+      locationById.get(Number(row.location_id))?.tents.push(tent);
+    }
+
+    for (const row of blocksResult.rows) {
+      tentById.get(Number(row.tent_id))?.blocks.push({
+        id: Number(row.id),
+        index: Number(row.block_index),
+        name: row.name,
+        size: Number(row.size),
+        genderRestriction: row.gender_restriction,
+        activeAllocations: Number(row.active_allocations),
+        highestActiveBed: Number(row.highest_active_bed),
+      });
+    }
+
+    res.json({ locations });
+  } catch (error) {
+    handleStructureError(res, error, 'fetch_structure_failed');
+  }
+});
+
+app.patch('/api/admin/structure/locations/:locationId', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+
+    const locationId = validateEntityId(req.params.locationId, 'locationId');
+    const name = validateStructureName(req.body?.name, 'name', 'Location');
+    const currentResult = await execQuery('SELECT id, name, capacity FROM locations WHERE id = $1', [locationId]);
+    if (!currentResult.rowCount) {
+      throw new StructureRequestError(404, 'location_not_found', 'Location not found.');
+    }
+
+    const current = currentResult.rows[0];
+    const updatedResult = await execQuery(`
+      UPDATE locations
+      SET name = $1
+      WHERE id = $2
+      RETURNING id, name, capacity
+    `, [name, locationId]);
+    const updated = updatedResult.rows[0];
+
+    await logAudit(req, 'update_location', 'location', locationId, {
+      oldName: current.name,
+      newName: updated.name,
+    });
+
+    res.json({
+      ok: true,
+      location: { id: Number(updated.id), name: updated.name, capacity: Number(updated.capacity) },
+    });
+  } catch (error) {
+    handleStructureError(res, error, 'update_location_failed');
+  }
+});
+
+app.post('/api/admin/structure/locations/:locationId/tents', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+
+    const locationId = validateEntityId(req.params.locationId, 'locationId');
+    const input = validateCreateTentInput(req.body);
+    const created = await withTransaction(async (client) => {
+      const locationResult = await client.query(
+        'SELECT id, name FROM locations WHERE id = $1 FOR UPDATE',
+        [locationId]
+      );
+      if (!locationResult.rowCount) {
+        throw new StructureRequestError(404, 'location_not_found', 'Location not found.');
+      }
+
+      const indexResult = await client.query(
+        'SELECT COALESCE(MAX(tent_index), 0) + 1 AS next_index FROM tents WHERE location_id = $1',
+        [locationId]
+      );
+      const tentIndex = Number(indexResult.rows[0].next_index);
+      const insertResult = await client.query(`
+        INSERT INTO tents (location_id, tent_index, name, size)
+        VALUES ($1, $2, $3, 0)
+        RETURNING id, tent_index, name, size
+      `, [locationId, tentIndex, input.name]);
+      return insertResult.rows[0];
+    });
+
+    await logAudit(req, 'create_tent', 'tent', created.id, {
+      locationId,
+      tentIndex: Number(created.tent_index),
+      name: created.name,
+    });
+
+    res.status(201).json({
+      ok: true,
+      tent: {
+        id: Number(created.id),
+        index: Number(created.tent_index),
+        name: created.name,
+        size: Number(created.size),
+        blocks: [],
+      },
+    });
+  } catch (error) {
+    handleStructureError(res, error, 'create_tent_failed');
+  }
+});
+
+app.patch('/api/admin/structure/tents/:tentId', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+
+    const tentId = validateEntityId(req.params.tentId, 'tentId');
+    const name = validateStructureName(req.body?.name, 'name', 'Tent');
+    const currentResult = await execQuery(
+      'SELECT id, location_id, tent_index, name, size FROM tents WHERE id = $1',
+      [tentId]
+    );
+    if (!currentResult.rowCount) {
+      throw new StructureRequestError(404, 'tent_not_found', 'Tent not found.');
+    }
+
+    const current = currentResult.rows[0];
+    const updatedResult = await execQuery(`
+      UPDATE tents
+      SET name = $1
+      WHERE id = $2
+      RETURNING id, location_id, tent_index, name, size
+    `, [name, tentId]);
+    const updated = updatedResult.rows[0];
+
+    await logAudit(req, 'update_tent', 'tent', tentId, {
+      locationId: Number(current.location_id),
+      tentIndex: Number(current.tent_index),
+      oldName: current.name,
+      newName: updated.name,
+    });
+
+    res.json({
+      ok: true,
+      tent: {
+        id: Number(updated.id),
+        index: Number(updated.tent_index),
+        name: updated.name,
+        size: Number(updated.size),
+      },
+    });
+  } catch (error) {
+    handleStructureError(res, error, 'update_tent_failed');
+  }
+});
+
+app.post('/api/admin/structure/tents/:tentId/blocks', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+
+    const tentId = validateEntityId(req.params.tentId, 'tentId');
+    const input = validateCreateBlockInput(req.body);
+    const created = await withTransaction(async (client) => {
+      const tentResult = await client.query(`
+        SELECT id, location_id, tent_index, name
+        FROM tents
+        WHERE id = $1
+        FOR UPDATE
+      `, [tentId]);
+      if (!tentResult.rowCount) {
+        throw new StructureRequestError(404, 'tent_not_found', 'Tent not found.');
+      }
+      const tent = tentResult.rows[0];
+
+      const indexResult = await client.query(
+        'SELECT COALESCE(MAX(block_index), 0) + 1 AS next_index FROM blocks WHERE tent_id = $1',
+        [tentId]
+      );
+      const blockIndex = Number(indexResult.rows[0].next_index);
+      const insertResult = await client.query(`
+        INSERT INTO blocks (
+          location_id, tent_id, tent_index, block_index, name, size, gender_restriction
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id, block_index, name, size, gender_restriction
+      `, [
+        Number(tent.location_id),
+        tentId,
+        Number(tent.tent_index),
+        blockIndex,
+        input.name,
+        input.size,
+        input.genderRestriction,
+      ]);
+
+      const tentSizeResult = await client.query(`
+        UPDATE tents
+        SET size = (SELECT COALESCE(SUM(size), 0)::int FROM blocks WHERE tent_id = $1)
+        WHERE id = $1
+        RETURNING size
+      `, [tentId]);
+      const locationCapacityResult = await client.query(`
+        UPDATE locations
+        SET capacity = (SELECT COALESCE(SUM(size), 0)::int FROM tents WHERE location_id = $1)
+        WHERE id = $1
+        RETURNING capacity
+      `, [Number(tent.location_id)]);
+
+      return {
+        block: insertResult.rows[0],
+        locationId: Number(tent.location_id),
+        tentIndex: Number(tent.tent_index),
+        tentSize: Number(tentSizeResult.rows[0].size),
+        locationCapacity: Number(locationCapacityResult.rows[0].capacity),
+      };
+    });
+
+    await logAudit(req, 'create_block', 'block', created.block.id, {
+      locationId: created.locationId,
+      tentId,
+      tentIndex: created.tentIndex,
+      blockIndex: Number(created.block.block_index),
+      name: created.block.name,
+      size: Number(created.block.size),
+      blockType: created.block.gender_restriction,
+    });
+
+    res.status(201).json({
+      ok: true,
+      block: {
+        id: Number(created.block.id),
+        index: Number(created.block.block_index),
+        name: created.block.name,
+        size: Number(created.block.size),
+        genderRestriction: created.block.gender_restriction,
+        activeAllocations: 0,
+        highestActiveBed: 0,
+      },
+      tentSize: created.tentSize,
+      locationCapacity: created.locationCapacity,
+    });
+  } catch (error) {
+    handleStructureError(res, error, 'create_block_failed');
+  }
+});
+
+app.patch('/api/admin/structure/blocks/:blockId', async (req, res) => {
+  try {
+    const user = getUserFromRequest(req);
+    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+
+    const blockId = validateEntityId(req.params.blockId, 'blockId');
+    const input = validateBlockUpdateInput(req.body);
+    const updated = await withTransaction(async (client) => {
+      const blockResult = await client.query(`
+        SELECT
+          b.id,
+          b.name,
+          b.size,
+          b.gender_restriction,
+          b.block_index,
+          b.tent_id,
+          t.tent_index,
+          t.location_id
+        FROM blocks b
+        JOIN tents t ON t.id = b.tent_id
+        WHERE b.id = $1
+        FOR UPDATE OF b, t
+      `, [blockId]);
+      if (!blockResult.rowCount) {
+        throw new StructureRequestError(404, 'block_not_found', 'Block not found.');
+      }
+      const current = blockResult.rows[0];
+      const next = {
+        name: input.name ?? current.name,
+        size: input.size ?? Number(current.size),
+        genderRestriction: input.genderRestriction ?? current.gender_restriction,
+      };
+
+      if (next.size < Number(current.size)) {
+        const sizeConflictResult = await client.query(`
+          SELECT COUNT(*)::int AS count, MAX(bed_number)::int AS highest_bed
+          FROM allocations
+          WHERE block_id = $1
+            AND bed_number > $2
+            AND deleted_at IS NULL
+            AND (
+              (status = 'confirmed' AND end_date >= ${todaySQL})
+              OR (status = 'reserved' AND reserved_expires_at > ${nowIST})
+            )
+        `, [blockId, next.size]);
+        const conflict = sizeConflictResult.rows[0];
+        if (Number(conflict.count) > 0) {
+          throw new StructureRequestError(
+            409,
+            'block_size_conflict',
+            `Cannot reduce this block to ${next.size} beds because ${conflict.count} active booking(s) use a higher bed number.`,
+            { highestActiveBed: Number(conflict.highest_bed), conflictingAllocations: Number(conflict.count) }
+          );
+        }
+      }
+
+      if (
+        next.genderRestriction !== current.gender_restriction
+        && next.genderRestriction !== 'both'
+      ) {
+        const genderResult = await client.query(`
+          SELECT gender, COUNT(*)::int AS count
+          FROM allocations
+          WHERE block_id = $1
+            AND deleted_at IS NULL
+            AND (
+              (status = 'confirmed' AND end_date >= ${todaySQL})
+              OR (status = 'reserved' AND reserved_expires_at > ${nowIST})
+            )
+          GROUP BY gender
+        `, [blockId]);
+        const permittedGender = next.genderRestriction === 'male_only' ? 'Male' : 'Female';
+        const conflicts = genderResult.rows.filter((row) => row.gender !== permittedGender);
+        if (conflicts.length > 0) {
+          const count = conflicts.reduce((sum, row) => sum + Number(row.count), 0);
+          throw new StructureRequestError(
+            409,
+            'block_type_conflict',
+            `Cannot change this block type while ${count} incompatible active booking(s) remain.`,
+            { conflictingAllocations: count }
+          );
+        }
+      }
+
+      const updateResult = await client.query(`
+        UPDATE blocks
+        SET name = $1, size = $2, gender_restriction = $3
+        WHERE id = $4
+        RETURNING id, block_index, name, size, gender_restriction
+      `, [next.name, next.size, next.genderRestriction, blockId]);
+
+      const tentSizeResult = await client.query(`
+        UPDATE tents
+        SET size = (SELECT COALESCE(SUM(size), 0)::int FROM blocks WHERE tent_id = $1)
+        WHERE id = $1
+        RETURNING size
+      `, [Number(current.tent_id)]);
+      const locationCapacityResult = await client.query(`
+        UPDATE locations
+        SET capacity = (SELECT COALESCE(SUM(size), 0)::int FROM tents WHERE location_id = $1)
+        WHERE id = $1
+        RETURNING capacity
+      `, [Number(current.location_id)]);
+
+      return {
+        block: updateResult.rows[0],
+        current,
+        locationId: Number(current.location_id),
+        tentId: Number(current.tent_id),
+        tentIndex: Number(current.tent_index),
+        tentSize: Number(tentSizeResult.rows[0].size),
+        locationCapacity: Number(locationCapacityResult.rows[0].capacity),
+      };
+    });
+
+    await logAudit(req, 'update_block', 'block', blockId, {
+      locationId: updated.locationId,
+      tentId: updated.tentId,
+      tentIndex: updated.tentIndex,
+      blockIndex: Number(updated.block.block_index),
+      before: {
+        name: updated.current.name,
+        size: Number(updated.current.size),
+        blockType: updated.current.gender_restriction,
+      },
+      after: {
+        name: updated.block.name,
+        size: Number(updated.block.size),
+        blockType: updated.block.gender_restriction,
+      },
+    });
+
+    res.json({
+      ok: true,
+      block: {
+        id: Number(updated.block.id),
+        index: Number(updated.block.block_index),
+        name: updated.block.name,
+        size: Number(updated.block.size),
+        genderRestriction: updated.block.gender_restriction,
+      },
+      tentSize: updated.tentSize,
+      locationCapacity: updated.locationCapacity,
+    });
+  } catch (error) {
+    handleStructureError(res, error, 'update_block_failed');
   }
 });
 
