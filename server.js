@@ -2,12 +2,12 @@ import express from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
 import cookieParser from 'cookie-parser';
-import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import multer from 'multer';
+import { createAuthToken, getUserFromRequest as readAuthenticatedUser } from './common/auth.js';
 import { parseCsvContent } from './common/csvImport.js';
 import { config } from './common/configs.js';
-import { db, execQuery } from './common/db.js';
+import { execQuery, withTransaction } from './common/db.js';
 import { isCronAuthorized, isSeedAllowed } from './common/runtimeGuards.js';
 import {
   UserValidationError,
@@ -53,25 +53,6 @@ class StructureRequestError extends Error {
   }
 }
 
-async function withTransaction(operation) {
-  const client = await db.connect();
-  try {
-    await client.query('BEGIN');
-    const result = await operation(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (error) {
-    try {
-      await client.query('ROLLBACK');
-    } catch (rollbackError) {
-      console.error('[STRUCTURE] Rollback failed:', rollbackError.message);
-    }
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
 function handleStructureError(res, error, fallbackCode) {
   if (error instanceof StructureValidationError) {
     return res.status(400).json({ error: error.code, message: error.message, field: error.field });
@@ -87,7 +68,7 @@ function handleStructureError(res, error, fallbackCode) {
 }
 
 // Audit logging helper
-async function logAudit(req, action, entityType, entityId, details = {}) {
+async function logAudit(req, action, entityType, entityId, details = {}, query = execQuery) {
   try {
     const user = getUserFromRequest(req);
     let userId = user?.id || null;
@@ -95,7 +76,7 @@ async function logAudit(req, action, entityType, entityId, details = {}) {
 
     // If user_id is not in token/cookie, fetch it from database
     if (!userId && username !== 'anonymous') {
-      const userQuery = await execQuery('SELECT id FROM users WHERE username = $1', [username]);
+      const userQuery = await query('SELECT id FROM users WHERE username = $1', [username]);
       userId = userQuery.rows[0]?.id || null;
     }
 
@@ -108,7 +89,7 @@ async function logAudit(req, action, entityType, entityId, details = {}) {
       'unknown'
     );
     
-    await execQuery(`
+    await query(`
       INSERT INTO audit_logs (user_id, username, action, entity_type, entity_id, details, ip_address)
       VALUES ($1, $2, $3, $4, $5, $6, $7)
     `, [userId, username, action, entityType, entityId, JSON.stringify(details), ipAddress]);
@@ -145,25 +126,7 @@ if (config.nodeEnv === 'development') {
 
 // Helpers to read auth from header or cookies
 function getUserFromRequest(req) {
-  // Prefer Bearer token from Authorization header if present
-  const authHeader = req.headers['authorization'] || req.headers['Authorization'];
-  if (authHeader && typeof authHeader === 'string' && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.slice('Bearer '.length).trim();
-    try {
-      const payload = jwt.verify(token, config.jwtSecret);
-      if (payload && payload.username && payload.role) {
-        return { username: payload.username, role: payload.role, id: payload.id, locationId: payload.locationId || null };
-      }
-    } catch (e) {
-      // invalid token -> fall back to cookies
-    }
-  }
-  const user = req.cookies?.bs_user;
-  const role = req.cookies?.bs_role;
-  const userId = req.cookies?.bs_user_id;
-  const locationId = req.cookies?.bs_location_id;
-  if (user && role) return { username: user, role, id: userId ? Number(userId) : null, locationId: locationId ? Number(locationId) : null };
-  return null;
+  return readAuthenticatedUser(req, config.jwtSecret);
 }
 
 // Global guard for API routes, excluding auth/health/seed.
@@ -209,21 +172,7 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'invalid_credentials' });
     }
 
-    // Set cookies for auth - use 'none' for cross-site with secure, or 'lax' for same-site
-    const cookieOptions = {
-      httpOnly: true,
-      sameSite: config.nodeEnv === 'production' ? 'none' : 'lax', // 'none' allows cross-site cookies
-      secure: config.nodeEnv === 'production', // required when sameSite=none
-      path: '/',
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-    };
-    res.cookie('bs_user', u.username, cookieOptions);
-    res.cookie('bs_role', u.role, cookieOptions);
-    res.cookie('bs_user_id', u.id, cookieOptions);
-    if (u.location_id) res.cookie('bs_location_id', u.location_id, cookieOptions);
-
-    // Also return a signed JWT for token-based auth on platforms where cookies are unreliable
-    const token = jwt.sign({ id: u.id, username: u.username, role: u.role, locationId: u.location_id }, config.jwtSecret, { expiresIn: '7d' });
+    const token = createAuthToken(u, config.jwtSecret);
     await logAudit(req, 'login', 'auth', u.id, { username: u.username, role: u.role });
     res.json({ ok: true, user: { username: u.username, role: u.role, locationId: u.location_id }, token });
   } catch (e) {
@@ -233,8 +182,12 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 app.post('/api/auth/logout', (req, res) => {
+  // Clear legacy unsigned cookies left by older deployments. Authentication is
+  // bearer-token only; the frontend removes that token from localStorage.
   res.clearCookie('bs_user', { path: '/' });
   res.clearCookie('bs_role', { path: '/' });
+  res.clearCookie('bs_user_id', { path: '/' });
+  res.clearCookie('bs_location_id', { path: '/' });
   res.json({ ok: true });
 });
 
@@ -347,18 +300,18 @@ app.post('/api/seed', async (req, res) => {
   }
 
   try {
-    // Start transaction
-    await execQuery('BEGIN');
+    const seedResult = await withTransaction(async (client) => {
+      const query = client.query.bind(client);
     
-    console.log('[SEED] Starting database seed...');
+      console.log('[SEED] Starting database seed...');
     
     // Clear existing data in reverse dependency order
-    await execQuery('DELETE FROM audit_logs');
-    await execQuery('DELETE FROM allocations');
-    await execQuery('DELETE FROM blocks');
-    await execQuery('DELETE FROM tents');
-    await execQuery('DELETE FROM users');
-    await execQuery('DELETE FROM locations');
+    await query('DELETE FROM audit_logs');
+    await query('DELETE FROM allocations');
+    await query('DELETE FROM blocks');
+    await query('DELETE FROM tents');
+    await query('DELETE FROM users');
+    await query('DELETE FROM locations');
     
     console.log('[SEED] Cleared all existing data');
 
@@ -414,7 +367,7 @@ app.post('/api/seed', async (req, res) => {
     ).join(', ');
     const locationParams = locationData.flatMap(loc => [loc.name, loc.capacity]);
     
-    const locResult = await execQuery(`
+    const locResult = await query(`
       INSERT INTO locations(name, capacity) 
       VALUES ${locationValues}
       RETURNING id, name
@@ -480,7 +433,7 @@ app.post('/api/seed', async (req, res) => {
       ).join(', ');
       const tentParams = allTentData.flatMap(t => [t.location_id, t.tent_index, t.tent_name, t.size]);
       
-      const tentResult = await execQuery(`
+      const tentResult = await query(`
         INSERT INTO tents(location_id, tent_index, name, size) 
         VALUES ${tentValues}
         RETURNING id, location_id, tent_index, name, size
@@ -531,7 +484,7 @@ app.post('/api/seed', async (req, res) => {
           [b.location_id, b.tent_id, b.tent_index, b.block_index, b.block_name, b.size, b.gender]
         );
         
-        await execQuery(`
+        await query(`
           INSERT INTO blocks(location_id, tent_id, tent_index, block_index, name, size, gender_restriction)
           VALUES ${blockValues}
         `, blockParams);
@@ -563,7 +516,7 @@ app.post('/api/seed', async (req, res) => {
     }
     
     // Batch insert all users at once
-    await execQuery(`
+    await query(`
       INSERT INTO users(username, password, role, location_id) 
       VALUES ${userValues.join(', ')}
     `, userParams);
@@ -571,7 +524,7 @@ app.post('/api/seed', async (req, res) => {
     console.log(`[SEED] Created ${locationInserts.length * 20} users in batch`);
 
     // Recreate admin users (they were deleted during seed)
-    await execQuery(`
+    await query(`
       INSERT INTO users(username, password, role)
       VALUES ('admin', 'admin', 'admin'), ('dashboard', 'dashboard', 'dashboard')
       ON CONFLICT (username) DO NOTHING
@@ -581,7 +534,7 @@ app.post('/api/seed', async (req, res) => {
     console.log('[SEED] No dummy allocations created - clean slate ready!');
 
     // Get summary
-    const summary = await execQuery(`
+    const summary = await query(`
       SELECT 
         l.name,
         l.capacity,
@@ -594,24 +547,23 @@ app.post('/api/seed', async (req, res) => {
       ORDER BY l.id
     `);
 
-    await execQuery('COMMIT');
-    
-    console.log('[SEED] Database seed completed successfully!');
-
-    res.json({
-      success: true,
-      message: 'Database seeded successfully',
-      summary: summary.rows,
-      credentials: locationInserts.flatMap(loc => 
-        Array.from({ length: 20 }, (_, i) => ({
-          location: loc.name,
-          username: `${loc.shortcode}_${i + 1}`,
-          password: `${loc.shortcode}_${i + 1}` // username = password
-        }))
-      )
+      return {
+        success: true,
+        message: 'Database seeded successfully',
+        summary: summary.rows,
+        credentials: locationInserts.flatMap(loc =>
+          Array.from({ length: 20 }, (_, i) => ({
+            location: loc.name,
+            username: `${loc.shortcode}_${i + 1}`,
+            password: `${loc.shortcode}_${i + 1}` // username = password
+          }))
+        )
+      };
     });
+
+    console.log('[SEED] Database seed completed successfully!');
+    res.json(seedResult);
   } catch (e) {
-    await execQuery('ROLLBACK');
     console.error('[SEED ERROR]', e);
     res.status(500).json({ error: 'seed_failed', message: e.message });
   }
@@ -824,12 +776,9 @@ app.patch('/api/locations/:id/beds/:bedNumber', async (req, res) => {
       console.error('[EDIT] Cleanup error:', cleanupErr.message);
     }
 
-    // Begin transaction
-    await execQuery('BEGIN');
-
-    try {
+    await withTransaction(async (client) => {
       // Soft delete current allocation
-      await execQuery(
+      await client.query(
         `UPDATE allocations SET deleted_at = NOW() WHERE id = $1`,
         [current.id]
       );
@@ -840,7 +789,7 @@ app.patch('/api/locations/:id/beds/:bedNumber', async (req, res) => {
         VALUES ($1, $2, $3, $4, $5, $6, $7)
         RETURNING id
       `;
-      await execQuery(insertQ, [
+      await client.query(insertQ, [
         id,
         bedNumber,
         newName,
@@ -849,13 +798,8 @@ app.patch('/api/locations/:id/beds/:bedNumber', async (req, res) => {
         newStartDate,
         newEndDate
       ]);
-
-      await execQuery('COMMIT');
-      res.json({ ok: true });
-    } catch (e) {
-      await execQuery('ROLLBACK');
-      throw e;
-    }
+    });
+    res.json({ ok: true });
   } catch (e) {
     console.error('[EDIT ERROR]', {
       error: e.message,
@@ -2703,12 +2647,9 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
       });
     }
 
-    // Begin transaction
-    await execQuery('BEGIN');
-
-    try {
+    const newAllocationId = await withTransaction(async (client) => {
       // Step 1: Soft delete old allocation with "booking_error" reason
-      await execQuery(`
+      await client.query(`
         UPDATE allocations 
         SET deleted_at = NOW(), updated_at = NOW()
         WHERE id = $1
@@ -2729,10 +2670,10 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
         to_tent_id: newTentId,
         to_block_id: newBlockId,
         to_bed: newBedNumber
-      });
+      }, client.query.bind(client));
 
       // Step 2: Create new allocation with same data
-      const insertResult = await execQuery(`
+      const insertResult = await client.query(`
         INSERT INTO allocations(
           location_id,
           tent_id,
@@ -2768,10 +2709,10 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
         oldAllocation.aadhaar_photo_key
       ]);
 
-      const newAllocationId = insertResult.rows[0].id;
+      const insertedAllocationId = insertResult.rows[0].id;
 
       // Log allocation with reallocation flag
-      await logAudit(req, 'allocate', 'allocation', newAllocationId, {
+      await logAudit(req, 'allocate', 'allocation', insertedAllocationId, {
         reallocation: true,
         from_allocation_id: allocationId,
         from_location_id: oldAllocation.location_id,
@@ -2784,11 +2725,12 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
         name: oldAllocation.name,
         phone: oldAllocation.phone,
         gender: oldAllocation.gender
-      });
+      }, client.query.bind(client));
 
-      await execQuery('COMMIT');
+      return insertedAllocationId;
+    });
 
-      res.json({ 
+    res.json({
         ok: true, 
         message: 'Reallocation successful',
         old_allocation_id: allocationId,
@@ -2806,11 +2748,6 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
           bed: newBedNumber
         }
       });
-
-    } catch (e) {
-      await execQuery('ROLLBACK');
-      throw e;
-    }
 
   } catch (e) {
     console.error('[REALLOCATE ERROR]', {
@@ -3617,34 +3554,32 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
     const batchId = `batch_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
     const expiresAt = new Date(Date.now() + (config.reservationTTLHours * 60 * 60 * 1000));
 
-    await execQuery('BEGIN');
     try {
-      const cols = `location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date, status, batch_id, is_family, reserved_expires_at, emergency_phone`;
-      
-      // Batch insert to avoid parameter limit (PostgreSQL limit is ~65535 params)
-      const batchSize = 500; // 500 rows * 15 params = 7500 params per batch (safe)
-      for (let i = 0; i < finalPlan.items.length; i += batchSize) {
-        const chunk = finalPlan.items.slice(i, i + batchSize);
-        const values = [];
-        const params = [];
-        let p = 1;
-        
-        for (const item of chunk) {
-          values.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},'reserved',$${p++},$${p++},$${p++},$${p++})`);
-          params.push(
-            item.locationId, item.tentId, item.blockId, item.tentIndex, item.blockIndex, item.bedNumber,
-            contactName || 'Reserved', phone, item.gender, startDate, endDate,
-            batchId, !!isFamily, expiresAt, emergencyPhone || null
-          );
+      await withTransaction(async (client) => {
+        const cols = `location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date, status, batch_id, is_family, reserved_expires_at, emergency_phone`;
+
+        // Batch insert to avoid parameter limit (PostgreSQL limit is ~65535 params)
+        const batchSize = 500; // 500 rows * 15 params = 7500 params per batch (safe)
+        for (let i = 0; i < finalPlan.items.length; i += batchSize) {
+          const chunk = finalPlan.items.slice(i, i + batchSize);
+          const values = [];
+          const params = [];
+          let p = 1;
+
+          for (const item of chunk) {
+            values.push(`($${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},'reserved',$${p++},$${p++},$${p++},$${p++})`);
+            params.push(
+              item.locationId, item.tentId, item.blockId, item.tentIndex, item.blockIndex, item.bedNumber,
+              contactName || 'Reserved', phone, item.gender, startDate, endDate,
+              batchId, !!isFamily, expiresAt, emergencyPhone || null
+            );
+          }
+
+          const sql = `INSERT INTO allocations(${cols}) VALUES ${values.join(',')}`;
+          await client.query(sql, params);
         }
-        
-        const sql = `INSERT INTO allocations(${cols}) VALUES ${values.join(',')}`;
-        await execQuery(sql, params);
-      }
-      
-      await execQuery('COMMIT');
+      });
     } catch (e) {
-      await execQuery('ROLLBACK');
       if (e.code === '23P01') {
         // Exclusion constraint violation - provide detailed error
         console.error('[SMART-RESERVE CONFLICT]', {
@@ -4691,10 +4626,9 @@ app.post('/api/allocations/confirm', async (req, res) => {
     const { batchId, allocationIds } = req.body || {};
     if (!batchId) return res.status(400).json({ error: 'missing_batch' });
 
-    await execQuery('BEGIN');
-    try {
+    const confirmedIds = await withTransaction(async (client) => {
       // Select target rows (reserved and not expired)
-      const target = await execQuery(`
+      const target = await client.query(`
         SELECT id FROM allocations
         WHERE batch_id = $1 AND status = 'reserved' AND (reserved_expires_at IS NULL OR reserved_expires_at > NOW())
       `, [batchId]);
@@ -4705,24 +4639,31 @@ app.post('/api/allocations/confirm', async (req, res) => {
         ids = ids.filter(id => set.has(Number(id)));
       }
       if (!ids.length) {
-        await execQuery('ROLLBACK');
-        return res.status(400).json({ error: 'nothing_to_confirm' });
+        return null;
       }
 
       // Flip to confirmed
       const placeholders = ids.map((_,i)=>`$${i+2}`).join(',');
-      await execQuery(`
+      await client.query(`
         UPDATE allocations SET status = 'confirmed', updated_at = NOW()
         WHERE batch_id = $1 AND id IN (${placeholders})
       `, [batchId, ...ids]);
 
-      await execQuery('COMMIT');
-      await logAudit(req, 'confirm', 'reservation', null, { batchId, confirmedCount: ids.length, allocationIds: ids });
-      res.json({ ok: true, confirmedIds: ids });
-    } catch (e) {
-      await execQuery('ROLLBACK');
-      throw e;
+      await logAudit(
+        req,
+        'confirm',
+        'reservation',
+        null,
+        { batchId, confirmedCount: ids.length, allocationIds: ids },
+        client.query.bind(client),
+      );
+      return ids;
+    });
+
+    if (!confirmedIds) {
+      return res.status(400).json({ error: 'nothing_to_confirm' });
     }
+    res.json({ ok: true, confirmedIds });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'confirm_failed' });
@@ -5168,24 +5109,21 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
       });
     }
 
-    // Begin transaction for bulk insert
-    await execQuery('BEGIN');
-
     // Generate a batch ID for this bulk allocation
     const batchId = `batch_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
 
     const success = [];
     const errors = [];
     
-    try {
-      // Validate gender restrictions before allocating
-      if (maleCount > 0) {
-        await validateGenderRestriction(locationId, tentIndex, blockIndex, 'Male');
-      }
-      if (femaleCount > 0) {
-        await validateGenderRestriction(locationId, tentIndex, blockIndex, 'Female');
-      }
+    // Validate gender restrictions before holding a transaction connection.
+    if (maleCount > 0) {
+      await validateGenderRestriction(locationId, tentIndex, blockIndex, 'Male');
+    }
+    if (femaleCount > 0) {
+      await validateGenderRestriction(locationId, tentIndex, blockIndex, 'Female');
+    }
 
+    await withTransaction(async (client) => {
       // Build bulk insert values
       const values = [];
       const placeholders = [];
@@ -5212,25 +5150,21 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
 
       // Execute single bulk INSERT if we have any beds to allocate
       if (placeholders.length > 0) {
-        await execQuery(`
+        await client.query(`
           INSERT INTO allocations(location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date, batch_id, emergency_phone)
           VALUES ${placeholders.join(', ')}
         `, values);
       }
 
-      await execQuery('COMMIT');
-      
-      res.json({ 
-        ok: true, 
-        success, 
-        errors,
-        total: totalCount,
-        allocated: success.length
-      });
-    } catch (e) {
-      await execQuery('ROLLBACK');
-      throw e;
-    }
+    });
+
+    res.json({
+      ok: true,
+      success,
+      errors,
+      total: totalCount,
+      allocated: success.length
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'bulk_allocate_failed', message: e.message });

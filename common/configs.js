@@ -1,14 +1,24 @@
 import dotenv from 'dotenv';
-dotenv.config();
+dotenv.config({ quiet: true });
+
+function resolveJwtSecret(nodeEnv, configuredSecret) {
+    if (configuredSecret) return configuredSecret;
+    if (nodeEnv === 'production') {
+        throw new Error('JWT_SECRET must be configured in production');
+    }
+    return 'dev-insecure-secret';
+}
+
+const nodeEnv = process.env.NODE_ENV || 'development';
 
 const config = {
     random: process.env.RANDOM || 10,
     port: process.env.PORT || 3001,
     databaseUrl: process.env.DATABASE_URL,
     frontendUrl: process.env.FRONTEND_URL || 'http://localhost:3000',
-    nodeEnv: process.env.NODE_ENV || 'development',
+    nodeEnv,
     reservationTTLHours: Number(process.env.RESERVATION_TTL_HOURS || 7),
-    jwtSecret: process.env.JWT_SECRET || 'dev-insecure-secret',
+    jwtSecret: resolveJwtSecret(nodeEnv, process.env.JWT_SECRET),
     // AWS S3 Configuration
     awsRegion: process.env.AWS_REGION || 'us-east-1',
     awsAccessKeyId: process.env.AWS_ACCESS_KEY_ID,
@@ -21,4 +31,5 @@ const config = {
 
 export {
     config,
+    resolveJwtSecret,
 }

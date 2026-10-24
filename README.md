@@ -391,6 +391,21 @@ FRONTEND_URL=http://localhost:3000 # CORS allowed origin
 NODE_ENV=development              # Environment mode
 ```
 
+`JWT_SECRET` is mandatory when `NODE_ENV=production`. Changing it invalidates
+existing login tokens and requires users to sign in again.
+
+## Tests
+
+```bash
+npm test
+TEST_DATABASE_URL=postgresql://... npm run test:integration
+```
+
+Use a dedicated non-production PostgreSQL/Neon database for
+`TEST_DATABASE_URL`. The integration test creates a uniquely named schema,
+verifies commit and rollback behavior, and removes that schema afterward. CI
+runs it automatically when the repository secret `TEST_DATABASE_URL` exists.
+
 ## Database Migrations
 
 ### Migration Files

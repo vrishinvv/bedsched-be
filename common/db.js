@@ -1,5 +1,6 @@
 import pg from 'pg'
 import { config } from "./configs.js"
+import { runInTransaction } from './transactions.js'
 
 const { Pool } = pg
 
@@ -94,6 +95,9 @@ async function execQuery(text, params = []) {
   }
 }
 
+async function withTransaction(operation) {
+  return runInTransaction(db, operation);
+}
 
 
-export { db, execQuery };
+export { db, execQuery, withTransaction };
