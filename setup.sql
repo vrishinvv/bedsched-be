@@ -30,6 +30,11 @@ CREATE TABLE IF NOT EXISTS blocks (
   name         TEXT,
   size         INTEGER NOT NULL CHECK (size >= 0),
   gender_restriction TEXT NOT NULL DEFAULT 'both' CHECK (gender_restriction IN ('male_only', 'female_only', 'both')),
+  allowed_categories TEXT[] NOT NULL DEFAULT ARRAY['delegate', 'sevadal', 'devotee']::TEXT[]
+    CHECK (
+      cardinality(allowed_categories) > 0
+      AND allowed_categories <@ ARRAY['delegate', 'sevadal', 'devotee']::TEXT[]
+    ),
   created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE(tent_id, block_index)
 );
@@ -57,8 +62,27 @@ CREATE TABLE IF NOT EXISTS allocations (
   created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   deleted_at   TIMESTAMPTZ DEFAULT NULL,
+  accommodation_category TEXT NOT NULL DEFAULT 'devotee'
+    CHECK (accommodation_category IN ('delegate', 'sevadal', 'devotee')),
+  category_source TEXT NOT NULL DEFAULT 'legacy'
+    CHECK (category_source IN ('sai_connect', 'manual', 'default', 'legacy')),
+  verified_categories TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[]
+    CHECK (verified_categories <@ ARRAY['delegate', 'sevadal']::TEXT[]),
+  category_verified_at TIMESTAMPTZ,
+  sai_connect_id TEXT,
+  sai_lookup_identifier TEXT,
+  caretaker_for_allocation_id BIGINT REFERENCES allocations(id) ON DELETE RESTRICT,
   -- Prevent end before start
   CHECK (end_date >= start_date),
+  CHECK (
+    accommodation_category <> 'delegate'
+    OR (category_source = 'sai_connect' AND 'delegate' = ANY(verified_categories))
+  ),
+  CHECK (
+    category_source <> 'sai_connect'
+    OR accommodation_category = ANY(verified_categories)
+  ),
+  CHECK (caretaker_for_allocation_id IS NULL OR caretaker_for_allocation_id <> id),
   -- Prevent overlapping bookings for same (location, tent, block, bed) - only for non-deleted records
   EXCLUDE USING gist (
     location_id WITH =,
@@ -82,6 +106,8 @@ CREATE INDEX IF NOT EXISTS idx_allocations_end_date ON allocations(end_date);
 CREATE INDEX IF NOT EXISTS idx_allocations_status_expiry ON allocations(status, reserved_expires_at);
 CREATE INDEX IF NOT EXISTS idx_allocations_batch_id ON allocations(batch_id);
 CREATE INDEX IF NOT EXISTS idx_allocations_phone ON allocations(phone);
+CREATE INDEX IF NOT EXISTS idx_allocations_caretaker_for ON allocations(caretaker_for_allocation_id) WHERE caretaker_for_allocation_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_allocations_one_active_caretaker ON allocations(caretaker_for_allocation_id) WHERE caretaker_for_allocation_id IS NOT NULL AND deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_tents_location_index ON tents(location_id, tent_index); -- Fast tent lookup
 
 -- Users (simple auth)

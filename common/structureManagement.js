@@ -1,3 +1,5 @@
+import { normalizeAccommodationCategories } from './accommodationEligibility.js';
+
 export const BLOCK_TYPES = Object.freeze(['both', 'male_only', 'female_only']);
 
 const MAX_NAME_LENGTH = 100;
@@ -52,6 +54,14 @@ export function validateBlockType(value) {
   return value;
 }
 
+export function validateAllowedCategories(value, options) {
+  try {
+    return normalizeAccommodationCategories(value, options);
+  } catch (error) {
+    fail(error.code || 'invalid_category', error.message, error.field || 'allowedCategories');
+  }
+}
+
 export function validateCreateTentInput(input) {
   const candidate = input && typeof input === 'object' ? input : {};
   return { name: validateStructureName(candidate.name, 'name', 'Tent') };
@@ -63,6 +73,7 @@ export function validateCreateBlockInput(input) {
     name: validateStructureName(candidate.name, 'name', 'Block'),
     size: validateBlockSize(candidate.size),
     genderRestriction: validateBlockType(candidate.genderRestriction || 'both'),
+    allowedCategories: validateAllowedCategories(candidate.allowedCategories, { defaultToAll: true }),
   };
 }
 
@@ -78,6 +89,9 @@ export function validateBlockUpdateInput(input) {
   }
   if (Object.hasOwn(candidate, 'genderRestriction')) {
     update.genderRestriction = validateBlockType(candidate.genderRestriction);
+  }
+  if (Object.hasOwn(candidate, 'allowedCategories')) {
+    update.allowedCategories = validateAllowedCategories(candidate.allowedCategories);
   }
 
   if (Object.keys(update).length === 0) {

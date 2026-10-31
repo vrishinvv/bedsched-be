@@ -25,23 +25,46 @@ test('normalizes names and positive entity IDs', () => {
 
 test('validates new block size and type', () => {
   assert.deepEqual(
-    validateCreateBlockInput({ name: ' Block 4 ', size: '125', genderRestriction: 'female_only' }),
-    { name: 'Block 4', size: 125, genderRestriction: 'female_only' }
+    validateCreateBlockInput({
+      name: ' Block 4 ',
+      size: '125',
+      genderRestriction: 'female_only',
+      allowedCategories: ['delegate', 'sevadal'],
+    }),
+    {
+      name: 'Block 4',
+      size: 125,
+      genderRestriction: 'female_only',
+      allowedCategories: ['delegate', 'sevadal'],
+    }
   );
 });
 
-test('defaults a new block to mixed type', () => {
-  assert.equal(
-    validateCreateBlockInput({ name: 'Block 1', size: 50 }).genderRestriction,
-    'both'
+test('defaults a new block to mixed type and all accommodation categories', () => {
+  assert.deepEqual(
+    validateCreateBlockInput({ name: 'Block 1', size: 50 }),
+    {
+      name: 'Block 1',
+      size: 50,
+      genderRestriction: 'both',
+      allowedCategories: ['delegate', 'sevadal', 'devotee'],
+    }
   );
 });
 
 test('accepts partial block updates', () => {
   assert.deepEqual(validateBlockUpdateInput({ size: 75 }), { size: 75 });
   assert.deepEqual(
-    validateBlockUpdateInput({ name: ' West ', genderRestriction: 'male_only' }),
-    { name: 'West', genderRestriction: 'male_only' }
+    validateBlockUpdateInput({
+      name: ' West ',
+      genderRestriction: 'male_only',
+      allowedCategories: ['devotee', 'sevadal', 'devotee'],
+    }),
+    {
+      name: 'West',
+      genderRestriction: 'male_only',
+      allowedCategories: ['sevadal', 'devotee'],
+    }
   );
 });
 
@@ -50,6 +73,8 @@ test('rejects empty names, invalid sizes, invalid types, and empty updates', () 
     [() => validateCreateTentInput({ name: '   ' }), 'name_required'],
     [() => validateCreateBlockInput({ name: 'Block', size: 0 }), 'invalid_block_size'],
     [() => validateCreateBlockInput({ name: 'Block', size: 10, genderRestriction: 'vip' }), 'invalid_block_type'],
+    [() => validateCreateBlockInput({ name: 'Block', size: 10, allowedCategories: [] }), 'category_required'],
+    [() => validateCreateBlockInput({ name: 'Block', size: 10, allowedCategories: ['vip'] }), 'invalid_category'],
     [() => validateBlockUpdateInput({}), 'no_changes'],
     [() => validateEntityId('not-an-id'), 'invalid_id'],
   ];

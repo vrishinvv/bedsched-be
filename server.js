@@ -24,6 +24,20 @@ import {
   validateEntityId,
   validateStructureName,
 } from './common/structureManagement.js';
+import {
+  AccommodationEligibilityError,
+  resolveUnverifiedCategory,
+  resolveVerifiedCategory,
+  validateAdminCategoryChange,
+  validateCategoryAllowedInBlock,
+  validateCaretakerTarget,
+} from './common/accommodationEligibility.js';
+import {
+  SaiConnectError,
+  createSaiVerificationToken,
+  lookupSaiConnectMember,
+  verifySaiVerificationToken,
+} from './common/saiConnect.js';
 import {   
   getLocationsWithStats, 
   getLocationDetail, 
@@ -65,6 +79,20 @@ function handleStructureError(res, error, fallbackCode) {
   }
   console.error(`[STRUCTURE] ${fallbackCode}:`, error);
   return res.status(500).json({ error: fallbackCode });
+}
+
+function handleAccommodationError(res, error, fallbackCode = 'accommodation_failed') {
+  if (error instanceof AccommodationEligibilityError || error instanceof SaiConnectError) {
+    return res.status(400).json({ error: error.code, message: error.message, field: error.field });
+  }
+  if (error?.code === '23505' && error?.constraint === 'idx_allocations_one_active_caretaker') {
+    return res.status(409).json({
+      error: 'caretaker_already_assigned',
+      message: 'This Delegate already has a caretaker.',
+    });
+  }
+  console.error(`[ACCOMMODATION] ${fallbackCode}:`, error);
+  return res.status(500).json({ error: fallbackCode, message: error.message });
 }
 
 // Audit logging helper
@@ -155,6 +183,54 @@ app.use((req, res, next) => {
 });
 
 /* -------------------------------- Routes -------------------------------- */
+
+app.post('/api/sai-connect/lookup', async (req, res) => {
+  try {
+    const identifier = String(req.body?.identifier ?? '').trim();
+    if (!identifier) {
+      return res.status(400).json({ error: 'identifier_required', message: 'Enter a Sai Connect ID or phone number.' });
+    }
+
+    const result = await lookupSaiConnectMember({
+      endpoint: config.saiConnectEndpoint,
+      bearerToken: config.saiConnectBearerToken,
+      identifier,
+      eventCategoryMap: new Map([
+        [config.saiConnectDelegateEventId, 'delegate'],
+        [config.saiConnectSevadalEventId, 'sevadal'],
+      ]),
+    });
+
+    if (result.outcome !== 'matched') {
+      return res.json({
+        matched: false,
+        outcome: result.outcome,
+        message: result.message,
+        defaultCategory: 'devotee',
+      });
+    }
+
+    return res.json({
+      matched: true,
+      fullName: result.fullName,
+      age: result.age,
+      mobileNo: result.mobileNo,
+      verifiedCategories: result.verifiedCategories,
+      registrations: result.registrations,
+      verificationToken: createSaiVerificationToken(result, config.jwtSecret),
+    });
+  } catch (error) {
+    if (error instanceof SaiConnectError && ['timeout', 'unavailable', 'invalid_response', 'not_configured'].includes(error.code)) {
+      return res.status(503).json({
+        error: error.code,
+        message: error.message,
+        canContinue: true,
+        defaultCategory: 'devotee',
+      });
+    }
+    return handleAccommodationError(res, error, 'sai_connect_lookup_failed');
+  }
+});
 
 // Auth routes
 app.post('/api/auth/login', async (req, res) => {
@@ -1199,6 +1275,7 @@ app.get('/api/admin/structure', async (req, res) => {
           b.name,
           b.size,
           b.gender_restriction,
+          b.allowed_categories,
           COUNT(a.id) FILTER (
             WHERE a.deleted_at IS NULL AND (
               (a.status = 'confirmed' AND a.end_date >= ${todaySQL})
@@ -1246,6 +1323,7 @@ app.get('/api/admin/structure', async (req, res) => {
         name: row.name,
         size: Number(row.size),
         genderRestriction: row.gender_restriction,
+        allowedCategories: row.allowed_categories,
         activeAllocations: Number(row.active_allocations),
         highestActiveBed: Number(row.highest_active_bed),
       });
@@ -1413,10 +1491,10 @@ app.post('/api/admin/structure/tents/:tentId/blocks', async (req, res) => {
       const blockIndex = Number(indexResult.rows[0].next_index);
       const insertResult = await client.query(`
         INSERT INTO blocks (
-          location_id, tent_id, tent_index, block_index, name, size, gender_restriction
+          location_id, tent_id, tent_index, block_index, name, size, gender_restriction, allowed_categories
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        RETURNING id, block_index, name, size, gender_restriction
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING id, block_index, name, size, gender_restriction, allowed_categories
       `, [
         Number(tent.location_id),
         tentId,
@@ -1425,6 +1503,7 @@ app.post('/api/admin/structure/tents/:tentId/blocks', async (req, res) => {
         input.name,
         input.size,
         input.genderRestriction,
+        input.allowedCategories,
       ]);
 
       const tentSizeResult = await client.query(`
@@ -1457,6 +1536,7 @@ app.post('/api/admin/structure/tents/:tentId/blocks', async (req, res) => {
       name: created.block.name,
       size: Number(created.block.size),
       blockType: created.block.gender_restriction,
+      allowedCategories: created.block.allowed_categories,
     });
 
     res.status(201).json({
@@ -1467,6 +1547,7 @@ app.post('/api/admin/structure/tents/:tentId/blocks', async (req, res) => {
         name: created.block.name,
         size: Number(created.block.size),
         genderRestriction: created.block.gender_restriction,
+        allowedCategories: created.block.allowed_categories,
         activeAllocations: 0,
         highestActiveBed: 0,
       },
@@ -1492,6 +1573,7 @@ app.patch('/api/admin/structure/blocks/:blockId', async (req, res) => {
           b.name,
           b.size,
           b.gender_restriction,
+          b.allowed_categories,
           b.block_index,
           b.tent_id,
           t.tent_index,
@@ -1509,6 +1591,7 @@ app.patch('/api/admin/structure/blocks/:blockId', async (req, res) => {
         name: input.name ?? current.name,
         size: input.size ?? Number(current.size),
         genderRestriction: input.genderRestriction ?? current.gender_restriction,
+        allowedCategories: input.allowedCategories ?? current.allowed_categories,
       };
 
       if (next.size < Number(current.size)) {
@@ -1562,12 +1645,37 @@ app.patch('/api/admin/structure/blocks/:blockId', async (req, res) => {
         }
       }
 
+      if (input.allowedCategories) {
+        const categoryConflictResult = await client.query(`
+          SELECT accommodation_category, COUNT(*)::int AS count
+          FROM allocations
+          WHERE block_id = $1
+            AND caretaker_for_allocation_id IS NULL
+            AND accommodation_category <> ALL($2::text[])
+            AND deleted_at IS NULL
+            AND (
+              (status = 'confirmed' AND end_date >= ${todaySQL})
+              OR (status = 'reserved' AND reserved_expires_at > ${nowIST})
+            )
+          GROUP BY accommodation_category
+        `, [blockId, next.allowedCategories]);
+        if (categoryConflictResult.rowCount > 0) {
+          const count = categoryConflictResult.rows.reduce((sum, row) => sum + Number(row.count), 0);
+          throw new StructureRequestError(
+            409,
+            'block_category_conflict',
+            `Cannot remove a category while ${count} incompatible active booking(s) remain.`,
+            { conflictingAllocations: count }
+          );
+        }
+      }
+
       const updateResult = await client.query(`
         UPDATE blocks
-        SET name = $1, size = $2, gender_restriction = $3
-        WHERE id = $4
-        RETURNING id, block_index, name, size, gender_restriction
-      `, [next.name, next.size, next.genderRestriction, blockId]);
+        SET name = $1, size = $2, gender_restriction = $3, allowed_categories = $4
+        WHERE id = $5
+        RETURNING id, block_index, name, size, gender_restriction, allowed_categories
+      `, [next.name, next.size, next.genderRestriction, next.allowedCategories, blockId]);
 
       const tentSizeResult = await client.query(`
         UPDATE tents
@@ -1602,11 +1710,13 @@ app.patch('/api/admin/structure/blocks/:blockId', async (req, res) => {
         name: updated.current.name,
         size: Number(updated.current.size),
         blockType: updated.current.gender_restriction,
+        allowedCategories: updated.current.allowed_categories,
       },
       after: {
         name: updated.block.name,
         size: Number(updated.block.size),
         blockType: updated.block.gender_restriction,
+        allowedCategories: updated.block.allowed_categories,
       },
     });
 
@@ -1618,6 +1728,7 @@ app.patch('/api/admin/structure/blocks/:blockId', async (req, res) => {
         name: updated.block.name,
         size: Number(updated.block.size),
         genderRestriction: updated.block.gender_restriction,
+        allowedCategories: updated.block.allowed_categories,
       },
       tentSize: updated.tentSize,
       locationCapacity: updated.locationCapacity,
@@ -2275,6 +2386,12 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
         a.start_date,
         a.end_date,
         a.gender,
+        a.accommodation_category,
+        a.caretaker_for_allocation_id,
+        EXISTS (
+          SELECT 1 FROM allocations caretaker
+          WHERE caretaker.caretaker_for_allocation_id = a.id AND caretaker.deleted_at IS NULL
+        ) AS has_caretaker,
         a.created_at,
         l.name as location_name,
         b.tent_id as current_tent_id,
@@ -2290,6 +2407,12 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
     }
 
     const allocation = allocationQuery.rows[0];
+    if (allocation.caretaker_for_allocation_id || allocation.has_caretaker) {
+      return res.status(409).json({
+        error: 'linked_caretaker_reallocation',
+        message: 'A Delegate and linked caretaker must remain in the same block. Remove the caretaker link before reallocating either person.',
+      });
+    }
 
     // Step 1: Return available locations
     if (!location_id) {
@@ -2367,7 +2490,8 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
           b.block_index,
           b.name,
           b.size,
-          b.gender_restriction
+          b.gender_restriction,
+          b.allowed_categories
         FROM blocks b
         WHERE b.tent_id = $1
         ORDER BY b.block_index
@@ -2389,8 +2513,9 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
             OR b.gender_restriction = 'both'
             OR LOWER(b.gender_restriction) LIKE LOWER($2) || '%'
           )
+          AND b.allowed_categories @> ARRAY[$3]::text[]
         ORDER BY b.block_index
-      `, [tent_id, allocation.gender]);
+      `, [tent_id, allocation.gender, allocation.accommodation_category]);
       
       console.log('[REALLOCATE_OPTIONS] Filtered blocks:', blocksQuery.rows);
 
@@ -2411,7 +2536,7 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
     
     // First get block info
     const blockInfo = await execQuery(`
-      SELECT b.size, b.name, b.gender_restriction
+      SELECT b.size, b.name, b.gender_restriction, b.allowed_categories
       FROM blocks b
       WHERE b.id = $1
     `, [block_id]);
@@ -2421,6 +2546,10 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
     }
     
     const block = blockInfo.rows[0];
+    validateCategoryAllowedInBlock({
+      accommodationCategory: allocation.accommodation_category,
+      allowedCategories: block.allowed_categories,
+    });
     
     // Check gender compatibility (case-insensitive, handles male_only/female_only format)
     // Allow blocks with 'both' or NULL gender restriction
@@ -2513,6 +2642,9 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
 
   } catch (e) {
     console.error('[REALLOCATE_OPTIONS ERROR]', e);
+    if (e instanceof AccommodationEligibilityError) {
+      return handleAccommodationError(res, e, 'fetch_reallocate_options_failed');
+    }
     res.status(500).json({ error: 'fetch_reallocate_options_failed', message: e.message });
   }
 });
@@ -2561,6 +2693,17 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
         a.emergency_phone,
         a.person_photo_key,
         a.aadhaar_photo_key,
+        a.accommodation_category,
+        a.category_source,
+        a.verified_categories,
+        a.category_verified_at,
+        a.sai_connect_id,
+        a.sai_lookup_identifier,
+        a.caretaker_for_allocation_id,
+        EXISTS (
+          SELECT 1 FROM allocations caretaker
+          WHERE caretaker.caretaker_for_allocation_id = a.id AND caretaker.deleted_at IS NULL
+        ) AS has_caretaker,
         l.name as location_name,
         t.tent_index,
         t.name as tent_name,
@@ -2578,6 +2721,12 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
     }
 
     const oldAllocation = allocationQuery.rows[0];
+    if (oldAllocation.caretaker_for_allocation_id || oldAllocation.has_caretaker) {
+      return res.status(409).json({
+        error: 'linked_caretaker_reallocation',
+        message: 'A Delegate and linked caretaker must remain in the same block. Remove the caretaker link before reallocating either person.',
+      });
+    }
 
     // Permission check: location_user can only reallocate within their location
     if (user.role === 'location_user') {
@@ -2591,7 +2740,7 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
 
     // Verify new block exists and get tent_index
     const newBlockQuery = await execQuery(`
-      SELECT b.id, b.size, b.tent_index, b.block_index, b.gender_restriction, t.tent_index
+      SELECT b.id, b.size, b.tent_index, b.block_index, b.gender_restriction, b.allowed_categories, t.tent_index
       FROM blocks b
       JOIN tents t ON b.tent_id = t.id
       WHERE b.id = $1 AND t.id = $2 AND t.location_id = $3
@@ -2605,6 +2754,10 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
     }
 
     const newBlock = newBlockQuery.rows[0];
+    validateCategoryAllowedInBlock({
+      accommodationCategory: oldAllocation.accommodation_category,
+      allowedCategories: newBlock.allowed_categories,
+    });
 
     // Validate bed number is within block size
     if (Number(newBedNumber) < 1 || Number(newBedNumber) > newBlock.size) {
@@ -2688,9 +2841,15 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
           end_date, 
           emergency_phone, 
           person_photo_key, 
-          aadhaar_photo_key
+          aadhaar_photo_key,
+          accommodation_category,
+          category_source,
+          verified_categories,
+          category_verified_at,
+          sai_connect_id,
+          sai_lookup_identifier
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
         RETURNING id
       `, [
         newLocationId,
@@ -2706,7 +2865,13 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
         oldAllocation.end_date,
         oldAllocation.emergency_phone,
         oldAllocation.person_photo_key,
-        oldAllocation.aadhaar_photo_key
+        oldAllocation.aadhaar_photo_key,
+        oldAllocation.accommodation_category,
+        oldAllocation.category_source,
+        oldAllocation.verified_categories,
+        oldAllocation.category_verified_at,
+        oldAllocation.sai_connect_id,
+        oldAllocation.sai_lookup_identifier
       ]);
 
       const insertedAllocationId = insertResult.rows[0].id;
@@ -2757,6 +2922,10 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
       allocationId: req.params.allocationId,
       timestamp: new Date().toISOString()
     });
+
+    if (e instanceof AccommodationEligibilityError) {
+      return handleAccommodationError(res, e, 'reallocate_failed');
+    }
 
     if (e.code === '23P01') {
       return res.status(409).json({ 
@@ -3216,6 +3385,7 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
     const blockRes = await execQuery(`
       SELECT b.id, b.tent_id, t.location_id, t.tent_index, b.block_index, b.size, b.gender_restriction
       FROM blocks b JOIN tents t ON t.id = b.tent_id
+      WHERE b.allowed_categories @> ARRAY['devotee']::text[]
       ORDER BY t.location_id, t.tent_index, b.block_index
     `);
 
@@ -4874,113 +5044,184 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
   const tentIndex = Number(req.params.tent);
   const blockIndex = Number(req.params.block);
   const bedNumber = Number(req.params.bedNumber);
-  
-  try {
-    console.log(`[ALLOCATE] Start - Bed ${bedNumber}`);
 
-    const { name, phone, gender, startDate, endDate, emergencyPhone, personPhotoKey, aadhaarPhotoKey } = req.body || {};
-    if (!name || !startDate || !endDate) {
+  try {
+    const user = getUserFromRequest(req);
+    if (user?.role === 'location_user' && Number(user.locationId) !== locationId) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    const {
+      name,
+      phone,
+      gender,
+      startDate,
+      endDate,
+      emergencyPhone,
+      personPhotoKey,
+      aadhaarPhotoKey,
+      accommodationCategory,
+      saiVerificationToken,
+      caretakerForAllocationId,
+    } = req.body || {};
+    const isCaretaker = caretakerForAllocationId !== undefined && caretakerForAllocationId !== null && caretakerForAllocationId !== '';
+    if (!String(name || '').trim() || (!isCaretaker && (!startDate || !endDate))) {
       return res.status(400).json({ error: 'missing_required_fields' });
     }
 
-    // Validate photos are provided
-    if (!personPhotoKey || !aadhaarPhotoKey) {
+    if (!isCaretaker && (!personPhotoKey || !aadhaarPhotoKey)) {
       return res.status(400).json({ error: 'photos_required', message: 'Both person and Identity photos are required' });
     }
 
-    // Validate date range
-    if (new Date(startDate) > new Date(endDate)) {
+    if (!isCaretaker && new Date(startDate) > new Date(endDate)) {
       return res.status(400).json({ error: 'invalid_date_range', message: 'start_date must be before or equal to end_date' });
     }
 
-    // Validate and normalize gender
     const validGenders = ['Male', 'Female', 'Other'];
-    const normalizedGender = gender && gender.trim() && validGenders.includes(gender.trim()) 
-      ? gender.trim() 
-      : 'Other';
+    const normalizedGender = isCaretaker
+      ? (validGenders.includes(String(gender || '').trim()) ? String(gender).trim() : null)
+      : (validGenders.includes(String(gender || '').trim()) ? String(gender).trim() : 'Other');
+    const verification = saiVerificationToken
+      ? verifySaiVerificationToken(saiVerificationToken, config.jwtSecret)
+      : null;
+    const category = verification
+      ? resolveVerifiedCategory({
+          verifiedCategories: verification.verifiedCategories,
+          requestedCategory: accommodationCategory,
+        })
+      : resolveUnverifiedCategory();
 
-    // Combined validation - gets blockId, tentId and validates bed + gender in ONE query
-    const t1 = Date.now();
-    let blockId, tentId;
-    try {
-      const result = await validateAndGetBlockInfo(locationId, tentIndex, blockIndex, bedNumber, normalizedGender);
-      blockId = result.blockId;
-      tentId = result.tentId;
-    } catch (e) {
-      return res.status(400).json({ error: 'validation_failed', message: e.message });
-    }
-    console.log(`[ALLOCATE] Combined validation: ${Date.now() - t1}ms`);
+    const allocation = await withTransaction(async (client) => {
+      const blockResult = await client.query(`
+        SELECT b.id, b.size, b.gender_restriction, b.allowed_categories, t.id AS tent_id
+        FROM blocks b
+        JOIN tents t ON t.id = b.tent_id
+        WHERE t.location_id = $1 AND t.tent_index = $2 AND b.block_index = $3
+        FOR SHARE OF b, t
+      `, [locationId, tentIndex, blockIndex]);
+      if (!blockResult.rowCount) throw new AccommodationEligibilityError('block_not_found', 'Block not found.');
+      const block = blockResult.rows[0];
+      const blockId = Number(block.id);
+      const tentId = Number(block.tent_id);
+      if (!Number.isSafeInteger(bedNumber) || bedNumber < 1 || bedNumber > Number(block.size)) {
+        throw new AccommodationEligibilityError('bed_out_of_range', 'Bed out of range.');
+      }
+      if (!isCaretaker) {
+        const normalized = normalizedGender?.toLowerCase();
+        if (block.gender_restriction === 'male_only' && normalized !== 'male') {
+          throw new AccommodationEligibilityError('gender_restriction_violation', 'This block is restricted to male guests only.');
+        }
+        if (block.gender_restriction === 'female_only' && normalized !== 'female') {
+          throw new AccommodationEligibilityError('gender_restriction_violation', 'This block is restricted to female guests only.');
+        }
+      }
 
-    // Cleanup: soft-delete expired reservations on this bed (non-blocking)
-    const t2 = Date.now();
-    execQuery(`
-      UPDATE allocations
-      SET deleted_at = NOW(), updated_at = NOW()
-      WHERE block_id = $1
-        AND bed_number = $2
-        AND status = 'reserved'
-        AND deleted_at IS NULL
-        AND (
-          (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
-          OR end_date < ${todaySQL}
-        )
-    `, [blockId, bedNumber]).catch(() => {}); // Non-blocking, ignore errors
-    console.log(`[ALLOCATE] Cleanup (non-blocking): ${Date.now() - t2}ms`);
+      await client.query(`
+        UPDATE allocations
+        SET deleted_at = NOW(), updated_at = NOW()
+        WHERE block_id = $1 AND bed_number = $2 AND status = 'reserved' AND deleted_at IS NULL
+          AND ((reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW()) OR end_date < ${todaySQL})
+      `, [blockId, bedNumber]);
 
-    // Check if bed has current or future allocation (end_date >= today)
-    const t3 = Date.now();
-    const checkQ = `
-      SELECT id FROM allocations
-      WHERE block_id = $1
-        AND bed_number = $2
-        AND deleted_at IS NULL
-        AND end_date >= ${todaySQL}
-        AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > ${nowIST}))
-      LIMIT 1
-    `;
-    const existing = await execQuery(checkQ, [blockId, bedNumber]);
-    console.log(`[ALLOCATE] Check existing: ${Date.now() - t3}ms`);
-    if (existing.rowCount > 0) {
-      return res.status(409).json({ 
-        error: 'bed_already_allocated',
-        message: 'This bed is already allocated or reserved (current or future booking exists)'
+      const existing = await client.query(`
+        SELECT id FROM allocations
+        WHERE block_id = $1 AND bed_number = $2 AND deleted_at IS NULL AND end_date >= ${todaySQL}
+          AND (status = 'confirmed' OR (status = 'reserved' AND reserved_expires_at > ${nowIST}))
+        LIMIT 1
+        FOR UPDATE
+      `, [blockId, bedNumber]);
+      if (existing.rowCount > 0) {
+        throw new StructureRequestError(409, 'bed_already_allocated', 'This bed is already allocated or reserved.');
+      }
+
+      let effectiveStartDate = startDate;
+      let effectiveEndDate = endDate;
+      let delegateAllocationId = null;
+      if (isCaretaker) {
+        const targetResult = await client.query(`
+          SELECT id, block_id, accommodation_category, start_date, end_date, deleted_at
+          FROM allocations
+          WHERE id = $1
+            AND deleted_at IS NULL
+            AND status = 'confirmed'
+            AND end_date >= ${todaySQL}
+          FOR UPDATE
+        `, [Number(caretakerForAllocationId)]);
+        const caretakerResult = await client.query(`
+          SELECT id FROM allocations
+          WHERE caretaker_for_allocation_id = $1 AND deleted_at IS NULL
+          LIMIT 1
+        `, [Number(caretakerForAllocationId)]);
+        const target = validateCaretakerTarget({
+          targetAllocation: targetResult.rows[0],
+          blockId,
+          hasCaretaker: caretakerResult.rowCount > 0,
+        });
+        effectiveStartDate = target.startDate;
+        effectiveEndDate = target.endDate;
+        delegateAllocationId = target.delegateAllocationId;
+      }
+
+      validateCategoryAllowedInBlock({
+        accommodationCategory: category.accommodationCategory,
+        allowedCategories: block.allowed_categories,
+        isCaretaker,
       });
-    }
 
-    const t4 = Date.now();
-    // Combine INSERT + fetch using RETURNING clause (saves 1 round-trip!)
-    const q = `
-      INSERT INTO allocations(location_id, tent_id, block_id, tent_index, block_index, bed_number, name, phone, gender, start_date, end_date, emergency_phone, person_photo_key, aadhaar_photo_key)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-      RETURNING id, name, phone, gender,
-                TO_CHAR(start_date, 'YYYY-MM-DD') as start_date,
-                TO_CHAR(end_date, 'YYYY-MM-DD') as end_date,
-                emergency_phone, person_photo_key, aadhaar_photo_key, status
-    `;
-    const insertResult = await execQuery(q, [
+      const insertResult = await client.query(`
+        INSERT INTO allocations (
+          location_id, tent_id, block_id, tent_index, block_index, bed_number,
+          name, phone, gender, start_date, end_date, emergency_phone,
+          person_photo_key, aadhaar_photo_key, accommodation_category, category_source,
+          verified_categories, category_verified_at, sai_connect_id, sai_lookup_identifier,
+          caretaker_for_allocation_id
+        )
+        VALUES (
+          $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+          $18,$19,$20,$21
+        )
+        RETURNING id, name, phone, gender, accommodation_category, category_source,
+                  caretaker_for_allocation_id,
+                  TO_CHAR(start_date, 'YYYY-MM-DD') AS start_date,
+                  TO_CHAR(end_date, 'YYYY-MM-DD') AS end_date,
+                  emergency_phone, person_photo_key, aadhaar_photo_key, status
+      `, [
+        locationId,
+        tentId,
+        blockId,
+        tentIndex,
+        blockIndex,
+        bedNumber,
+        String(name).trim(),
+        phone || verification?.mobileNo || null,
+        normalizedGender,
+        effectiveStartDate,
+        effectiveEndDate,
+        emergencyPhone || null,
+        personPhotoKey || null,
+        aadhaarPhotoKey || null,
+        category.accommodationCategory,
+        category.categorySource,
+        category.verifiedCategories,
+        verification ? new Date() : null,
+        verification && verification.identifier.length < 10 ? verification.identifier : null,
+        verification?.identifier || null,
+        delegateAllocationId,
+      ]);
+      return insertResult.rows[0];
+    });
+
+    const allocationId = allocation.id;
+    logAudit(req, 'allocate', 'allocation', allocationId, {
       locationId,
-      tentId,
-      blockId,
       tentIndex,
       blockIndex,
       bedNumber,
       name,
-      phone || null,
-      normalizedGender,
-      startDate,
-      endDate,
-      emergencyPhone || null,
-      personPhotoKey,
-      aadhaarPhotoKey
-    ]);
-    const allocation = insertResult.rows[0];
-    const allocationId = allocation.id;
-    console.log(`[ALLOCATE] INSERT+fetch: ${Date.now() - t4}ms`);
-    
-    // Log audit in background (non-blocking - saves 300ms!)
-    logAudit(req, 'allocate', 'allocation', allocationId, { locationId, tentIndex, blockIndex, bedNumber, name, phone, gender: normalizedGender, startDate, endDate });
+      accommodationCategory: allocation.accommodation_category,
+      caretakerForAllocationId: allocation.caretaker_for_allocation_id,
+    });
 
-    // Transform to camelCase (no need to generate view URLs - frontend already has the photos)
     const result = {
       id: allocation.id,
       name: allocation.name,
@@ -4991,7 +5232,10 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       emergencyPhone: allocation.emergency_phone,
       status: allocation.status,
       personPhotoKey: allocation.person_photo_key,
-      aadhaarPhotoKey: allocation.aadhaar_photo_key
+      aadhaarPhotoKey: allocation.aadhaar_photo_key,
+      accommodationCategory: allocation.accommodation_category,
+      categorySource: allocation.category_source,
+      caretakerForAllocationId: allocation.caretaker_for_allocation_id,
     };
 
     console.log(`[ALLOCATE] Total time: ${Date.now() - startTime}ms`);
@@ -5007,6 +5251,12 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       blockIndex,
       timestamp: new Date().toISOString()
     });
+    if (e instanceof AccommodationEligibilityError || e instanceof SaiConnectError) {
+      return handleAccommodationError(res, e, 'allocate_failed');
+    }
+    if (e instanceof StructureRequestError) {
+      return res.status(e.status).json({ error: e.code, message: e.message });
+    }
     if (e.code === '23P01') {
       return res.status(409).json({ 
         error: 'overlapping_allocation',
@@ -5014,7 +5264,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
         detail: e.detail
       });
     }
-    res.status(500).json({ error: 'allocate_failed', message: e.message });
+    return handleAccommodationError(res, e, 'allocate_failed');
   }
 });
 
@@ -5043,7 +5293,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
 
     // Get block info
     const blockRes = await execQuery(`
-      SELECT b.id, b.size
+      SELECT b.id, b.size, b.allowed_categories
       FROM blocks b
       JOIN tents t ON t.id = b.tent_id
       WHERE t.location_id = $1 AND t.tent_index = $2 AND b.block_index = $3
@@ -5055,6 +5305,12 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
     
     const blockId = blockRes.rows[0].id;
     const blockSize = blockRes.rows[0].size;
+    if (!blockRes.rows[0].allowed_categories?.includes('devotee')) {
+      return res.status(400).json({
+        error: 'verified_booking_required',
+        message: 'Bulk allocation is unavailable for a category-restricted block. Allocate verified people individually.',
+      });
+    }
 
     // Get tent_id
     const tentRes = await execQuery(`
@@ -5181,6 +5437,10 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
     const blockIndex = Number(req.params.block);
     const bedNumber = Number(req.params.bedNumber);
     if (!Number.isFinite(bedNumber)) return res.status(400).json({ error: 'invalid_bed_number' });
+    const user = getUserFromRequest(req);
+    if (user?.role === 'location_user' && Number(user.locationId) !== locationId) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
     
     console.log(`[EDIT] Start - Bed ${bedNumber}`);
     
@@ -5213,7 +5473,9 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
       SELECT id, name, phone, gender, emergency_phone,
              TO_CHAR(start_date, 'YYYY-MM-DD') as start_date,
              TO_CHAR(end_date, 'YYYY-MM-DD') as end_date,
-             person_photo_key, aadhaar_photo_key
+             person_photo_key, aadhaar_photo_key,
+             accommodation_category, category_source, verified_categories,
+             caretaker_for_allocation_id
       FROM allocations
       WHERE block_id = $1
         AND bed_number = $2
@@ -5227,7 +5489,10 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
     if (!active.rowCount) return res.status(404).json({ error: 'no_active_allocation' });
 
     const current = active.rows[0];
-    const { name, phone, gender, startDate, endDate, emergencyPhone, personPhotoKey, aadhaarPhotoKey } = req.body || {};
+    const {
+      name, phone, gender, startDate, endDate, emergencyPhone, personPhotoKey, aadhaarPhotoKey,
+      accommodationCategory,
+    } = req.body || {};
 
     // Build dynamic UPDATE query
     const updates = [];
@@ -5279,6 +5544,27 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
       updates.push(`aadhaar_photo_key = $${paramIndex++}`);
       values.push(aadhaarPhotoKey);
     }
+    if (accommodationCategory !== undefined) {
+      if (user?.role !== 'admin') {
+        return res.status(403).json({ error: 'forbidden', message: 'Only an administrator can change accommodation category.' });
+      }
+      const nextCategory = validateAdminCategoryChange(accommodationCategory);
+      const blockResult = await execQuery('SELECT allowed_categories FROM blocks WHERE id = $1', [blockId]);
+      validateCategoryAllowedInBlock({
+        accommodationCategory: nextCategory,
+        allowedCategories: blockResult.rows[0]?.allowed_categories,
+        isCaretaker: current.caretaker_for_allocation_id !== null,
+      });
+      updates.push(`accommodation_category = $${paramIndex++}`);
+      values.push(nextCategory);
+      updates.push(`category_source = $${paramIndex++}`);
+      values.push('manual');
+      updates.push(`verified_categories = $${paramIndex++}`);
+      values.push([]);
+      updates.push('category_verified_at = NULL');
+      updates.push('sai_connect_id = NULL');
+      updates.push('sai_lookup_identifier = NULL');
+    }
 
     if (updates.length === 0) {
       return res.status(400).json({ error: 'no_fields_to_update' });
@@ -5312,17 +5598,28 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
       RETURNING id, name, phone, emergency_phone, gender,
                 TO_CHAR(start_date, 'YYYY-MM-DD') as start_date,
                 TO_CHAR(end_date, 'YYYY-MM-DD') as end_date,
-                person_photo_key, aadhaar_photo_key, status
+                person_photo_key, aadhaar_photo_key, status,
+                accommodation_category, category_source, caretaker_for_allocation_id
     `;
     
-    const result = await execQuery(updateQ, values);
+    const result = await withTransaction(async (client) => {
+      const updated = await client.query(updateQ, values);
+      if ((startDate !== undefined || endDate !== undefined) && !current.caretaker_for_allocation_id) {
+        await client.query(`
+          UPDATE allocations
+          SET start_date = $1, end_date = $2, updated_at = NOW()
+          WHERE caretaker_for_allocation_id = $3 AND deleted_at IS NULL
+        `, [updated.rows[0].start_date, updated.rows[0].end_date, current.id]);
+      }
+      return updated;
+    });
     const updatedAllocation = result.rows[0];
     console.log(`[EDIT] UPDATE: ${Date.now() - t3}ms`);
 
     // Log audit in background (non-blocking)
     logAudit(req, 'edit_allocation', 'allocation', current.id, { 
       locationId, tentIndex, blockIndex, bedNumber, 
-      changes: { name, phone, emergencyPhone, gender, startDate, endDate, personPhotoKey, aadhaarPhotoKey }
+      changes: { name, phone, emergencyPhone, gender, startDate, endDate, personPhotoKey, aadhaarPhotoKey, accommodationCategory }
     });
 
     // Return updated data
@@ -5336,7 +5633,10 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
       endDate: updatedAllocation.end_date,
       status: updatedAllocation.status,
       personPhotoKey: updatedAllocation.person_photo_key,
-      aadhaarPhotoKey: updatedAllocation.aadhaar_photo_key
+      aadhaarPhotoKey: updatedAllocation.aadhaar_photo_key,
+      accommodationCategory: updatedAllocation.accommodation_category,
+      categorySource: updatedAllocation.category_source,
+      caretakerForAllocationId: updatedAllocation.caretaker_for_allocation_id,
     };
 
     console.log(`[EDIT] Total time: ${Date.now() - startTime}ms`);
@@ -5352,6 +5652,9 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
       blockIndex: req.params.block,
       timestamp: new Date().toISOString()
     });
+    if (e instanceof AccommodationEligibilityError) {
+      return handleAccommodationError(res, e, 'edit_failed');
+    }
     if (e.code === '23P01') {
       return res.status(409).json({ 
         error: 'overlapping_allocation',
@@ -5388,6 +5691,19 @@ app.delete('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async
     if (idResult.rowCount === 0) return res.status(404).json({ error: 'no_active_allocation' });
     const allocationId = idResult.rows[0].id;
 
+    const caretakerResult = await execQuery(`
+      SELECT id
+      FROM allocations
+      WHERE caretaker_for_allocation_id = $1 AND deleted_at IS NULL
+      LIMIT 1
+    `, [allocationId]);
+    if (caretakerResult.rowCount > 0) {
+      return res.status(409).json({
+        error: 'delegate_has_caretaker',
+        message: 'Remove the linked caretaker before removing this Delegate.',
+      });
+    }
+
     const delQ = `
       UPDATE allocations 
       SET deleted_at = NOW(), updated_at = NOW(), was_occupied = $1
@@ -5420,6 +5736,33 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/deallocate-batch', a
     `, [locationId, tentIndex, blockIndex]);
     if (!v.rowCount) return res.status(404).json({ error: 'block_not_found' });
     const blockId = Number(v.rows[0].id);
+
+    const linkedCaretakerResult = await execQuery(`
+      WITH latest AS (
+        SELECT id
+        FROM (
+          SELECT a.id, ROW_NUMBER() OVER (PARTITION BY a.bed_number ORDER BY a.created_at DESC) rn
+          FROM allocations a
+          WHERE a.block_id = $1
+            AND a.bed_number = ANY($2::int[])
+            AND a.deleted_at IS NULL
+            AND a.end_date >= ${todaySQL}
+        ) selected
+        WHERE rn = 1
+      )
+      SELECT caretaker.id
+      FROM latest delegate
+      JOIN allocations caretaker ON caretaker.caretaker_for_allocation_id = delegate.id
+      WHERE caretaker.deleted_at IS NULL
+        AND caretaker.id NOT IN (SELECT id FROM latest)
+      LIMIT 1
+    `, [blockId, bedNumbers]);
+    if (linkedCaretakerResult.rowCount > 0) {
+      return res.status(409).json({
+        error: 'delegate_has_caretaker',
+        message: 'Include the linked caretaker when deallocating a Delegate.',
+      });
+    }
 
     // One set-based update to soft-delete latest active allocation per requested bed
     const sql = `
@@ -5615,7 +5958,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/bulk-import-csv',
 
       // Validate block exists and get block_id, tent_id, size, and gender_restriction in one query
       const blockInfo = await execQuery(`
-        SELECT b.id as block_id, b.size, b.gender_restriction, t.id as tent_id
+        SELECT b.id as block_id, b.size, b.gender_restriction, b.allowed_categories, t.id as tent_id
         FROM blocks b
         JOIN tents t ON t.id = b.tent_id
         WHERE t.location_id = $1 AND t.tent_index = $2 AND b.block_index = $3
@@ -5625,7 +5968,19 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/bulk-import-csv',
         return res.status(404).json({ error: 'block_not_found' });
       }
       
-      const { block_id: blockId, tent_id: tentId, size: blockSize, gender_restriction: genderRestriction } = blockInfo.rows[0];
+      const {
+        block_id: blockId,
+        tent_id: tentId,
+        size: blockSize,
+        gender_restriction: genderRestriction,
+        allowed_categories: allowedCategories,
+      } = blockInfo.rows[0];
+      if (!allowedCategories?.includes('devotee')) {
+        return res.status(400).json({
+          error: 'verified_booking_required',
+          message: 'CSV import is unavailable for a category-restricted block. Allocate verified people individually.',
+        });
+      }
 
       // Track results
       const results = {

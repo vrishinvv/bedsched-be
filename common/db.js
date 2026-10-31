@@ -1,14 +1,13 @@
 import pg from 'pg'
 import { config } from "./configs.js"
 import { runInTransaction } from './transactions.js'
+import { resolveDatabaseSsl } from './databaseConfig.js'
 
 const { Pool } = pg
 
 const db = new Pool({
     connectionString: config.databaseUrl,
-    ssl: {
-        rejectUnauthorized: false
-    },
+    ssl: resolveDatabaseSsl(config.databaseUrl),
     // Optimized pool settings for Neon serverless
     min: 2, // Keep 2 connections warm to avoid cold starts
     max: 10, // Maximum connections

@@ -341,7 +341,8 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
 
   // Get block info
   const blockRes = await execQuery(`
-    SELECT b.id, b.block_index, b.name, b.size, b.gender_restriction, t.tent_index, t.name as tent_name, l.name as location_name
+    SELECT b.id, b.block_index, b.name, b.size, b.gender_restriction, b.allowed_categories,
+           t.tent_index, t.name as tent_name, l.name as location_name
     FROM blocks b
     JOIN tents t ON t.id = b.tent_id
     JOIN locations l ON l.id = t.location_id
@@ -357,25 +358,31 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
   // For reserved: reserved_expires_at > NOW (regardless of end_date)
   const allocRes = await execQuery(`
     SELECT 
-      id,
-      bed_number, 
-      name, 
-      phone, 
-      emergency_phone,
-      gender, 
-      TO_CHAR(start_date, 'YYYY-MM-DD') as start_date_str,
-      TO_CHAR(end_date, 'YYYY-MM-DD') as end_date_str,
-      person_photo_key,
-      aadhaar_photo_key,
-      status, 
-      reserved_expires_at,
-      created_at
-    FROM allocations
-    WHERE block_id = $1 
-      AND deleted_at IS NULL
+      a.id,
+      a.bed_number,
+      a.name,
+      a.phone,
+      a.emergency_phone,
+      a.gender,
+      TO_CHAR(a.start_date, 'YYYY-MM-DD') as start_date_str,
+      TO_CHAR(a.end_date, 'YYYY-MM-DD') as end_date_str,
+      a.person_photo_key,
+      a.aadhaar_photo_key,
+      a.status,
+      a.reserved_expires_at,
+      a.created_at,
+      a.accommodation_category,
+      a.category_source,
+      a.verified_categories,
+      a.caretaker_for_allocation_id,
+      delegate.name AS caretaker_for_name
+    FROM allocations a
+    LEFT JOIN allocations delegate ON delegate.id = a.caretaker_for_allocation_id
+    WHERE a.block_id = $1
+      AND a.deleted_at IS NULL
       AND (
-        (status = 'confirmed' AND end_date >= ${todaySQL})
-        OR (status = 'reserved' AND reserved_expires_at > ${nowIST})
+        (a.status = 'confirmed' AND a.end_date >= ${todaySQL})
+        OR (a.status = 'reserved' AND a.reserved_expires_at > ${nowIST})
       )
   `, [block.id]);
 
@@ -393,6 +400,11 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
       status: r.status,
       reservedExpiresAt: r.reserved_expires_at ? r.reserved_expires_at.toISOString() : null,
       createdAt: r.created_at ? r.created_at.toISOString() : null, // Include creation timestamp
+      accommodationCategory: r.accommodation_category,
+      categorySource: r.category_source,
+      verifiedCategories: r.verified_categories || [],
+      caretakerForAllocationId: r.caretaker_for_allocation_id ? Number(r.caretaker_for_allocation_id) : null,
+      caretakerForName: r.caretaker_for_name || null,
     };
 
     // Include photo keys and generate URLs if keys exist
@@ -421,7 +433,8 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
       block: {
         index: Number(block.block_index),
         name: block.name,
-        genderRestriction: block.gender_restriction
+        genderRestriction: block.gender_restriction,
+        allowedCategories: block.allowed_categories,
       }
     },
     blockSize: Number(block.size),
