@@ -58,6 +58,7 @@ import {
   nowIST
 } from './common/helpers.js';
 import { generateUploadUrl, generateViewUrl } from './common/s3.js';
+import { validateLinkedReallocationTarget } from './common/reallocationEligibility.js';
 
 const app = express();
 
@@ -2409,17 +2410,24 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
     }
 
     const allocation = allocationQuery.rows[0];
-    if (allocation.caretaker_for_allocation_id || allocation.has_caretaker) {
-      return res.status(409).json({
-        error: 'linked_caretaker_reallocation',
-        message: 'A Delegate and linked caretaker must remain in the same block. Remove the caretaker link before reallocating either person.',
-      });
-    }
+    const linkedState = validateLinkedReallocationTarget({
+      currentBlockId: allocation.current_block_id,
+      targetBlockId: allocation.current_block_id,
+      caretakerForAllocationId: allocation.caretaker_for_allocation_id,
+      hasCaretaker: allocation.has_caretaker,
+    });
 
     // Step 1: Return available locations
     if (!location_id) {
       let locationsQuery;
-      if (user.role === 'location_user' && user.locationId) {
+      if (linkedState.isLinked) {
+        locationsQuery = await execQuery(`
+          SELECT id, name, capacity
+          FROM locations
+          WHERE id = $1
+          ORDER BY name
+        `, [allocation.location_id]);
+      } else if (user.role === 'location_user' && user.locationId) {
         // Location users can only reallocate within their location
         locationsQuery = await execQuery(`
           SELECT id, name, capacity 
@@ -2461,9 +2469,10 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
         FROM tents t
         LEFT JOIN blocks b ON b.tent_id = t.id
         WHERE t.location_id = $1
+          AND ($2::boolean = FALSE OR t.id = $3)
         GROUP BY t.id, t.tent_index, t.name, t.size
         ORDER BY t.tent_index
-      `, [location_id]);
+      `, [location_id, linkedState.isLinked, allocation.current_tent_id]);
 
       return res.json({
         step: 'tents',
@@ -2515,11 +2524,15 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
             OR b.gender_restriction = 'both'
             OR LOWER(b.gender_restriction) LIKE LOWER($2) || '%'
           )
-          AND b.allowed_categories @> ARRAY[$3]::text[]
+          AND ($4::boolean = TRUE OR b.allowed_categories @> ARRAY[$3]::text[])
         ORDER BY b.block_index
-      `, [tent_id, allocation.gender, allocation.accommodation_category]);
+      `, [tent_id, allocation.gender, allocation.accommodation_category, linkedState.isCaretaker]);
       
       console.log('[REALLOCATE_OPTIONS] Filtered blocks:', blocksQuery.rows);
+
+      const eligibleBlocks = linkedState.isLinked
+        ? blocksQuery.rows.filter((candidate) => Number(candidate.id) === Number(allocation.current_block_id))
+        : blocksQuery.rows;
 
       return res.json({
         step: 'blocks',
@@ -2529,7 +2542,7 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
           end_date: allocation.end_date,
           gender: allocation.gender
         },
-        blocks: blocksQuery.rows
+        blocks: eligibleBlocks
       });
     }
 
@@ -2548,21 +2561,22 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
     }
     
     const block = blockInfo.rows[0];
+    validateLinkedReallocationTarget({
+      currentBlockId: allocation.current_block_id,
+      targetBlockId: block_id,
+      caretakerForAllocationId: allocation.caretaker_for_allocation_id,
+      hasCaretaker: allocation.has_caretaker,
+    });
     validateCategoryAllowedInBlock({
       accommodationCategory: allocation.accommodation_category,
       allowedCategories: block.allowed_categories,
+      isCaretaker: linkedState.isCaretaker,
     });
     
-    // Check gender compatibility (case-insensitive, handles male_only/female_only format)
-    // Allow blocks with 'both' or NULL gender restriction
-    if (block.gender_restriction && 
-        block.gender_restriction.toLowerCase() !== 'both' && 
-        !block.gender_restriction.toLowerCase().startsWith(allocation.gender.toLowerCase())) {
-      return res.status(400).json({ 
-        error: 'gender_mismatch',
-        message: `This block is restricted to ${block.gender_restriction} only. The allocation is for ${allocation.gender}.`
-      });
-    }
+    validateGenderAllowedInBlock({
+      gender: allocation.gender,
+      genderRestriction: block.gender_restriction,
+    });
     
     console.log('[REALLOCATE_OPTIONS] Step 4 - Getting beds for block:', {
       block_id,
@@ -2724,12 +2738,12 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
     }
 
     const oldAllocation = allocationQuery.rows[0];
-    if (oldAllocation.caretaker_for_allocation_id || oldAllocation.has_caretaker) {
-      return res.status(409).json({
-        error: 'linked_caretaker_reallocation',
-        message: 'A Delegate and linked caretaker must remain in the same block. Remove the caretaker link before reallocating either person.',
-      });
-    }
+    const linkedState = validateLinkedReallocationTarget({
+      currentBlockId: oldAllocation.block_id,
+      targetBlockId: newBlockId,
+      caretakerForAllocationId: oldAllocation.caretaker_for_allocation_id,
+      hasCaretaker: oldAllocation.has_caretaker,
+    });
 
     // Permission check: location_user can only reallocate within their location
     if (user.role === 'location_user') {
@@ -2760,6 +2774,7 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
     validateCategoryAllowedInBlock({
       accommodationCategory: oldAllocation.accommodation_category,
       allowedCategories: newBlock.allowed_categories,
+      isCaretaker: linkedState.isCaretaker,
     });
 
     // Validate bed number is within block size
@@ -2770,16 +2785,10 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
       });
     }
     
-    // Validate gender compatibility (case-insensitive, handles male_only/female_only format)
-    // Allow blocks with 'both' or NULL gender restriction
-    if (newBlock.gender_restriction && 
-        newBlock.gender_restriction.toLowerCase() !== 'both' && 
-        !newBlock.gender_restriction.toLowerCase().startsWith(oldAllocation.gender.toLowerCase())) {
-      return res.status(400).json({ 
-        error: 'gender_mismatch',
-        message: `Cannot reallocate ${oldAllocation.gender} person to a ${newBlock.gender_restriction} block` 
-      });
-    }
+    validateGenderAllowedInBlock({
+      gender: oldAllocation.gender,
+      genderRestriction: newBlock.gender_restriction,
+    });
 
     // Check if new bed is available for the date range (excluding the current allocation being moved)
     const availabilityCheck = await execQuery(`
@@ -2851,9 +2860,10 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
           category_verified_at,
           sai_connect_id,
           sai_connect_age,
-          sai_lookup_identifier
+          sai_lookup_identifier,
+          caretaker_for_allocation_id
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
         RETURNING id
       `, [
         newLocationId,
@@ -2876,10 +2886,19 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
         oldAllocation.category_verified_at,
         oldAllocation.sai_connect_id,
         oldAllocation.sai_connect_age,
-        oldAllocation.sai_lookup_identifier
+        oldAllocation.sai_lookup_identifier,
+        oldAllocation.caretaker_for_allocation_id,
       ]);
 
       const insertedAllocationId = insertResult.rows[0].id;
+
+      if (linkedState.hasLinkedCaretaker) {
+        await client.query(`
+          UPDATE allocations
+          SET caretaker_for_allocation_id = $1, updated_at = NOW()
+          WHERE caretaker_for_allocation_id = $2 AND deleted_at IS NULL
+        `, [insertedAllocationId, allocationId]);
+      }
 
       // Log allocation with reallocation flag
       await logAudit(req, 'allocate', 'allocation', insertedAllocationId, {
