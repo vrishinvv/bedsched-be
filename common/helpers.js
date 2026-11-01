@@ -419,6 +419,7 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
         name: block.tent_name
       },
       block: {
+        id: Number(block.id),
         index: Number(block.block_index),
         name: block.name,
         genderRestriction: block.gender_restriction,
