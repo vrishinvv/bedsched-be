@@ -117,6 +117,24 @@ export function validateSaiIdentityAvailable({ identifier, existingAllocationId,
   );
 }
 
+export function validateBulkSaiIdentityAbsent(payload = {}) {
+  const hasSaiIdentity = [
+    payload.saiVerificationToken,
+    payload.saiConnectId,
+    payload.saiLookupIdentifier,
+    payload.saiIdentifier,
+    payload.Participant_id,
+    payload.participantId,
+    payload.identifier,
+  ].some((value) => value !== undefined && value !== null && String(value).trim() !== '');
+  if (!hasSaiIdentity) return;
+  fail(
+    'bulk_sai_identity_not_allowed',
+    'Sai Connect identities cannot be bulk booked. Allocate each verified person individually.',
+    'saiVerificationToken'
+  );
+}
+
 export function validateCaretakerTarget({ targetAllocation, blockId, hasCaretaker }) {
   if (!targetAllocation || targetAllocation.deleted_at) {
     fail('delegate_not_active', 'Select an active delegate in this block.', 'caretakerForAllocationId');

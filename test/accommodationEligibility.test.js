@@ -8,6 +8,7 @@ import {
   resolveUnverifiedCategory,
   validateAdminCategoryChange,
   validateCategoryAllowedInBlock,
+  validateBulkSaiIdentityAbsent,
   validateCaretakerTarget,
   validateSaiIdentityAvailable,
 } from '../common/accommodationEligibility.js';
@@ -70,6 +71,23 @@ test('a Sai Connect identity can have only one active allocation while caretaker
     existingAllocationId: 81,
     isCaretaker: true,
   }));
+});
+
+test('a Sai Connect identity cannot be attached to a bulk booking', () => {
+  for (const payload of [
+    { saiVerificationToken: 'verified-person-token' },
+    { saiConnectId: '239910' },
+    { Participant_id: 239910 },
+  ]) {
+    assert.throws(
+      () => validateBulkSaiIdentityAbsent(payload),
+      (error) => error instanceof AccommodationEligibilityError
+        && error.code === 'bulk_sai_identity_not_allowed'
+        && error.message === 'Sai Connect identities cannot be bulk booked. Allocate each verified person individually.'
+    );
+  }
+
+  assert.doesNotThrow(() => validateBulkSaiIdentityAbsent({ name: 'Unverified group booking' }));
 });
 
 test('an unverified person is allocated as a devotee by default', () => {

@@ -28,6 +28,7 @@ import {
   AccommodationEligibilityError,
   resolveMandatoryLookupCategory,
   validateAdminCategoryChange,
+  validateBulkSaiIdentityAbsent,
   validateCategoryAllowedInBlock,
   validateCaretakerTarget,
   validateSaiIdentityAvailable,
@@ -5297,6 +5298,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
     const locationId = Number(req.params.id);
     const tentIndex = Number(req.params.tent);
     const blockIndex = Number(req.params.block);
+    validateBulkSaiIdentityAbsent(req.body);
     
     const { name, phone, maleCount, femaleCount, startDate, endDate, emergencyPhone } = req.body || {};
     
@@ -5446,6 +5448,9 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
     });
   } catch (e) {
     console.error(e);
+    if (e instanceof AccommodationEligibilityError) {
+      return handleAccommodationError(res, e, 'bulk_allocate_failed');
+    }
     res.status(500).json({ error: 'bulk_allocate_failed', message: e.message });
   }
 });
