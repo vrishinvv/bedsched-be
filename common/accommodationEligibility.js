@@ -145,11 +145,11 @@ export function validateRequiredBookingPhotos({
 } = {}) {
   if (!photosRequired) return;
   if (isCaretaker) {
-    if (!String(personPhotoKey || '').trim()) {
+    if (!String(personPhotoKey || '').trim() || !String(aadhaarPhotoKey || '').trim()) {
       fail(
         'caretaker_photo_required',
-        'A caretaker photo is required for this booking.',
-        'personPhoto'
+        'A caretaker photo and Aadhaar/identity photo are required for this booking.',
+        'photos'
       );
     }
     return;
