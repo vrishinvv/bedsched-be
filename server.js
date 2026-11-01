@@ -26,11 +26,13 @@ import {
 } from './common/structureManagement.js';
 import {
   AccommodationEligibilityError,
+  resolveAllocationGender,
   resolveMandatoryLookupCategory,
   validateAdminCategoryChange,
   validateBulkSaiIdentityAbsent,
   validateCategoryAllowedInBlock,
   validateCaretakerTarget,
+  validateGenderAllowedInBlock,
   validateSaiIdentityAvailable,
 } from './common/accommodationEligibility.js';
 import {
@@ -217,6 +219,7 @@ app.post('/api/sai-connect/lookup', async (req, res) => {
       fullName: result.fullName,
       age: result.age,
       mobileNo: result.mobileNo,
+      gender: result.gender,
       verifiedCategories: result.verifiedCategories,
       registrations: result.registrations,
       verificationToken: createSaiVerificationToken(result, config.jwtSecret),
@@ -5079,13 +5082,14 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       return res.status(400).json({ error: 'invalid_date_range', message: 'start_date must be before or equal to end_date' });
     }
 
-    const validGenders = ['Male', 'Female', 'Other'];
-    const normalizedGender = isCaretaker
-      ? (validGenders.includes(String(gender || '').trim()) ? String(gender).trim() : null)
-      : (validGenders.includes(String(gender || '').trim()) ? String(gender).trim() : 'Other');
     const verification = saiVerificationToken
       ? verifySaiVerificationToken(saiVerificationToken, config.jwtSecret)
       : null;
+    const normalizedGender = resolveAllocationGender({
+      submittedGender: gender,
+      verifiedGender: verification?.gender,
+      isCaretaker,
+    });
 
     const allocation = await withTransaction(async (client) => {
       const blockResult = await client.query(`
@@ -5130,15 +5134,10 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       if (!Number.isSafeInteger(bedNumber) || bedNumber < 1 || bedNumber > Number(block.size)) {
         throw new AccommodationEligibilityError('bed_out_of_range', 'Bed out of range.');
       }
-      if (!isCaretaker) {
-        const normalized = normalizedGender?.toLowerCase();
-        if (block.gender_restriction === 'male_only' && normalized !== 'male') {
-          throw new AccommodationEligibilityError('gender_restriction_violation', 'This block is restricted to male guests only.');
-        }
-        if (block.gender_restriction === 'female_only' && normalized !== 'female') {
-          throw new AccommodationEligibilityError('gender_restriction_violation', 'This block is restricted to female guests only.');
-        }
-      }
+      validateGenderAllowedInBlock({
+        gender: normalizedGender,
+        genderRestriction: block.gender_restriction,
+      });
 
       await client.query(`
         UPDATE allocations

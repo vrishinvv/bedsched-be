@@ -4,14 +4,42 @@ import test from 'node:test';
 import {
   AccommodationEligibilityError,
   resolveMandatoryLookupCategory,
+  resolveAllocationGender,
   resolveVerifiedCategory,
   resolveUnverifiedCategory,
   validateAdminCategoryChange,
   validateCategoryAllowedInBlock,
   validateBulkSaiIdentityAbsent,
   validateCaretakerTarget,
+  validateGenderAllowedInBlock,
   validateSaiIdentityAvailable,
 } from '../common/accommodationEligibility.js';
+
+test('Sai-verified gender is authoritative for an allocation', () => {
+  assert.equal(resolveAllocationGender({
+    submittedGender: 'Male',
+    verifiedGender: 'female',
+  }), 'Female');
+});
+
+test('a caretaker must provide a valid gender', () => {
+  assert.equal(resolveAllocationGender({ submittedGender: 'Female', isCaretaker: true }), 'Female');
+  assert.throws(
+    () => resolveAllocationGender({ submittedGender: '', isCaretaker: true }),
+    (error) => error instanceof AccommodationEligibilityError
+      && error.code === 'gender_required'
+  );
+});
+
+test('gender restrictions apply to caretakers and Sai-verified occupants alike', () => {
+  assert.equal(validateGenderAllowedInBlock({ gender: 'Male', genderRestriction: 'male_only' }), 'Male');
+  assert.throws(
+    () => validateGenderAllowedInBlock({ gender: 'Female', genderRestriction: 'male_only' }),
+    (error) => error instanceof AccommodationEligibilityError
+      && error.code === 'gender_restriction_violation'
+      && error.message === 'This block is restricted to male guests only.'
+  );
+});
 
 test('a normal allocation requires completed Sai Connect lookup proof', () => {
   assert.throws(

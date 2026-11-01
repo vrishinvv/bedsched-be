@@ -42,6 +42,7 @@ test('calls Sai Connect with a bearer-authenticated GET JSON body and maps retur
         full_name: 'Ramesh Kumar',
         age: 35,
         mobile_no: null,
+        gender: 'male',
         checkin_status: [
           { event_id: 14, event_name: 'Sevadal Conference', checked_in: false },
           { event_id: 15, event_name: 'Delegate Conference', checked_in: true },
@@ -67,6 +68,7 @@ test('calls Sai Connect with a bearer-authenticated GET JSON body and maps retur
     fullName: 'Ramesh Kumar',
     age: 35,
     mobileNo: null,
+    gender: 'Male',
     verifiedCategories: ['delegate', 'sevadal'],
     registrations: [
       { eventId: 14, eventName: 'Sevadal Conference', checkedIn: false, category: 'sevadal' },
@@ -98,12 +100,14 @@ test('issues a short-lived signed verification token that preserves both categor
   const token = createSaiVerificationToken({
     identifier: '427199',
     fullName: 'Ramesh Kumar',
+    gender: 'Female',
     verifiedCategories: ['delegate', 'sevadal'],
   }, secret);
 
   assert.deepEqual(verifySaiVerificationToken(token, secret), {
     identifier: '427199',
     fullName: 'Ramesh Kumar',
+    gender: 'Female',
     verifiedCategories: ['delegate', 'sevadal'],
   });
   assert.throws(() => verifySaiVerificationToken(`${token}tampered`, secret), /Invalid Sai Connect verification/);

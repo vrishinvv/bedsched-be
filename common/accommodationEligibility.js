@@ -9,6 +9,33 @@ export class AccommodationEligibilityError extends Error {
   }
 }
 
+export function normalizePersonGender(value) {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (['male', 'm'].includes(normalized)) return 'Male';
+  if (['female', 'f'].includes(normalized)) return 'Female';
+  if (['other', 'o', 'non-binary', 'nonbinary'].includes(normalized)) return 'Other';
+  return null;
+}
+
+export function resolveAllocationGender({ submittedGender, verifiedGender, isCaretaker = false } = {}) {
+  const gender = normalizePersonGender(verifiedGender) || normalizePersonGender(submittedGender);
+  if (!gender && isCaretaker) {
+    fail('gender_required', 'Select the caretaker\'s gender.', 'gender');
+  }
+  return gender || 'Other';
+}
+
+export function validateGenderAllowedInBlock({ gender, genderRestriction } = {}) {
+  const normalizedGender = normalizePersonGender(gender);
+  if (genderRestriction === 'male_only' && normalizedGender !== 'Male') {
+    fail('gender_restriction_violation', 'This block is restricted to male guests only.', 'gender');
+  }
+  if (genderRestriction === 'female_only' && normalizedGender !== 'Female') {
+    fail('gender_restriction_violation', 'This block is restricted to female guests only.', 'gender');
+  }
+  return normalizedGender;
+}
+
 function fail(code, message, field) {
   throw new AccommodationEligibilityError(code, message, field);
 }

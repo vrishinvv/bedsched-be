@@ -2,7 +2,7 @@ import http from 'node:http';
 import https from 'node:https';
 import jwt from 'jsonwebtoken';
 
-import { ACCOMMODATION_CATEGORIES } from './accommodationEligibility.js';
+import { ACCOMMODATION_CATEGORIES, normalizePersonGender } from './accommodationEligibility.js';
 
 const TOKEN_AUDIENCE = 'bedsched-fe';
 const TOKEN_ISSUER = 'bedsched-sai-connect';
@@ -135,6 +135,11 @@ export async function lookupSaiConnectMember({
     fullName: response.data.data.full_name || '',
     age: response.data.data.age ?? null,
     mobileNo: response.data.data.mobile_no ?? null,
+    gender: normalizePersonGender(
+      response.data.data.gender
+      ?? response.data.data.gender_name
+      ?? response.data.data.sex
+    ),
     verifiedCategories,
     registrations,
   };
@@ -146,6 +151,7 @@ export function createSaiVerificationToken(result, secret) {
     outcome: result.outcome,
     identifier: result.identifier,
     fullName: result.fullName,
+    gender: result.gender,
     verifiedCategories: result.verifiedCategories,
   }, secret, {
     algorithm: 'HS256',
@@ -166,10 +172,12 @@ export function verifySaiVerificationToken(token, secret) {
     const outcome = ['matched', 'not_registered', 'not_approved', 'invalid', 'error'].includes(payload.outcome)
       ? payload.outcome
       : undefined;
+    const gender = normalizePersonGender(payload.gender);
     return {
       ...(outcome ? { outcome } : {}),
       identifier: String(payload.identifier),
       fullName: String(payload.fullName || ''),
+      ...(gender ? { gender } : {}),
       verifiedCategories: ACCOMMODATION_CATEGORIES.filter((category) => (
         Array.isArray(payload.verifiedCategories) && payload.verifiedCategories.includes(category)
       )),
