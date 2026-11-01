@@ -273,6 +273,7 @@ export async function getTentBlocks(locationId, tentIndex) {
       b.name,
       b.size,
       b.gender_restriction,
+      b.minimum_age,
       COALESCE(a.allocated, 0) AS allocated,
       COALESCE(a.freeing_tomorrow, 0) AS freeing_tomorrow,
       COALESCE(r.reserved_active, 0) AS reserved
@@ -311,6 +312,7 @@ export async function getTentBlocks(locationId, tentIndex) {
       name: b.name,
       size: Number(b.size),
       genderRestriction: b.gender_restriction,
+      minimumAge: Number(b.minimum_age || 0),
       allocated: Number(b.allocated),
       freeingTomorrow: Number(b.freeing_tomorrow),
       reserved: Number(b.reserved || 0)
@@ -342,7 +344,7 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
 
   // Get block info
   const blockRes = await execQuery(`
-    SELECT b.id, b.block_index, b.name, b.size, b.gender_restriction, b.allowed_categories,
+    SELECT b.id, b.block_index, b.name, b.size, b.gender_restriction, b.allowed_categories, b.minimum_age,
            t.tent_index, t.name as tent_name, l.name as location_name
     FROM blocks b
     JOIN tents t ON t.id = b.tent_id
@@ -424,6 +426,7 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
         name: block.name,
         genderRestriction: block.gender_restriction,
         allowedCategories: block.allowed_categories,
+        minimumAge: Number(block.minimum_age || 0),
       }
     },
     blockSize: Number(block.size),

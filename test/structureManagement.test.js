@@ -30,12 +30,14 @@ test('validates new block size and type', () => {
       size: '125',
       genderRestriction: 'female_only',
       allowedCategories: ['delegate', 'sevadal'],
+      minimumAge: '70',
     }),
     {
       name: 'Block 4',
       size: 125,
       genderRestriction: 'female_only',
       allowedCategories: ['delegate', 'sevadal'],
+      minimumAge: 70,
     }
   );
 });
@@ -48,12 +50,14 @@ test('defaults a new block to mixed type and all accommodation categories', () =
       size: 50,
       genderRestriction: 'both',
       allowedCategories: ['delegate', 'sevadal', 'devotee'],
+      minimumAge: 0,
     }
   );
 });
 
 test('accepts partial block updates', () => {
   assert.deepEqual(validateBlockUpdateInput({ size: 75 }), { size: 75 });
+  assert.deepEqual(validateBlockUpdateInput({ minimumAge: '70' }), { minimumAge: 70 });
   assert.deepEqual(
     validateBlockUpdateInput({
       name: ' West ',
@@ -75,6 +79,8 @@ test('rejects empty names, invalid sizes, invalid types, and empty updates', () 
     [() => validateCreateBlockInput({ name: 'Block', size: 10, genderRestriction: 'vip' }), 'invalid_block_type'],
     [() => validateCreateBlockInput({ name: 'Block', size: 10, allowedCategories: [] }), 'category_required'],
     [() => validateCreateBlockInput({ name: 'Block', size: 10, allowedCategories: ['vip'] }), 'invalid_category'],
+    [() => validateCreateBlockInput({ name: 'Block', size: 10, minimumAge: -1 }), 'invalid_minimum_age'],
+    [() => validateCreateBlockInput({ name: 'Block', size: 10, minimumAge: 131 }), 'invalid_minimum_age'],
     [() => validateBlockUpdateInput({}), 'no_changes'],
     [() => validateEntityId('not-an-id'), 'invalid_id'],
   ];

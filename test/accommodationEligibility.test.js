@@ -29,7 +29,7 @@ test('allocation access is limited to an administrator or the assigned location'
   assert.equal(canAccessAllocationLocation(null, 61), false);
 });
 
-test('production photo enforcement requires both photos only for normal individual bookings', () => {
+test('production photo enforcement requires both photos for guests and a person photo for caretakers', () => {
   assert.throws(
     () => validateRequiredBookingPhotos({ photosRequired: true, personPhotoKey: 'person.jpg' }),
     (error) => error instanceof AccommodationEligibilityError
@@ -41,7 +41,16 @@ test('production photo enforcement requires both photos only for normal individu
     aadhaarPhotoKey: 'identity.jpg',
   }));
   assert.doesNotThrow(() => validateRequiredBookingPhotos({ photosRequired: false }));
-  assert.doesNotThrow(() => validateRequiredBookingPhotos({ photosRequired: true, isCaretaker: true }));
+  assert.throws(
+    () => validateRequiredBookingPhotos({ photosRequired: true, isCaretaker: true }),
+    (error) => error instanceof AccommodationEligibilityError
+      && error.code === 'caretaker_photo_required',
+  );
+  assert.doesNotThrow(() => validateRequiredBookingPhotos({
+    photosRequired: true,
+    isCaretaker: true,
+    personPhotoKey: 'caretaker.jpg',
+  }));
 });
 
 test('Sai-verified gender is authoritative for an allocation', () => {

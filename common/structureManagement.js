@@ -4,6 +4,7 @@ export const BLOCK_TYPES = Object.freeze(['both', 'male_only', 'female_only']);
 
 const MAX_NAME_LENGTH = 100;
 const MAX_BLOCK_SIZE = 10000;
+const MAX_MINIMUM_AGE = 130;
 
 export class StructureValidationError extends Error {
   constructor(code, message, field) {
@@ -54,6 +55,14 @@ export function validateBlockType(value) {
   return value;
 }
 
+export function validateMinimumAge(value = 0) {
+  const minimumAge = Number(value);
+  if (!Number.isSafeInteger(minimumAge) || minimumAge < 0 || minimumAge > MAX_MINIMUM_AGE) {
+    fail('invalid_minimum_age', `Minimum age must be a whole number between 0 and ${MAX_MINIMUM_AGE}.`, 'minimumAge');
+  }
+  return minimumAge;
+}
+
 export function validateAllowedCategories(value, options) {
   try {
     return normalizeAccommodationCategories(value, options);
@@ -74,6 +83,7 @@ export function validateCreateBlockInput(input) {
     size: validateBlockSize(candidate.size),
     genderRestriction: validateBlockType(candidate.genderRestriction || 'both'),
     allowedCategories: validateAllowedCategories(candidate.allowedCategories, { defaultToAll: true }),
+    minimumAge: validateMinimumAge(candidate.minimumAge ?? 0),
   };
 }
 
@@ -92,6 +102,9 @@ export function validateBlockUpdateInput(input) {
   }
   if (Object.hasOwn(candidate, 'allowedCategories')) {
     update.allowedCategories = validateAllowedCategories(candidate.allowedCategories);
+  }
+  if (Object.hasOwn(candidate, 'minimumAge')) {
+    update.minimumAge = validateMinimumAge(candidate.minimumAge);
   }
 
   if (Object.keys(update).length === 0) {

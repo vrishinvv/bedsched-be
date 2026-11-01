@@ -1367,6 +1367,7 @@ app.get('/api/admin/structure', async (req, res) => {
           b.size,
           b.gender_restriction,
           b.allowed_categories,
+          b.minimum_age,
           COUNT(a.id) FILTER (
             WHERE a.deleted_at IS NULL AND (
               (a.status = 'confirmed' AND a.end_date >= ${todaySQL})
@@ -1415,6 +1416,7 @@ app.get('/api/admin/structure', async (req, res) => {
         size: Number(row.size),
         genderRestriction: row.gender_restriction,
         allowedCategories: row.allowed_categories,
+        minimumAge: Number(row.minimum_age || 0),
         activeAllocations: Number(row.active_allocations),
         highestActiveBed: Number(row.highest_active_bed),
       });
@@ -1582,10 +1584,10 @@ app.post('/api/admin/structure/tents/:tentId/blocks', async (req, res) => {
       const blockIndex = Number(indexResult.rows[0].next_index);
       const insertResult = await client.query(`
         INSERT INTO blocks (
-          location_id, tent_id, tent_index, block_index, name, size, gender_restriction, allowed_categories
+          location_id, tent_id, tent_index, block_index, name, size, gender_restriction, allowed_categories, minimum_age
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING id, block_index, name, size, gender_restriction, allowed_categories
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        RETURNING id, block_index, name, size, gender_restriction, allowed_categories, minimum_age
       `, [
         Number(tent.location_id),
         tentId,
@@ -1595,6 +1597,7 @@ app.post('/api/admin/structure/tents/:tentId/blocks', async (req, res) => {
         input.size,
         input.genderRestriction,
         input.allowedCategories,
+        input.minimumAge,
       ]);
 
       const tentSizeResult = await client.query(`
@@ -1628,6 +1631,7 @@ app.post('/api/admin/structure/tents/:tentId/blocks', async (req, res) => {
       size: Number(created.block.size),
       blockType: created.block.gender_restriction,
       allowedCategories: created.block.allowed_categories,
+      minimumAge: Number(created.block.minimum_age || 0),
     });
 
     res.status(201).json({
@@ -1639,6 +1643,7 @@ app.post('/api/admin/structure/tents/:tentId/blocks', async (req, res) => {
         size: Number(created.block.size),
         genderRestriction: created.block.gender_restriction,
         allowedCategories: created.block.allowed_categories,
+        minimumAge: Number(created.block.minimum_age || 0),
         activeAllocations: 0,
         highestActiveBed: 0,
       },
@@ -1665,6 +1670,7 @@ app.patch('/api/admin/structure/blocks/:blockId', async (req, res) => {
           b.size,
           b.gender_restriction,
           b.allowed_categories,
+          b.minimum_age,
           b.block_index,
           b.tent_id,
           t.tent_index,
@@ -1683,6 +1689,7 @@ app.patch('/api/admin/structure/blocks/:blockId', async (req, res) => {
         size: input.size ?? Number(current.size),
         genderRestriction: input.genderRestriction ?? current.gender_restriction,
         allowedCategories: input.allowedCategories ?? current.allowed_categories,
+        minimumAge: input.minimumAge ?? Number(current.minimum_age || 0),
       };
 
       if (next.size < Number(current.size)) {
@@ -1763,10 +1770,10 @@ app.patch('/api/admin/structure/blocks/:blockId', async (req, res) => {
 
       const updateResult = await client.query(`
         UPDATE blocks
-        SET name = $1, size = $2, gender_restriction = $3, allowed_categories = $4
-        WHERE id = $5
-        RETURNING id, block_index, name, size, gender_restriction, allowed_categories
-      `, [next.name, next.size, next.genderRestriction, next.allowedCategories, blockId]);
+        SET name = $1, size = $2, gender_restriction = $3, allowed_categories = $4, minimum_age = $5
+        WHERE id = $6
+        RETURNING id, block_index, name, size, gender_restriction, allowed_categories, minimum_age
+      `, [next.name, next.size, next.genderRestriction, next.allowedCategories, next.minimumAge, blockId]);
 
       const tentSizeResult = await client.query(`
         UPDATE tents
@@ -1802,12 +1809,14 @@ app.patch('/api/admin/structure/blocks/:blockId', async (req, res) => {
         size: Number(updated.current.size),
         blockType: updated.current.gender_restriction,
         allowedCategories: updated.current.allowed_categories,
+        minimumAge: Number(updated.current.minimum_age || 0),
       },
       after: {
         name: updated.block.name,
         size: Number(updated.block.size),
         blockType: updated.block.gender_restriction,
         allowedCategories: updated.block.allowed_categories,
+        minimumAge: Number(updated.block.minimum_age || 0),
       },
     });
 
@@ -1820,6 +1829,7 @@ app.patch('/api/admin/structure/blocks/:blockId', async (req, res) => {
         size: Number(updated.block.size),
         genderRestriction: updated.block.gender_restriction,
         allowedCategories: updated.block.allowed_categories,
+        minimumAge: Number(updated.block.minimum_age || 0),
       },
       tentSize: updated.tentSize,
       locationCapacity: updated.locationCapacity,
@@ -2590,7 +2600,8 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
           b.name,
           b.size,
           b.gender_restriction,
-          b.allowed_categories
+          b.allowed_categories,
+          b.minimum_age AS "minimumAge"
         FROM blocks b
         WHERE b.tent_id = $1
         ORDER BY b.block_index
@@ -2604,7 +2615,8 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
           b.block_index,
           b.name,
           b.size,
-          b.gender_restriction
+          b.gender_restriction,
+          b.minimum_age AS "minimumAge"
         FROM blocks b
         WHERE b.tent_id = $1
           AND (
