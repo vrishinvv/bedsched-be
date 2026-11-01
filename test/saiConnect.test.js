@@ -9,8 +9,8 @@ import {
 } from '../common/saiConnect.js';
 
 const eventCategoryMap = new Map([
-  [14, 'delegate'],
-  [15, 'sevadal'],
+  [14, 'sevadal'],
+  [15, 'delegate'],
 ]);
 
 async function withServer(handler, operation) {
@@ -43,8 +43,8 @@ test('calls Sai Connect with a bearer-authenticated GET JSON body and maps retur
         age: 35,
         mobile_no: null,
         checkin_status: [
-          { event_id: 14, event_name: 'Delegate Conference', checked_in: false },
-          { event_id: 15, event_name: 'Sevadal Conference', checked_in: true },
+          { event_id: 14, event_name: 'Sevadal Conference', checked_in: false },
+          { event_id: 15, event_name: 'Delegate Conference', checked_in: true },
         ],
       },
     }));
@@ -69,8 +69,8 @@ test('calls Sai Connect with a bearer-authenticated GET JSON body and maps retur
     mobileNo: null,
     verifiedCategories: ['delegate', 'sevadal'],
     registrations: [
-      { eventId: 14, eventName: 'Delegate Conference', checkedIn: false, category: 'delegate' },
-      { eventId: 15, eventName: 'Sevadal Conference', checkedIn: true, category: 'sevadal' },
+      { eventId: 14, eventName: 'Sevadal Conference', checkedIn: false, category: 'sevadal' },
+      { eventId: 15, eventName: 'Delegate Conference', checkedIn: true, category: 'delegate' },
     ],
   });
 });

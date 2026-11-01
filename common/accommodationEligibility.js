@@ -37,9 +37,15 @@ export function resolveUnverifiedCategory() {
   };
 }
 
-export function resolveMandatoryLookupCategory({ verification, requestedCategory, isCaretaker = false } = {}) {
+export function resolveMandatoryLookupCategory({
+  verification,
+  requestedCategory,
+  isCaretaker = false,
+  lookupRequired = true,
+} = {}) {
   if (isCaretaker) return resolveUnverifiedCategory();
   if (!verification) {
+    if (!lookupRequired) return resolveUnverifiedCategory();
     fail(
       'sai_connect_lookup_required',
       'Complete the Sai Connect lookup before allocating this bed.',

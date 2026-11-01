@@ -19,6 +19,17 @@ test('a normal allocation requires completed Sai Connect lookup proof', () => {
   );
 });
 
+test('Sai Connect lookup remains optional when the block allows Devotees', () => {
+  assert.deepEqual(
+    resolveMandatoryLookupCategory({ verification: null, lookupRequired: false }),
+    {
+      accommodationCategory: 'devotee',
+      categorySource: 'default',
+      verifiedCategories: [],
+    }
+  );
+});
+
 test('a completed lookup without registration resolves to Devotee', () => {
   assert.deepEqual(
     resolveMandatoryLookupCategory({

@@ -9,7 +9,18 @@ function resolveJwtSecret(nodeEnv, configuredSecret) {
     return 'dev-insecure-secret';
 }
 
+function resolveSaiConnectEventIds(configuredDelegateEventId, configuredSevadalEventId) {
+    return {
+        delegateEventId: Number(configuredDelegateEventId || 15),
+        sevadalEventId: Number(configuredSevadalEventId || 14),
+    };
+}
+
 const nodeEnv = process.env.NODE_ENV || 'development';
+const saiConnectEventIds = resolveSaiConnectEventIds(
+    process.env.SAI_CONNECT_DELEGATE_EVENT_ID,
+    process.env.SAI_CONNECT_SEVADAL_EVENT_ID,
+);
 
 const config = {
     random: process.env.RANDOM || 10,
@@ -29,11 +40,12 @@ const config = {
     backupEmail: process.env.BACKUP_EMAIL || 'vvnihsirv@gmail.com',
     saiConnectEndpoint: process.env.SAI_CONNECT_ENDPOINT || 'https://www.saiconnect.app/api/getMemberDetailwithEventRegistrations',
     saiConnectBearerToken: process.env.SAI_CONNECT_BEARER_TOKEN,
-    saiConnectDelegateEventId: Number(process.env.SAI_CONNECT_DELEGATE_EVENT_ID || 14),
-    saiConnectSevadalEventId: Number(process.env.SAI_CONNECT_SEVADAL_EVENT_ID || 15),
+    saiConnectDelegateEventId: saiConnectEventIds.delegateEventId,
+    saiConnectSevadalEventId: saiConnectEventIds.sevadalEventId,
 }
 
 export {
     config,
     resolveJwtSecret,
+    resolveSaiConnectEventIds,
 }

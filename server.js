@@ -5084,11 +5084,6 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
     const verification = saiVerificationToken
       ? verifySaiVerificationToken(saiVerificationToken, config.jwtSecret)
       : null;
-    const category = resolveMandatoryLookupCategory({
-      verification,
-      requestedCategory: accommodationCategory,
-      isCaretaker,
-    });
 
     const allocation = await withTransaction(async (client) => {
       const blockResult = await client.query(`
@@ -5102,6 +5097,12 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       const block = blockResult.rows[0];
       const blockId = Number(block.id);
       const tentId = Number(block.tent_id);
+      const category = resolveMandatoryLookupCategory({
+        verification,
+        requestedCategory: accommodationCategory,
+        isCaretaker,
+        lookupRequired: !block.allowed_categories.includes('devotee'),
+      });
       if (!Number.isSafeInteger(bedNumber) || bedNumber < 1 || bedNumber > Number(block.size)) {
         throw new AccommodationEligibilityError('bed_out_of_range', 'Bed out of range.');
       }
