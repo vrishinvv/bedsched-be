@@ -8,6 +8,7 @@ import {
   resolveVerifiedCategory,
   resolveUnverifiedCategory,
   validateAdminCategoryChange,
+  validateAccommodationCategoryEditPermission,
   validateCategoryAllowedInBlock,
   validateBulkSaiIdentityAbsent,
   validateCaretakerTarget,
@@ -171,6 +172,16 @@ test('admins may manually change a category to devotee or sevadal but never dele
     () => validateAdminCategoryChange('delegate'),
     (error) => error instanceof AccommodationEligibilityError
       && error.code === 'delegate_requires_verification'
+  );
+});
+
+test('only admins may edit the accommodation category of an existing booking', () => {
+  assert.doesNotThrow(() => validateAccommodationCategoryEditPermission({ role: 'admin' }));
+  assert.throws(
+    () => validateAccommodationCategoryEditPermission({ role: 'location_user' }),
+    (error) => error instanceof AccommodationEligibilityError
+      && error.code === 'forbidden'
+      && error.message === 'Only an administrator can change accommodation category.'
   );
 });
 

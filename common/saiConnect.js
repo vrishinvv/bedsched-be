@@ -78,6 +78,29 @@ function errorOutcome(message, identifier) {
   return { outcome: 'error', identifier, message: normalizedMessage };
 }
 
+function normalizeSaiConnectId(data, lookupIdentifier) {
+  const returnedId = data?.sai_connect_id
+    ?? data?.participant_id
+    ?? data?.Participant_id
+    ?? null;
+  const normalizedReturnedId = String(returnedId ?? '').trim();
+  if (/^\d{1,15}$/.test(normalizedReturnedId)) return normalizedReturnedId;
+
+  // Sai Connect currently accepts either the member ID or a 10-digit phone.
+  // A direct member-ID lookup is still authoritative when the upstream response
+  // omits the ID, but a phone number must never be persisted as the member ID.
+  const normalizedLookup = String(lookupIdentifier ?? '').trim();
+  return /^\d{1,15}$/.test(normalizedLookup) && normalizedLookup.length !== 10
+    ? normalizedLookup
+    : null;
+}
+
+function normalizeAge(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const age = Number(value);
+  return Number.isInteger(age) && age >= 0 && age <= 130 ? age : null;
+}
+
 export async function lookupSaiConnectMember({
   endpoint,
   bearerToken,
@@ -132,8 +155,9 @@ export async function lookupSaiConnectMember({
   return {
     outcome: 'matched',
     identifier: normalizedIdentifier,
+    saiConnectId: normalizeSaiConnectId(response.data.data, normalizedIdentifier),
     fullName: response.data.data.full_name || '',
-    age: response.data.data.age ?? null,
+    age: normalizeAge(response.data.data.age),
     mobileNo: response.data.data.mobile_no ?? null,
     gender: normalizePersonGender(
       response.data.data.gender
@@ -150,7 +174,9 @@ export function createSaiVerificationToken(result, secret) {
     type: 'sai_connect_verification',
     outcome: result.outcome,
     identifier: result.identifier,
+    saiConnectId: result.saiConnectId || null,
     fullName: result.fullName,
+    age: normalizeAge(result.age),
     gender: result.gender,
     verifiedCategories: result.verifiedCategories,
   }, secret, {
@@ -173,10 +199,14 @@ export function verifySaiVerificationToken(token, secret) {
       ? payload.outcome
       : undefined;
     const gender = normalizePersonGender(payload.gender);
+    const saiConnectId = String(payload.saiConnectId ?? '').trim();
+    const age = normalizeAge(payload.age);
     return {
       ...(outcome ? { outcome } : {}),
       identifier: String(payload.identifier),
+      ...(saiConnectId ? { saiConnectId } : {}),
       fullName: String(payload.fullName || ''),
+      ...(age !== null ? { age } : {}),
       ...(gender ? { gender } : {}),
       verifiedCategories: ACCOMMODATION_CATEGORIES.filter((category) => (
         Array.isArray(payload.verifiedCategories) && payload.verifiedCategories.includes(category)

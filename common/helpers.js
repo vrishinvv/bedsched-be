@@ -1,4 +1,5 @@
 import { execQuery } from './db.js';
+import { mapAllocationRowToBedData } from './allocationPresentation.js';
 import { generateViewUrl } from './s3.js';
 
 // IST timezone functions - Get current date in IST as a DATE type
@@ -374,6 +375,8 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
       a.accommodation_category,
       a.category_source,
       a.verified_categories,
+      a.sai_connect_id,
+      a.sai_connect_age,
       a.caretaker_for_allocation_id,
       delegate.name AS caretaker_for_name
     FROM allocations a
@@ -389,23 +392,7 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
   // Build beds object
   const beds = {};
   for (const r of allocRes.rows) {
-    const bedData = {
-      id: r.id, // Include allocation ID for reallocation feature
-      name: r.name,
-      phone: r.phone,
-      emergencyPhone: r.emergency_phone,
-      gender: r.gender || 'Other',
-      startDate: r.start_date_str, // Already formatted as YYYY-MM-DD string from TO_CHAR
-      endDate: r.end_date_str,     // Already formatted as YYYY-MM-DD string from TO_CHAR
-      status: r.status,
-      reservedExpiresAt: r.reserved_expires_at ? r.reserved_expires_at.toISOString() : null,
-      createdAt: r.created_at ? r.created_at.toISOString() : null, // Include creation timestamp
-      accommodationCategory: r.accommodation_category,
-      categorySource: r.category_source,
-      verifiedCategories: r.verified_categories || [],
-      caretakerForAllocationId: r.caretaker_for_allocation_id ? Number(r.caretaker_for_allocation_id) : null,
-      caretakerForName: r.caretaker_for_name || null,
-    };
+    const bedData = mapAllocationRowToBedData(r);
 
     // Include photo keys and generate URLs if keys exist
     if (r.person_photo_key) {

@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS allocations (
     CHECK (verified_categories <@ ARRAY['delegate', 'sevadal']::TEXT[]),
   category_verified_at TIMESTAMPTZ,
   sai_connect_id TEXT,
+  sai_connect_age SMALLINT CHECK (sai_connect_age IS NULL OR sai_connect_age BETWEEN 0 AND 130),
   sai_lookup_identifier TEXT,
   caretaker_for_allocation_id BIGINT REFERENCES allocations(id) ON DELETE RESTRICT,
   -- Prevent end before start

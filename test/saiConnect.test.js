@@ -39,6 +39,7 @@ test('calls Sai Connect with a bearer-authenticated GET JSON body and maps retur
     res.end(JSON.stringify({
       status: 'success',
       data: {
+        participant_id: 427199,
         full_name: 'Ramesh Kumar',
         age: 35,
         mobile_no: null,
@@ -65,6 +66,7 @@ test('calls Sai Connect with a bearer-authenticated GET JSON body and maps retur
   assert.deepEqual(result, {
     outcome: 'matched',
     identifier: '427199',
+    saiConnectId: '427199',
     fullName: 'Ramesh Kumar',
     age: 35,
     mobileNo: null,
@@ -99,14 +101,18 @@ test('issues a short-lived signed verification token that preserves both categor
   const secret = 'test-secret-that-is-long-and-random-enough-for-hmac';
   const token = createSaiVerificationToken({
     identifier: '427199',
+    saiConnectId: '427199',
     fullName: 'Ramesh Kumar',
+    age: 35,
     gender: 'Female',
     verifiedCategories: ['delegate', 'sevadal'],
   }, secret);
 
   assert.deepEqual(verifySaiVerificationToken(token, secret), {
     identifier: '427199',
+    saiConnectId: '427199',
     fullName: 'Ramesh Kumar',
+    age: 35,
     gender: 'Female',
     verifiedCategories: ['delegate', 'sevadal'],
   });

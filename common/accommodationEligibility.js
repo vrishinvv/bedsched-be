@@ -125,6 +125,12 @@ export function validateAdminCategoryChange(value) {
   return value;
 }
 
+export function validateAccommodationCategoryEditPermission(user) {
+  if (user?.role !== 'admin') {
+    fail('forbidden', 'Only an administrator can change accommodation category.');
+  }
+}
+
 export function validateCategoryAllowedInBlock({ accommodationCategory, allowedCategories, isCaretaker = false }) {
   const allowed = normalizeAccommodationCategories(allowedCategories);
   if (isCaretaker || allowed.includes(accommodationCategory)) return accommodationCategory;

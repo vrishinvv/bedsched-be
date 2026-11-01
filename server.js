@@ -28,6 +28,7 @@ import {
   AccommodationEligibilityError,
   resolveAllocationGender,
   resolveMandatoryLookupCategory,
+  validateAccommodationCategoryEditPermission,
   validateAdminCategoryChange,
   validateBulkSaiIdentityAbsent,
   validateCategoryAllowedInBlock,
@@ -216,6 +217,7 @@ app.post('/api/sai-connect/lookup', async (req, res) => {
 
     return res.json({
       matched: true,
+      saiConnectId: result.saiConnectId,
       fullName: result.fullName,
       age: result.age,
       mobileNo: result.mobileNo,
@@ -2703,6 +2705,7 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
         a.verified_categories,
         a.category_verified_at,
         a.sai_connect_id,
+        a.sai_connect_age,
         a.sai_lookup_identifier,
         a.caretaker_for_allocation_id,
         EXISTS (
@@ -2852,9 +2855,10 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
           verified_categories,
           category_verified_at,
           sai_connect_id,
+          sai_connect_age,
           sai_lookup_identifier
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
         RETURNING id
       `, [
         newLocationId,
@@ -2876,6 +2880,7 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
         oldAllocation.verified_categories,
         oldAllocation.category_verified_at,
         oldAllocation.sai_connect_id,
+        oldAllocation.sai_connect_age,
         oldAllocation.sai_lookup_identifier
       ]);
 
@@ -5109,24 +5114,31 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
         isCaretaker,
         lookupRequired: !block.allowed_categories.includes('devotee'),
       });
-      const verifiedSaiIdentifier = category.categorySource === 'sai_connect'
+      const verifiedSaiLookupIdentifier = category.categorySource === 'sai_connect'
         ? verification?.identifier
         : null;
-      if (verifiedSaiIdentifier) {
+      const verifiedSaiConnectId = category.categorySource === 'sai_connect'
+        ? verification?.saiConnectId || null
+        : null;
+      const verifiedSaiAge = category.categorySource === 'sai_connect'
+        ? verification?.age ?? null
+        : null;
+      const saiIdentityLockKey = verifiedSaiConnectId || verifiedSaiLookupIdentifier;
+      if (saiIdentityLockKey) {
         await client.query(
           'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
-          [verifiedSaiIdentifier]
+          [saiIdentityLockKey]
         );
         const existingIdentity = await client.query(`
           SELECT id
           FROM allocations
-          WHERE sai_lookup_identifier = $1
+          WHERE (sai_connect_id = $1 OR sai_lookup_identifier = $2)
             AND category_verified_at IS NOT NULL
             AND deleted_at IS NULL
           LIMIT 1
-        `, [verifiedSaiIdentifier]);
+        `, [verifiedSaiConnectId, verifiedSaiLookupIdentifier]);
         validateSaiIdentityAvailable({
-          identifier: verifiedSaiIdentifier,
+          identifier: saiIdentityLockKey,
           existingAllocationId: existingIdentity.rows[0]?.id,
           isCaretaker,
         });
@@ -5197,14 +5209,14 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
           name, phone, gender, start_date, end_date, emergency_phone,
           person_photo_key, aadhaar_photo_key, accommodation_category, category_source,
           verified_categories, category_verified_at, sai_connect_id, sai_lookup_identifier,
-          caretaker_for_allocation_id
+          sai_connect_age, caretaker_for_allocation_id
         )
         VALUES (
           $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
-          $18,$19,$20,$21
+          $18,$19,$20,$21,$22
         )
         RETURNING id, name, phone, gender, accommodation_category, category_source,
-                  caretaker_for_allocation_id,
+                  sai_connect_id, sai_connect_age, caretaker_for_allocation_id,
                   TO_CHAR(start_date, 'YYYY-MM-DD') AS start_date,
                   TO_CHAR(end_date, 'YYYY-MM-DD') AS end_date,
                   emergency_phone, person_photo_key, aadhaar_photo_key, status
@@ -5226,9 +5238,10 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
         category.accommodationCategory,
         category.categorySource,
         category.verifiedCategories,
-        verifiedSaiIdentifier ? new Date() : null,
-        verifiedSaiIdentifier && verifiedSaiIdentifier.length < 10 ? verifiedSaiIdentifier : null,
-        verifiedSaiIdentifier || null,
+        verifiedSaiLookupIdentifier ? new Date() : null,
+        verifiedSaiConnectId,
+        verifiedSaiLookupIdentifier,
+        verifiedSaiAge,
         delegateAllocationId,
       ]);
       return insertResult.rows[0];
@@ -5258,6 +5271,8 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       aadhaarPhotoKey: allocation.aadhaar_photo_key,
       accommodationCategory: allocation.accommodation_category,
       categorySource: allocation.category_source,
+      saiConnectId: allocation.sai_connect_id,
+      saiConnectAge: allocation.sai_connect_age,
       caretakerForAllocationId: allocation.caretaker_for_allocation_id,
     };
 
@@ -5572,7 +5587,9 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
       values.push(aadhaarPhotoKey);
     }
     if (accommodationCategory !== undefined) {
-      if (user?.role !== 'admin') {
+      try {
+        validateAccommodationCategoryEditPermission(user);
+      } catch {
         return res.status(403).json({ error: 'forbidden', message: 'Only an administrator can change accommodation category.' });
       }
       const nextCategory = validateAdminCategoryChange(accommodationCategory);
