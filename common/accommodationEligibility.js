@@ -108,6 +108,15 @@ export function validateCategoryAllowedInBlock({ accommodationCategory, allowedC
   );
 }
 
+export function validateSaiIdentityAvailable({ identifier, existingAllocationId, isCaretaker = false } = {}) {
+  if (isCaretaker || !identifier || !existingAllocationId) return;
+  fail(
+    'sai_connect_already_allocated',
+    'This Sai Connect identity is already allocated to another bed.',
+    'saiVerificationToken'
+  );
+}
+
 export function validateCaretakerTarget({ targetAllocation, blockId, hasCaretaker }) {
   if (!targetAllocation || targetAllocation.deleted_at) {
     fail('delegate_not_active', 'Select an active delegate in this block.', 'caretakerForAllocationId');

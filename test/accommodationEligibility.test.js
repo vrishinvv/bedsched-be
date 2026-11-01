@@ -9,6 +9,7 @@ import {
   validateAdminCategoryChange,
   validateCategoryAllowedInBlock,
   validateCaretakerTarget,
+  validateSaiIdentityAvailable,
 } from '../common/accommodationEligibility.js';
 
 test('a normal allocation requires completed Sai Connect lookup proof', () => {
@@ -52,6 +53,23 @@ test('a caretaker remains exempt from Sai Connect lookup', () => {
       verifiedCategories: [],
     }
   );
+});
+
+test('a Sai Connect identity can have only one active allocation while caretakers remain exempt', () => {
+  assert.throws(
+    () => validateSaiIdentityAvailable({
+      identifier: '239910',
+      existingAllocationId: 81,
+    }),
+    (error) => error instanceof AccommodationEligibilityError
+      && error.code === 'sai_connect_already_allocated'
+  );
+
+  assert.doesNotThrow(() => validateSaiIdentityAvailable({
+    identifier: null,
+    existingAllocationId: 81,
+    isCaretaker: true,
+  }));
 });
 
 test('an unverified person is allocated as a devotee by default', () => {

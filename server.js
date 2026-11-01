@@ -30,6 +30,7 @@ import {
   validateAdminCategoryChange,
   validateCategoryAllowedInBlock,
   validateCaretakerTarget,
+  validateSaiIdentityAvailable,
 } from './common/accommodationEligibility.js';
 import {
   SaiConnectError,
@@ -5103,6 +5104,28 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
         isCaretaker,
         lookupRequired: !block.allowed_categories.includes('devotee'),
       });
+      const verifiedSaiIdentifier = category.categorySource === 'sai_connect'
+        ? verification?.identifier
+        : null;
+      if (verifiedSaiIdentifier) {
+        await client.query(
+          'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+          [verifiedSaiIdentifier]
+        );
+        const existingIdentity = await client.query(`
+          SELECT id
+          FROM allocations
+          WHERE sai_lookup_identifier = $1
+            AND category_verified_at IS NOT NULL
+            AND deleted_at IS NULL
+          LIMIT 1
+        `, [verifiedSaiIdentifier]);
+        validateSaiIdentityAvailable({
+          identifier: verifiedSaiIdentifier,
+          existingAllocationId: existingIdentity.rows[0]?.id,
+          isCaretaker,
+        });
+      }
       if (!Number.isSafeInteger(bedNumber) || bedNumber < 1 || bedNumber > Number(block.size)) {
         throw new AccommodationEligibilityError('bed_out_of_range', 'Bed out of range.');
       }
@@ -5203,9 +5226,9 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
         category.accommodationCategory,
         category.categorySource,
         category.verifiedCategories,
-        verification ? new Date() : null,
-        verification && verification.identifier.length < 10 ? verification.identifier : null,
-        verification?.identifier || null,
+        verifiedSaiIdentifier ? new Date() : null,
+        verifiedSaiIdentifier && verifiedSaiIdentifier.length < 10 ? verifiedSaiIdentifier : null,
+        verifiedSaiIdentifier || null,
         delegateAllocationId,
       ]);
       return insertResult.rows[0];
@@ -5561,9 +5584,6 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
       values.push('manual');
       updates.push(`verified_categories = $${paramIndex++}`);
       values.push([]);
-      updates.push('category_verified_at = NULL');
-      updates.push('sai_connect_id = NULL');
-      updates.push('sai_lookup_identifier = NULL');
     }
 
     if (updates.length === 0) {
