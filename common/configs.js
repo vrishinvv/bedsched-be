@@ -16,7 +16,15 @@ function resolveSaiConnectEventIds(configuredDelegateEventId, configuredSevadalE
     };
 }
 
+function resolveRequireBookingPhotos(configuredValue, frontendUrl) {
+    if (configuredValue !== undefined && configuredValue !== null && String(configuredValue).trim() !== '') {
+        return String(configuredValue).trim().toLowerCase() === 'true';
+    }
+    return String(frontendUrl || '').replace(/\/$/, '') === 'https://sssenclave.vercel.app';
+}
+
 const nodeEnv = process.env.NODE_ENV || 'development';
+const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
 const saiConnectEventIds = resolveSaiConnectEventIds(
     process.env.SAI_CONNECT_DELEGATE_EVENT_ID,
     process.env.SAI_CONNECT_SEVADAL_EVENT_ID,
@@ -26,7 +34,7 @@ const config = {
     random: process.env.RANDOM || 10,
     port: process.env.PORT || 3001,
     databaseUrl: process.env.DATABASE_URL,
-    frontendUrl: process.env.FRONTEND_URL || 'http://localhost:3000',
+    frontendUrl,
     nodeEnv,
     reservationTTLHours: Number(process.env.RESERVATION_TTL_HOURS || 7),
     jwtSecret: resolveJwtSecret(nodeEnv, process.env.JWT_SECRET),
@@ -42,10 +50,12 @@ const config = {
     saiConnectBearerToken: process.env.SAI_CONNECT_BEARER_TOKEN,
     saiConnectDelegateEventId: saiConnectEventIds.delegateEventId,
     saiConnectSevadalEventId: saiConnectEventIds.sevadalEventId,
+    requireBookingPhotos: resolveRequireBookingPhotos(process.env.REQUIRE_BOOKING_PHOTOS, frontendUrl),
 }
 
 export {
     config,
     resolveJwtSecret,
+    resolveRequireBookingPhotos,
     resolveSaiConnectEventIds,
 }

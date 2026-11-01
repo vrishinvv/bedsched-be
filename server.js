@@ -40,6 +40,7 @@ import {
   validateGenderAllowedInBlock,
   validateSaiIdentityAvailable,
   validateSaiProfileEditPermission,
+  validateRequiredBookingPhotos,
 } from './common/accommodationEligibility.js';
 import {
   SaiConnectError,
@@ -786,6 +787,11 @@ app.post('/api/locations/:id/beds/:bedNumber/allocate', async (req, res) => {
     if (!name || !startDate || !endDate) {
       return res.status(400).json({ error: 'missing_required_fields' });
     }
+    validateRequiredBookingPhotos({
+      photosRequired: config.requireBookingPhotos,
+      personPhotoKey,
+      aadhaarPhotoKey,
+    });
 
     // Validate and normalize gender
     const validGenders = ['Male', 'Female', 'Other'];
@@ -847,6 +853,9 @@ app.post('/api/locations/:id/beds/:bedNumber/allocate', async (req, res) => {
     ]);
     res.json({ ok: true });
   } catch (e) {
+    if (e instanceof AccommodationEligibilityError) {
+      return handleAccommodationError(res, e, 'allocate_failed');
+    }
     console.error('[ALLOCATE ERROR]', {
       error: e.message,
       code: e.code,
@@ -5210,6 +5219,12 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       caretakerForAllocationId,
     } = req.body || {};
     const isCaretaker = caretakerForAllocationId !== undefined && caretakerForAllocationId !== null && caretakerForAllocationId !== '';
+    validateRequiredBookingPhotos({
+      photosRequired: config.requireBookingPhotos,
+      isCaretaker,
+      personPhotoKey,
+      aadhaarPhotoKey,
+    });
     if (!isCaretaker && (!startDate || !endDate)) {
       return res.status(400).json({ error: 'missing_required_fields' });
     }

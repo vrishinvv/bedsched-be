@@ -137,6 +137,22 @@ export function validateSaiProfileEditPermission({ user, current, updates } = {}
   }
 }
 
+export function validateRequiredBookingPhotos({
+  photosRequired = false,
+  isCaretaker = false,
+  personPhotoKey,
+  aadhaarPhotoKey,
+} = {}) {
+  if (!photosRequired || isCaretaker) return;
+  if (!String(personPhotoKey || '').trim() || !String(aadhaarPhotoKey || '').trim()) {
+    fail(
+      'booking_photos_required',
+      'Both a person photo and an identity photo are required for this booking.',
+      'photos'
+    );
+  }
+}
+
 export function resolveMandatoryLookupCategory({
   verification,
   requestedCategory,
