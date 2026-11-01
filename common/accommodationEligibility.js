@@ -37,6 +37,24 @@ export function resolveUnverifiedCategory() {
   };
 }
 
+export function resolveMandatoryLookupCategory({ verification, requestedCategory, isCaretaker = false } = {}) {
+  if (isCaretaker) return resolveUnverifiedCategory();
+  if (!verification) {
+    fail(
+      'sai_connect_lookup_required',
+      'Complete the Sai Connect lookup before allocating this bed.',
+      'saiVerificationToken'
+    );
+  }
+  if (!Array.isArray(verification.verifiedCategories) || verification.verifiedCategories.length === 0) {
+    return resolveUnverifiedCategory();
+  }
+  return resolveVerifiedCategory({
+    verifiedCategories: verification.verifiedCategories,
+    requestedCategory,
+  });
+}
+
 export function resolveVerifiedCategory({ verifiedCategories, requestedCategory } = {}) {
   const normalized = normalizeAccommodationCategories(verifiedCategories);
   const eligible = normalized.filter((category) => category !== 'devotee');

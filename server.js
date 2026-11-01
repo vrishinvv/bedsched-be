@@ -26,8 +26,7 @@ import {
 } from './common/structureManagement.js';
 import {
   AccommodationEligibilityError,
-  resolveUnverifiedCategory,
-  resolveVerifiedCategory,
+  resolveMandatoryLookupCategory,
   validateAdminCategoryChange,
   validateCategoryAllowedInBlock,
   validateCaretakerTarget,
@@ -207,6 +206,7 @@ app.post('/api/sai-connect/lookup', async (req, res) => {
         outcome: result.outcome,
         message: result.message,
         defaultCategory: 'devotee',
+        verificationToken: createSaiVerificationToken(result, config.jwtSecret),
       });
     }
 
@@ -5084,12 +5084,11 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
     const verification = saiVerificationToken
       ? verifySaiVerificationToken(saiVerificationToken, config.jwtSecret)
       : null;
-    const category = verification
-      ? resolveVerifiedCategory({
-          verifiedCategories: verification.verifiedCategories,
-          requestedCategory: accommodationCategory,
-        })
-      : resolveUnverifiedCategory();
+    const category = resolveMandatoryLookupCategory({
+      verification,
+      requestedCategory: accommodationCategory,
+      isCaretaker,
+    });
 
     const allocation = await withTransaction(async (client) => {
       const blockResult = await client.query(`

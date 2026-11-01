@@ -108,3 +108,19 @@ test('issues a short-lived signed verification token that preserves both categor
   });
   assert.throws(() => verifySaiVerificationToken(`${token}tampered`, secret), /Invalid Sai Connect verification/);
 });
+
+test('issues lookup proof when Sai Connect finds no registration', () => {
+  const secret = 'test-secret-that-is-long-and-random-enough-for-hmac';
+  const token = createSaiVerificationToken({
+    outcome: 'not_registered',
+    identifier: '999999',
+    verifiedCategories: [],
+  }, secret);
+
+  assert.deepEqual(verifySaiVerificationToken(token, secret), {
+    outcome: 'not_registered',
+    identifier: '999999',
+    fullName: '',
+    verifiedCategories: [],
+  });
+});

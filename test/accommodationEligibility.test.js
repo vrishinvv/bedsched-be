@@ -3,12 +3,45 @@ import test from 'node:test';
 
 import {
   AccommodationEligibilityError,
+  resolveMandatoryLookupCategory,
   resolveVerifiedCategory,
   resolveUnverifiedCategory,
   validateAdminCategoryChange,
   validateCategoryAllowedInBlock,
   validateCaretakerTarget,
 } from '../common/accommodationEligibility.js';
+
+test('a normal allocation requires completed Sai Connect lookup proof', () => {
+  assert.throws(
+    () => resolveMandatoryLookupCategory({ verification: null }),
+    (error) => error instanceof AccommodationEligibilityError
+      && error.code === 'sai_connect_lookup_required'
+  );
+});
+
+test('a completed lookup without registration resolves to Devotee', () => {
+  assert.deepEqual(
+    resolveMandatoryLookupCategory({
+      verification: { outcome: 'not_registered', verifiedCategories: [] },
+    }),
+    {
+      accommodationCategory: 'devotee',
+      categorySource: 'default',
+      verifiedCategories: [],
+    }
+  );
+});
+
+test('a caretaker remains exempt from Sai Connect lookup', () => {
+  assert.deepEqual(
+    resolveMandatoryLookupCategory({ verification: null, isCaretaker: true }),
+    {
+      accommodationCategory: 'devotee',
+      categorySource: 'default',
+      verifiedCategories: [],
+    }
+  );
+});
 
 test('an unverified person is allocated as a devotee by default', () => {
   assert.deepEqual(resolveUnverifiedCategory(), {

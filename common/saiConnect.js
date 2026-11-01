@@ -143,6 +143,7 @@ export async function lookupSaiConnectMember({
 export function createSaiVerificationToken(result, secret) {
   return jwt.sign({
     type: 'sai_connect_verification',
+    outcome: result.outcome,
     identifier: result.identifier,
     fullName: result.fullName,
     verifiedCategories: result.verifiedCategories,
@@ -162,7 +163,11 @@ export function verifySaiVerificationToken(token, secret) {
       issuer: TOKEN_ISSUER,
     });
     if (payload.type !== 'sai_connect_verification') throw new Error('wrong token type');
+    const outcome = ['matched', 'not_registered', 'not_approved', 'invalid', 'error'].includes(payload.outcome)
+      ? payload.outcome
+      : undefined;
     return {
+      ...(outcome ? { outcome } : {}),
       identifier: String(payload.identifier),
       fullName: String(payload.fullName || ''),
       verifiedCategories: ACCOMMODATION_CATEGORIES.filter((category) => (
