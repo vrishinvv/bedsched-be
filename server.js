@@ -712,11 +712,6 @@ app.post('/api/locations/:id/beds/:bedNumber/allocate', async (req, res) => {
       return res.status(400).json({ error: 'missing_required_fields' });
     }
 
-    // Validate photos are provided
-    if (!personPhotoKey || !aadhaarPhotoKey) {
-      return res.status(400).json({ error: 'photos_required', message: 'Both person and Aadhaar photos are required' });
-    }
-
     // Validate and normalize gender
     const validGenders = ['Male', 'Female', 'Other'];
     const normalizedGender = gender && gender.trim() && validGenders.includes(gender.trim()) 
@@ -5077,10 +5072,6 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
     const isCaretaker = caretakerForAllocationId !== undefined && caretakerForAllocationId !== null && caretakerForAllocationId !== '';
     if (!String(name || '').trim() || (!isCaretaker && (!startDate || !endDate))) {
       return res.status(400).json({ error: 'missing_required_fields' });
-    }
-
-    if (!isCaretaker && (!personPhotoKey || !aadhaarPhotoKey)) {
-      return res.status(400).json({ error: 'photos_required', message: 'Both person and Identity photos are required' });
     }
 
     if (!isCaretaker && new Date(startDate) > new Date(endDate)) {
