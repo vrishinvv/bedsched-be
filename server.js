@@ -26,6 +26,7 @@ import {
 } from './common/structureManagement.js';
 import {
   AccommodationEligibilityError,
+  formatExistingAllocationAddress,
   resolveAllocationGender,
   resolveMandatoryLookupCategory,
   validateAccommodationCategoryEditPermission,
@@ -61,6 +62,47 @@ import { generateUploadUrl, generateViewUrl } from './common/s3.js';
 import { validateLinkedReallocationTarget } from './common/reallocationEligibility.js';
 
 const app = express();
+
+const existingSaiAllocationSelect = `
+  SELECT
+    a.id,
+    a.location_id,
+    a.bed_number,
+    l.name AS location_name,
+    t.tent_index,
+    t.name AS tent_name,
+    b.block_index,
+    b.name AS block_name
+  FROM allocations a
+  JOIN locations l ON l.id = a.location_id
+  JOIN tents t ON t.id = a.tent_id
+  JOIN blocks b ON b.id = a.block_id
+  WHERE (a.sai_connect_id = $1 OR a.sai_lookup_identifier = $2)
+    AND a.category_verified_at IS NOT NULL
+    AND a.deleted_at IS NULL
+`;
+
+async function findExistingSaiAllocation(query, saiConnectId, lookupIdentifier, { forUpdate = false } = {}) {
+  if (!saiConnectId && !lookupIdentifier) return null;
+  const result = await query(
+    `${existingSaiAllocationSelect} LIMIT 1${forUpdate ? ' FOR UPDATE OF a' : ''}`,
+    [saiConnectId || null, lookupIdentifier || null]
+  );
+  return result.rows[0] || null;
+}
+
+function presentExistingSaiAllocation(allocation) {
+  if (!allocation) return null;
+  return {
+    locationId: Number(allocation.location_id),
+    locationName: allocation.location_name,
+    tentIndex: Number(allocation.tent_index),
+    tentName: allocation.tent_name || `Tent ${allocation.tent_index}`,
+    blockIndex: Number(allocation.block_index),
+    blockName: allocation.block_name || `Block ${allocation.block_index}`,
+    bedNumber: Number(allocation.bed_number),
+  };
+}
 
 class StructureRequestError extends Error {
   constructor(status, code, message, details = {}) {
@@ -216,6 +258,18 @@ app.post('/api/sai-connect/lookup', async (req, res) => {
       });
     }
 
+    const existingAllocation = await findExistingSaiAllocation(
+      execQuery,
+      result.saiConnectId,
+      result.identifier || identifier
+    );
+    const existingAllocationAddress = formatExistingAllocationAddress(existingAllocation);
+    const allocationConflictMessage = existingAllocation
+      ? existingAllocationAddress
+        ? `This Sai Connect ID is already booked at ${existingAllocationAddress}.`
+        : 'This Sai Connect ID is already booked.'
+      : null;
+
     return res.json({
       matched: true,
       saiConnectId: result.saiConnectId,
@@ -225,6 +279,8 @@ app.post('/api/sai-connect/lookup', async (req, res) => {
       gender: result.gender,
       verifiedCategories: result.verifiedCategories,
       registrations: result.registrations,
+      existingAllocation: presentExistingSaiAllocation(existingAllocation),
+      allocationConflictMessage,
       verificationToken: createSaiVerificationToken(result, config.jwtSecret),
     });
   } catch (error) {
@@ -5139,18 +5195,15 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
           'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
           [saiIdentityLockKey]
         );
-        const existingIdentity = await client.query(`
-          SELECT id
-          FROM allocations
-          WHERE (sai_connect_id = $1 OR sai_lookup_identifier = $2)
-            AND category_verified_at IS NOT NULL
-            AND deleted_at IS NULL
-          LIMIT 1
-        `, [verifiedSaiConnectId, verifiedSaiLookupIdentifier]);
+        const existingIdentity = await findExistingSaiAllocation(
+          client.query.bind(client),
+          verifiedSaiConnectId,
+          verifiedSaiLookupIdentifier,
+          { forUpdate: true }
+        );
         validateSaiIdentityAvailable({
           identifier: saiIdentityLockKey,
-          existingAllocationId: existingIdentity.rows[0]?.id,
-          isCaretaker,
+          existingAllocation: existingIdentity,
         });
       }
       if (!Number.isSafeInteger(bedNumber) || bedNumber < 1 || bedNumber > Number(block.size)) {

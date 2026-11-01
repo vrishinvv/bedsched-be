@@ -107,6 +107,12 @@ CREATE INDEX IF NOT EXISTS idx_allocations_end_date ON allocations(end_date);
 CREATE INDEX IF NOT EXISTS idx_allocations_status_expiry ON allocations(status, reserved_expires_at);
 CREATE INDEX IF NOT EXISTS idx_allocations_batch_id ON allocations(batch_id);
 CREATE INDEX IF NOT EXISTS idx_allocations_phone ON allocations(phone);
+CREATE INDEX IF NOT EXISTS idx_allocations_active_sai_connect_id
+  ON allocations(sai_connect_id)
+  WHERE sai_connect_id IS NOT NULL AND category_verified_at IS NOT NULL AND deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_allocations_active_sai_lookup_identifier
+  ON allocations(sai_lookup_identifier)
+  WHERE sai_lookup_identifier IS NOT NULL AND category_verified_at IS NOT NULL AND deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_allocations_caretaker_for ON allocations(caretaker_for_allocation_id) WHERE caretaker_for_allocation_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_allocations_one_active_caretaker ON allocations(caretaker_for_allocation_id) WHERE caretaker_for_allocation_id IS NOT NULL AND deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS idx_tents_location_index ON tents(location_id, tent_index); -- Fast tent lookup

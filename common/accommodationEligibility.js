@@ -70,7 +70,7 @@ export function resolveMandatoryLookupCategory({
   isCaretaker = false,
   lookupRequired = true,
 } = {}) {
-  if (isCaretaker) return resolveUnverifiedCategory();
+  if (isCaretaker && !verification) return resolveUnverifiedCategory();
   if (!verification) {
     if (!lookupRequired) return resolveUnverifiedCategory();
     fail(
@@ -141,11 +141,28 @@ export function validateCategoryAllowedInBlock({ accommodationCategory, allowedC
   );
 }
 
-export function validateSaiIdentityAvailable({ identifier, existingAllocationId, isCaretaker = false } = {}) {
-  if (isCaretaker || !identifier || !existingAllocationId) return;
+export function formatExistingAllocationAddress(allocation) {
+  if (!allocation) return '';
+  const locationId = allocation.locationId ?? allocation.location_id;
+  const tentIndex = allocation.tentIndex ?? allocation.tent_index;
+  const blockIndex = allocation.blockIndex ?? allocation.block_index;
+  const location = allocation.locationName || allocation.location_name || (locationId != null ? `Location ${locationId}` : '');
+  const tent = allocation.tentName || allocation.tent_name || (tentIndex != null ? `Tent ${tentIndex}` : '');
+  const block = allocation.blockName || allocation.block_name || (blockIndex != null ? `Block ${blockIndex}` : '');
+  const bed = allocation.bedNumber ?? allocation.bed_number;
+  if (!location || !tent || !block || bed == null) return '';
+  return `${location} / ${tent} / ${block} / Bed ${bed}`;
+}
+
+export function validateSaiIdentityAvailable({ identifier, existingAllocation, existingAllocationId } = {}) {
+  const allocation = existingAllocation || (existingAllocationId ? { id: existingAllocationId } : null);
+  if (!identifier || !allocation) return;
+  const address = formatExistingAllocationAddress(allocation);
   fail(
     'sai_connect_already_allocated',
-    'This Sai Connect identity is already allocated to another bed.',
+    address
+      ? `This Sai Connect ID is already booked at ${address}.`
+      : 'This Sai Connect ID is already booked.',
     'saiVerificationToken'
   );
 }

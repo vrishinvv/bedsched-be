@@ -74,7 +74,7 @@ test('a completed lookup without registration resolves to Devotee', () => {
   );
 });
 
-test('a caretaker remains exempt from Sai Connect lookup', () => {
+test('a caretaker may skip Sai Connect, but verified caretaker categories are preserved', () => {
   assert.deepEqual(
     resolveMandatoryLookupCategory({ verification: null, isCaretaker: true }),
     {
@@ -83,23 +83,49 @@ test('a caretaker remains exempt from Sai Connect lookup', () => {
       verifiedCategories: [],
     }
   );
+
+  assert.deepEqual(
+    resolveMandatoryLookupCategory({
+      verification: { verifiedCategories: ['sevadal'] },
+      requestedCategory: 'sevadal',
+      isCaretaker: true,
+    }),
+    {
+      accommodationCategory: 'sevadal',
+      categorySource: 'sai_connect',
+      verifiedCategories: ['sevadal'],
+    }
+  );
 });
 
-test('a Sai Connect identity can have only one active allocation while caretakers remain exempt', () => {
+test('a verified Sai Connect identity can have only one active allocation, including caretakers', () => {
+  assert.throws(
+    () => validateSaiIdentityAvailable({
+      identifier: '239910',
+      existingAllocation: {
+        id: 81,
+        location_name: 'Anand Vilas Enclave',
+        tent_name: 'Tent A',
+        block_name: 'Block 1',
+        bed_number: 25,
+      },
+    }),
+    (error) => error instanceof AccommodationEligibilityError
+      && error.code === 'sai_connect_already_allocated'
+      && error.message === 'This Sai Connect ID is already booked at Anand Vilas Enclave / Tent A / Block 1 / Bed 25.'
+  );
+
   assert.throws(
     () => validateSaiIdentityAvailable({
       identifier: '239910',
       existingAllocationId: 81,
+      isCaretaker: true,
     }),
     (error) => error instanceof AccommodationEligibilityError
       && error.code === 'sai_connect_already_allocated'
   );
 
-  assert.doesNotThrow(() => validateSaiIdentityAvailable({
-    identifier: null,
-    existingAllocationId: 81,
-    isCaretaker: true,
-  }));
+  assert.doesNotThrow(() => validateSaiIdentityAvailable({ identifier: null, existingAllocationId: 81 }));
 });
 
 test('a Sai Connect identity cannot be attached to a bulk booking', () => {
