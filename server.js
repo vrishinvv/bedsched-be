@@ -1052,7 +1052,7 @@ app.get('/api/allocations/table-view', async (req, res) => {
 
     // Search filter
     if (search) {
-      whereConditions.push(`(LOWER(a.name) LIKE $${paramCounter} OR a.phone LIKE $${paramCounter})`);
+      whereConditions.push(`(LOWER(a.name) LIKE $${paramCounter} OR a.phone LIKE $${paramCounter} OR a.sai_connect_id LIKE $${paramCounter})`);
       params.push(`%${search.toLowerCase()}%`);
       paramCounter++;
     }
@@ -1876,7 +1876,7 @@ app.post('/api/allocations/send-csv', async (req, res) => {
     let paramCounter = 1;
 
     if (search) {
-      whereConditions.push(`(LOWER(a.name) LIKE $${paramCounter} OR a.phone LIKE $${paramCounter})`);
+      whereConditions.push(`(LOWER(a.name) LIKE $${paramCounter} OR a.phone LIKE $${paramCounter} OR a.sai_connect_id LIKE $${paramCounter})`);
       params.push(`%${search.toLowerCase()}%`);
       paramCounter++;
     }
@@ -1979,6 +1979,11 @@ app.post('/api/allocations/send-csv', async (req, res) => {
         a.name,
         a.phone,
         a.gender,
+        a.accommodation_category,
+        a.category_source,
+        a.verified_categories,
+        a.sai_connect_id,
+        a.sai_connect_age,
         a.start_date,
         a.end_date,
         a.created_at,
@@ -2032,11 +2037,12 @@ app.post('/api/allocations/send-csv', async (req, res) => {
 
     // Generate CSV with human-friendly headers and prefer name fields for location/tent/block
     const columns = [
-      'id', 'name', 'phone', 'gender', 'location_name', 'tent_name', 'block_name', 'bed_number',
+      'id', 'name', 'phone', 'gender', 'accommodation_category', 'sai_connect_id', 'sai_connect_age',
+      'location_name', 'tent_name', 'block_name', 'bed_number',
       'start_date', 'end_date', 'created_at', 'updated_at', 'allocated_by', 'deleted_at', 'reason'
     ];
 
-    const headerLabels = ['ID','Name','Phone','Gender','Location','Tent','Block','Bed','Start Date','End Date','Created At','Updated At','Allocated By','Deleted At','Reason'];
+    const headerLabels = ['ID','Name','Phone','Gender','Category','Sai Connect ID','Sai Connect Age','Location','Tent','Block','Bed','Start Date','End Date','Created At','Updated At','Allocated By','Deleted At','Reason'];
     const headers = headerLabels.join(',');
 
     const csvRows = dataResult.rows.map(row => {
@@ -2160,6 +2166,11 @@ app.get('/api/allocations/historical-deallocations', async (req, res) => {
         a.name,
         a.phone,
         a.gender,
+        a.accommodation_category,
+        a.category_source,
+        a.verified_categories,
+        a.sai_connect_id,
+        a.sai_connect_age,
         a.start_date,
         a.end_date,
         a.bed_number,
@@ -2197,6 +2208,11 @@ app.get('/api/allocations/historical-deallocations', async (req, res) => {
         a.name,
         a.phone,
         a.gender,
+        a.accommodation_category,
+        a.category_source,
+        a.verified_categories,
+        a.sai_connect_id,
+        a.sai_connect_age,
         a.start_date,
         a.end_date,
         a.bed_number,
@@ -2291,6 +2307,11 @@ app.post('/api/allocations/historical-deallocations/send-csv', async (req, res) 
         a.name,
         a.phone,
         a.gender,
+        a.accommodation_category,
+        a.category_source,
+        a.verified_categories,
+        a.sai_connect_id,
+        a.sai_connect_age,
         a.start_date,
         a.end_date,
         a.bed_number,
@@ -2327,6 +2348,11 @@ app.post('/api/allocations/historical-deallocations/send-csv', async (req, res) 
         a.name,
         a.phone,
         a.gender,
+        a.accommodation_category,
+        a.category_source,
+        a.verified_categories,
+        a.sai_connect_id,
+        a.sai_connect_age,
         a.start_date,
         a.end_date,
         a.bed_number,
@@ -2354,13 +2380,16 @@ app.post('/api/allocations/historical-deallocations/send-csv', async (req, res) 
     
     // Add expired allocations section
     csvRows.push(`"Section","Expired Allocations on ${previousDateStr}"`);
-    csvRows.push('"ID","Name","Phone","Gender","Location","Tent","Block","Bed","Start Date","End Date"');
+    csvRows.push('"ID","Name","Phone","Gender","Category","Sai Connect ID","Sai Connect Age","Location","Tent","Block","Bed","Start Date","End Date"');
     expiredResult.rows.forEach(row => {
       csvRows.push([
         row.id,
         row.name || '',
         row.phone || '',
         row.gender || '',
+        row.accommodation_category || 'devotee',
+        row.sai_connect_id || '',
+        row.sai_connect_age ?? '',
         row.location_name || '',
         row.tent_name || `Tent ${row.tent_index}`,
         row.block_name || `Block ${row.block_index}`,
@@ -2374,13 +2403,16 @@ app.post('/api/allocations/historical-deallocations/send-csv', async (req, res) 
 
     // Add manual deallocations section
     csvRows.push(`"Section","Manual Deallocations on ${date}"`);
-    csvRows.push('"ID","Name","Phone","Gender","Location","Tent","Block","Bed","Start Date","End Date","Deallocated At","Reason","Deallocated By"');
+    csvRows.push('"ID","Name","Phone","Gender","Category","Sai Connect ID","Sai Connect Age","Location","Tent","Block","Bed","Start Date","End Date","Deallocated At","Reason","Deallocated By"');
     manualResult.rows.forEach(row => {
       csvRows.push([
         row.id,
         row.name || '',
         row.phone || '',
         row.gender || '',
+        row.accommodation_category || 'devotee',
+        row.sai_connect_id || '',
+        row.sai_connect_age ?? '',
         row.location_name || '',
         row.tent_name || `Tent ${row.tent_index}`,
         row.block_name || `Block ${row.block_index}`,
@@ -3924,9 +3956,8 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
   }
 });
 
-// GET /api/allocations/by-phone/:phone - Search allocations by phone number (MUST be before query-based route)
+// GET /api/allocations/by-phone/:phone - Search allocations by phone number or Sai Connect ID (MUST be before query-based route)
 app.get('/api/allocations/by-phone/:phone', async (req, res) => {
-  console.log('HIT: /api/allocations/by-phone/:phone with phone =', req.params.phone);
   try {
     const user = getUserFromRequest(req);
     if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
@@ -3969,7 +4000,7 @@ app.get('/api/allocations/by-phone/:phone', async (req, res) => {
       JOIN locations l ON l.id = a.location_id
       LEFT JOIN tents t ON t.location_id = a.location_id AND t.tent_index = a.tent_index
       LEFT JOIN blocks b ON b.tent_id = a.tent_id AND b.block_index = a.block_index
-      WHERE a.phone = $1
+      WHERE (a.phone = $1 OR a.sai_connect_id = $1)
         ${locationScope}
         AND a.end_date >= ${todaySQL}
       ORDER BY a.created_at DESC
@@ -4002,7 +4033,7 @@ app.get('/api/allocations/by-phone/:phone', async (req, res) => {
 
 async function findPhoneAllocationTargets({ phone, batchId, allocationIds, user }) {
   const params = [phone];
-  const conditions = ['phone = $1', 'deleted_at IS NULL'];
+  const conditions = ['(phone = $1 OR sai_connect_id = $1)', 'deleted_at IS NULL'];
   if (batchId) {
     conditions.push(`batch_id = $${params.push(batchId)}`);
   }
@@ -4040,7 +4071,7 @@ app.get('/api/allocations/by-phone', async (req, res) => {
              bed_number, name, phone, gender, start_date, end_date, emergency_phone,
              accommodation_category, category_source, verified_categories, sai_connect_id, sai_connect_age
       FROM allocations
-      WHERE phone = $1 AND deleted_at IS NULL
+      WHERE (phone = $1 OR sai_connect_id = $1) AND deleted_at IS NULL
         ${locationScope}
       ORDER BY batch_id NULLS LAST, created_at DESC
     `, params);
