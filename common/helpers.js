@@ -378,7 +378,8 @@ export async function getBlockDetail(locationId, tentIndex, blockIndex) {
       a.sai_connect_id,
       a.sai_connect_age,
       a.caretaker_for_allocation_id,
-      delegate.name AS caretaker_for_name
+      delegate.name AS caretaker_for_name,
+      delegate.bed_number AS caretaker_for_bed_number
     FROM allocations a
     LEFT JOIN allocations delegate ON delegate.id = a.caretaker_for_allocation_id
     WHERE a.block_id = $1

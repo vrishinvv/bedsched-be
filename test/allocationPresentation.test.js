@@ -22,6 +22,7 @@ test('occupied-bed data exposes the saved Sai Connect profile as read-only displ
     sai_connect_age: 35,
     caretaker_for_allocation_id: null,
     caretaker_for_name: null,
+    caretaker_for_bed_number: null,
   }), {
     id: 101,
     name: 'Verified Delegate',
@@ -40,5 +41,24 @@ test('occupied-bed data exposes the saved Sai Connect profile as read-only displ
     saiConnectAge: 35,
     caretakerForAllocationId: null,
     caretakerForName: null,
+    caretakerForBedNumber: null,
   });
+});
+
+test('caretaker bed details include the linked Delegate name and bed number', () => {
+  const bedData = mapAllocationRowToBedData({
+    id: 202,
+    name: 'Delegate Caretaker',
+    gender: 'Male',
+    start_date_str: '2026-11-05',
+    end_date_str: '2026-11-24',
+    status: 'confirmed',
+    caretaker_for_allocation_id: 101,
+    caretaker_for_name: 'Verified Delegate',
+    caretaker_for_bed_number: 7,
+  });
+
+  assert.equal(bedData.caretakerForAllocationId, 101);
+  assert.equal(bedData.caretakerForName, 'Verified Delegate');
+  assert.equal(bedData.caretakerForBedNumber, 7);
 });

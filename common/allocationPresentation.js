@@ -17,5 +17,6 @@ export function mapAllocationRowToBedData(row) {
     saiConnectAge: row.sai_connect_age == null ? null : Number(row.sai_connect_age),
     caretakerForAllocationId: row.caretaker_for_allocation_id ? Number(row.caretaker_for_allocation_id) : null,
     caretakerForName: row.caretaker_for_name || null,
+    caretakerForBedNumber: row.caretaker_for_bed_number == null ? null : Number(row.caretaker_for_bed_number),
   };
 }
