@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   AccommodationEligibilityError,
+  canAccessAllocationLocation,
   resolveMandatoryLookupCategory,
   resolveAllocationGender,
   resolveSaiIdentityPersistence,
@@ -18,6 +19,14 @@ import {
   validateSaiIdentityAvailable,
   validateSaiProfileEditPermission,
 } from '../common/accommodationEligibility.js';
+
+test('allocation access is limited to an administrator or the assigned location', () => {
+  assert.equal(canAccessAllocationLocation({ role: 'admin' }, 61), true);
+  assert.equal(canAccessAllocationLocation({ role: 'location_user', locationId: 61 }, 61), true);
+  assert.equal(canAccessAllocationLocation({ role: 'location_user', locationId: 19 }, 61), false);
+  assert.equal(canAccessAllocationLocation({ role: 'dashboard' }, 61), false);
+  assert.equal(canAccessAllocationLocation(null, 61), false);
+});
 
 test('Sai-verified gender is authoritative for an allocation', () => {
   assert.equal(resolveAllocationGender({

@@ -26,6 +26,7 @@ import {
 } from './common/structureManagement.js';
 import {
   AccommodationEligibilityError,
+  canAccessAllocationLocation,
   formatExistingAllocationAddress,
   resolveAllocationGender,
   resolveMandatoryLookupCategory,
@@ -1159,6 +1160,11 @@ app.get('/api/allocations/table-view', async (req, res) => {
         a.name,
         a.phone,
         a.gender,
+        a.accommodation_category,
+        a.category_source,
+        a.verified_categories,
+        a.sai_connect_id,
+        a.sai_connect_age,
         a.start_date,
         a.end_date,
         a.created_at,
@@ -3902,9 +3908,13 @@ app.get('/api/allocations/by-phone/:phone', async (req, res) => {
   console.log('HIT: /api/allocations/by-phone/:phone with phone =', req.params.phone);
   try {
     const user = getUserFromRequest(req);
-    if (!user) return res.status(401).json({ error: 'unauthorized' });
+    if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
 
     const { phone } = req.params;
+    const searchParams = [phone];
+    const locationScope = user.role === 'location_user'
+      ? `AND a.location_id = $${searchParams.push(Number(user.locationId))}`
+      : '';
 
     const result = await execQuery(`
       SELECT 
@@ -3922,6 +3932,11 @@ app.get('/api/allocations/by-phone/:phone', async (req, res) => {
         TO_CHAR(a.start_date, 'YYYY-MM-DD') as start_date,
         TO_CHAR(a.end_date, 'YYYY-MM-DD') as end_date,
         a.status,
+        a.accommodation_category,
+        a.category_source,
+        a.verified_categories,
+        a.sai_connect_id,
+        a.sai_connect_age,
         a.person_photo_key,
         a.aadhaar_photo_key,
         a.deleted_at,
@@ -3934,9 +3949,10 @@ app.get('/api/allocations/by-phone/:phone', async (req, res) => {
       LEFT JOIN tents t ON t.location_id = a.location_id AND t.tent_index = a.tent_index
       LEFT JOIN blocks b ON b.tent_id = a.tent_id AND b.block_index = a.block_index
       WHERE a.phone = $1
+        ${locationScope}
         AND a.end_date >= ${todaySQL}
       ORDER BY a.created_at DESC
-    `, [phone]);
+    `, searchParams);
 
     // Generate pre-signed URLs for photos
     const allocations = await Promise.all(
@@ -3963,6 +3979,29 @@ app.get('/api/allocations/by-phone/:phone', async (req, res) => {
   }
 });
 
+async function findPhoneAllocationTargets({ phone, batchId, allocationIds, user }) {
+  const params = [phone];
+  const conditions = ['phone = $1', 'deleted_at IS NULL'];
+  if (batchId) {
+    conditions.push(`batch_id = $${params.push(batchId)}`);
+  }
+  if (Array.isArray(allocationIds) && allocationIds.length > 0) {
+    const ids = allocationIds.map(Number).filter(Number.isSafeInteger);
+    if (ids.length !== allocationIds.length) return [];
+    conditions.push(`id = ANY($${params.push(ids)}::bigint[])`);
+  }
+  if (user?.role === 'location_user') {
+    conditions.push(`location_id = $${params.push(Number(user.locationId))}`);
+  }
+  const result = await execQuery(`
+    SELECT id, name, phone, gender, location_id, category_source, verified_categories
+    FROM allocations
+    WHERE ${conditions.join(' AND ')}
+    ORDER BY id
+  `, params);
+  return result.rows;
+}
+
 // GET /api/allocations/by-phone?phone=...
 app.get('/api/allocations/by-phone', async (req, res) => {
   try {
@@ -3971,12 +4010,19 @@ app.get('/api/allocations/by-phone', async (req, res) => {
     const user = getUserFromRequest(req);
     if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
 
+    const params = [phone];
+    const locationScope = user.role === 'location_user'
+      ? `AND location_id = $${params.push(Number(user.locationId))}`
+      : '';
     const rows = await execQuery(`
-      SELECT id, batch_id, status, reserved_expires_at, location_id, tent_index, block_index, bed_number, gender, start_date, end_date, emergency_phone
+      SELECT id, batch_id, status, reserved_expires_at, location_id, tent_index, block_index,
+             bed_number, name, phone, gender, start_date, end_date, emergency_phone,
+             accommodation_category, category_source, verified_categories, sai_connect_id, sai_connect_age
       FROM allocations
       WHERE phone = $1 AND deleted_at IS NULL
+        ${locationScope}
       ORDER BY batch_id NULLS LAST, created_at DESC
-    `, [phone]);
+    `, params);
 
     const batches = {};
     for (const r of rows.rows) {
@@ -3984,7 +4030,11 @@ app.get('/api/allocations/by-phone', async (req, res) => {
       if (!batches[key]) batches[key] = { batchId: r.batch_id || null, items: [], statuses: new Set(), expiresAt: null };
       batches[key].items.push({
         id: Number(r.id), locationId: Number(r.location_id), tentIndex: Number(r.tent_index), blockIndex: Number(r.block_index), bedNumber: Number(r.bed_number),
-        gender: r.gender, status: r.status, startDate: r.start_date, endDate: r.end_date, emergencyPhone: r.emergency_phone
+        name: r.name, phone: r.phone, gender: r.gender, status: r.status,
+        startDate: r.start_date, endDate: r.end_date, emergencyPhone: r.emergency_phone,
+        accommodationCategory: r.accommodation_category, categorySource: r.category_source,
+        verifiedCategories: r.verified_categories || [], saiConnectId: r.sai_connect_id,
+        saiConnectAge: r.sai_connect_age == null ? null : Number(r.sai_connect_age),
       });
       batches[key].statuses.add(r.status);
       if (r.status === 'reserved' && r.reserved_expires_at && (!batches[key].expiresAt || batches[key].expiresAt < r.reserved_expires_at)) {
@@ -4014,19 +4064,18 @@ app.patch('/api/allocations/by-phone/update-phone', async (req, res) => {
     const { oldPhone, newPhone, batchId, allocationIds } = req.body || {};
     if (!oldPhone || !newPhone) return res.status(400).json({ error: 'missing_phone' });
 
-    const params = [oldPhone, newPhone];
-    let q = `UPDATE allocations SET phone = $2, updated_at = NOW() WHERE phone = $1 AND deleted_at IS NULL`;
-    if (batchId) { q += ` AND batch_id = $3`; params.push(batchId); }
-    if (Array.isArray(allocationIds) && allocationIds.length) {
-      const placeholders = allocationIds.map((_, i) => `$${params.length + i + 1}`).join(',');
-      q += ` AND id IN (${placeholders})`;
-      params.push(...allocationIds);
+    const targets = await findPhoneAllocationTargets({ phone: oldPhone, batchId, allocationIds, user });
+    for (const current of targets) {
+      validateSaiProfileEditPermission({ user, current, updates: { phone: newPhone } });
     }
-
-    const r = await execQuery(q, params);
+    const targetIds = targets.map((target) => Number(target.id));
+    const r = targetIds.length > 0
+      ? await execQuery('UPDATE allocations SET phone = $1, updated_at = NOW() WHERE id = ANY($2::bigint[])', [newPhone, targetIds])
+      : { rowCount: 0 };
     await logAudit(req, 'update_phone', 'allocation', null, { oldPhone, newPhone, batchId, allocationIds, updated: r.rowCount });
     res.json({ ok: true, updated: r.rowCount });
   } catch (e) {
+    if (e instanceof AccommodationEligibilityError) return handleAccommodationError(res, e, 'update_phone_failed');
     console.error(e);
     res.status(500).json({ error: 'update_phone_failed' });
   }
@@ -4041,19 +4090,18 @@ app.patch('/api/allocations/by-phone/update-name', async (req, res) => {
     const { phone, name, batchId, allocationIds } = req.body || {};
     if (!phone) return res.status(400).json({ error: 'missing_phone' });
 
-    const params = [name || null, phone];
-    let q = `UPDATE allocations SET name = $1, updated_at = NOW() WHERE phone = $2 AND deleted_at IS NULL`;
-    if (batchId) { q += ` AND batch_id = $3`; params.push(batchId); }
-    if (Array.isArray(allocationIds) && allocationIds.length) {
-      const placeholders = allocationIds.map((_, i) => `$${params.length + i + 1}`).join(',');
-      q += ` AND id IN (${placeholders})`;
-      params.push(...allocationIds);
+    const targets = await findPhoneAllocationTargets({ phone, batchId, allocationIds, user });
+    for (const current of targets) {
+      validateSaiProfileEditPermission({ user, current, updates: { name } });
     }
-
-    const r = await execQuery(q, params);
+    const targetIds = targets.map((target) => Number(target.id));
+    const r = targetIds.length > 0
+      ? await execQuery('UPDATE allocations SET name = $1, updated_at = NOW() WHERE id = ANY($2::bigint[])', [name || null, targetIds])
+      : { rowCount: 0 };
     await logAudit(req, 'update_name', 'allocation', null, { phone, name, batchId, allocationIds, updated: r.rowCount });
     res.json({ ok: true, updated: r.rowCount });
   } catch (e) {
+    if (e instanceof AccommodationEligibilityError) return handleAccommodationError(res, e, 'update_name_failed');
     console.error(e);
     res.status(500).json({ error: 'update_name_failed' });
   }
@@ -4068,16 +4116,11 @@ app.patch('/api/allocations/by-phone/update-emergency-phone', async (req, res) =
     const { phone, emergencyPhone, batchId, allocationIds } = req.body || {};
     if (!phone) return res.status(400).json({ error: 'missing_phone' });
 
-    const params = [emergencyPhone || null, phone];
-    let q = `UPDATE allocations SET emergency_phone = $1, updated_at = NOW() WHERE phone = $2 AND deleted_at IS NULL`;
-    if (batchId) { q += ` AND batch_id = $3`; params.push(batchId); }
-    if (Array.isArray(allocationIds) && allocationIds.length) {
-      const placeholders = allocationIds.map((_, i) => `$${params.length + i + 1}`).join(',');
-      q += ` AND id IN (${placeholders})`;
-      params.push(...allocationIds);
-    }
-
-    const r = await execQuery(q, params);
+    const targets = await findPhoneAllocationTargets({ phone, batchId, allocationIds, user });
+    const targetIds = targets.map((target) => Number(target.id));
+    const r = targetIds.length > 0
+      ? await execQuery('UPDATE allocations SET emergency_phone = $1, updated_at = NOW() WHERE id = ANY($2::bigint[])', [emergencyPhone || null, targetIds])
+      : { rowCount: 0 };
     await logAudit(req, 'update_emergency_phone', 'allocation', null, { phone, emergencyPhone, batchId, allocationIds, updated: r.rowCount });
     res.json({ ok: true, updated: r.rowCount });
   } catch (e) {
@@ -4095,15 +4138,11 @@ app.patch('/api/allocations/by-phone/update-end-date', async (req, res) => {
     const { phone, endDate, batchId, allocationIds } = req.body || {};
     if (!phone || !endDate) return res.status(400).json({ error: 'missing_fields' });
 
-    let base = `UPDATE allocations SET end_date = $1, updated_at = NOW() WHERE phone = $2 AND deleted_at IS NULL`;
-    const params = [endDate, phone];
-    if (batchId) { base += ` AND batch_id = $${params.push(batchId)}`; }
-    if (Array.isArray(allocationIds) && allocationIds.length) {
-      const placeholders = allocationIds.map((_, i) => `$${params.length + i + 1}`).join(',');
-      base += ` AND id IN (${placeholders})`;
-      params.push(...allocationIds);
-    }
-    const r = await execQuery(base, params);
+    const targets = await findPhoneAllocationTargets({ phone, batchId, allocationIds, user });
+    const targetIds = targets.map((target) => Number(target.id));
+    const r = targetIds.length > 0
+      ? await execQuery('UPDATE allocations SET end_date = $1, updated_at = NOW() WHERE id = ANY($2::bigint[])', [endDate, targetIds])
+      : { rowCount: 0 };
     await logAudit(req, 'update_end_date', 'allocation', null, { phone, endDate, batchId, allocationIds, updated: r.rowCount });
     res.json({ ok: true, updated: r.rowCount });
   } catch (e) {
@@ -4122,29 +4161,12 @@ app.post('/api/allocations/by-phone/deallocate', async (req, res) => {
     const { phone, batchId, allocationIds, reason } = req.body || {};
     if (!phone) return res.status(400).json({ error: 'missing_phone' });
 
-    // First, get the allocation IDs that will be deallocated
-    let selectBase = `SELECT id FROM allocations WHERE phone = $1 AND deleted_at IS NULL`;
-    const selectParams = [phone];
-    if (batchId) { 
-      selectBase += ` AND batch_id = $${selectParams.push(batchId)}`; 
-    }
-    if (Array.isArray(allocationIds) && allocationIds.length) {
-      const placeholders = allocationIds.map((_, i) => `$${selectParams.length + i + 1}`).join(',');
-      selectBase += ` AND id IN (${placeholders})`;
-      selectParams.push(...allocationIds);
-    }
-    const allocationsToDelete = await execQuery(selectBase, selectParams);
-
-    // Now perform the update
-    let base = `UPDATE allocations SET deleted_at = NOW(), updated_at = NOW() WHERE phone = $1 AND deleted_at IS NULL`;
-    const params = [phone];
-    if (batchId) { base += ` AND batch_id = $${params.push(batchId)}`; }
-    if (Array.isArray(allocationIds) && allocationIds.length) {
-      const placeholders = allocationIds.map((_, i) => `$${params.length + i + 1}`).join(',');
-      base += ` AND id IN (${placeholders})`;
-      params.push(...allocationIds);
-    }
-    const r = await execQuery(base, params);
+    const targets = await findPhoneAllocationTargets({ phone, batchId, allocationIds, user });
+    const targetIds = targets.map((target) => Number(target.id));
+    const allocationsToDelete = { rows: targets };
+    const r = targetIds.length > 0
+      ? await execQuery('UPDATE allocations SET deleted_at = NOW(), updated_at = NOW() WHERE id = ANY($1::bigint[])', [targetIds])
+      : { rowCount: 0 };
 
     // Create audit log entries for each deallocated allocation
     if (allocationsToDelete.rows.length > 0) {
@@ -4178,7 +4200,8 @@ app.get('/api/allocations/departures', async (req, res) => {
     const date = String(req.query.date || '').trim();
     if (!date) return res.status(400).json({ error: 'missing_date' });
 
-    const { page = 1, limit = 50, sortField = 'bed_number', sortOrder = 'asc', location_id = '', tent_index = '', block_index = '' } = req.query;
+    const { page = 1, limit = 50, sortField = 'bed_number', sortOrder = 'asc', location_id: requestedLocationId = '', tent_index = '', block_index = '' } = req.query;
+    const location_id = user.role === 'location_user' ? String(user.locationId) : requestedLocationId;
     const offset = (Number(page) - 1) * Number(limit);
     
     // Validate sortField to prevent SQL injection
@@ -4223,7 +4246,9 @@ app.get('/api/allocations/departures', async (req, res) => {
     const rows = await execQuery(`
       SELECT a.id, a.phone, a.name, a.location_id, l.name as location_name, 
              a.tent_index, t.name as tent_name, a.block_index, b.name as block_name, 
-             a.bed_number, a.gender, a.status, a.start_date, a.end_date
+             a.bed_number, a.gender, a.status, a.start_date, a.end_date,
+             a.accommodation_category, a.category_source, a.verified_categories,
+             a.sai_connect_id, a.sai_connect_age
       FROM allocations a
       LEFT JOIN locations l ON a.location_id = l.id
       LEFT JOIN tents t ON a.location_id = t.location_id AND a.tent_index = t.tent_index
@@ -4253,7 +4278,8 @@ app.post('/api/allocations/departures/send-csv', async (req, res) => {
     const user = getUserFromRequest(req);
     if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
 
-    const { email, date, sortField = 'bed_number', sortOrder = 'asc', location_id = '', tent_index = '', block_index = '' } = req.body;
+    const { email, date, sortField = 'bed_number', sortOrder = 'asc', location_id: requestedLocationId = '', tent_index = '', block_index = '' } = req.body;
+    const location_id = user.role === 'location_user' ? String(user.locationId) : requestedLocationId;
     
     if (!email || !email.includes('@')) {
       return res.status(400).json({ error: 'invalid_email', message: 'Valid email address is required' });
@@ -4308,6 +4334,9 @@ app.post('/api/allocations/departures/send-csv', async (req, res) => {
         a.status, 
         a.start_date, 
         a.end_date,
+        a.accommodation_category,
+        a.sai_connect_id,
+        a.sai_connect_age,
         a.created_at
       FROM allocations a
       LEFT JOIN locations l ON a.location_id = l.id
@@ -4322,7 +4351,7 @@ app.post('/api/allocations/departures/send-csv', async (req, res) => {
     // Generate CSV
     const columns = [
       'id', 'name', 'phone', 'gender', 'location_name', 'tent_name', 'block_name', 'bed_number',
-      'start_date', 'end_date', 'status', 'created_at'
+      'start_date', 'end_date', 'status', 'accommodation_category', 'sai_connect_id', 'sai_connect_age', 'created_at'
     ];
 
     const headers = columns.join(',');
@@ -4403,7 +4432,8 @@ app.get('/api/allocations/currently-occupied', async (req, res) => {
     const user = getUserFromRequest(req);
     if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
 
-    const { page = 1, limit = 50, sortField = 'bed_number', sortOrder = 'asc', location_id = '', tent_index = '', block_index = '' } = req.query;
+    const { page = 1, limit = 50, sortField = 'bed_number', sortOrder = 'asc', location_id: requestedLocationId = '', tent_index = '', block_index = '' } = req.query;
+    const location_id = user.role === 'location_user' ? String(user.locationId) : requestedLocationId;
     const offset = (Number(page) - 1) * Number(limit);
     
     // Validate sortField to prevent SQL injection
@@ -4453,7 +4483,9 @@ app.get('/api/allocations/currently-occupied', async (req, res) => {
     const rows = await execQuery(`
       SELECT a.id, a.phone, a.name, a.location_id, l.name as location_name, 
              a.tent_index, t.name as tent_name, a.block_index, b.name as block_name, 
-             a.bed_number, a.gender, a.status, a.start_date, a.end_date
+             a.bed_number, a.gender, a.status, a.start_date, a.end_date,
+             a.accommodation_category, a.category_source, a.verified_categories,
+             a.sai_connect_id, a.sai_connect_age
       FROM allocations a
       LEFT JOIN locations l ON a.location_id = l.id
       LEFT JOIN tents t ON a.location_id = t.location_id AND a.tent_index = t.tent_index
@@ -4483,7 +4515,8 @@ app.post('/api/allocations/currently-occupied/send-csv', async (req, res) => {
     const user = getUserFromRequest(req);
     if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
 
-    const { email, sortField = 'bed_number', sortOrder = 'asc', location_id = '', tent_index = '', block_index = '' } = req.body;
+    const { email, sortField = 'bed_number', sortOrder = 'asc', location_id: requestedLocationId = '', tent_index = '', block_index = '' } = req.body;
+    const location_id = user.role === 'location_user' ? String(user.locationId) : requestedLocationId;
     
     if (!email || !email.includes('@')) {
       return res.status(400).json({ error: 'invalid_email', message: 'Valid email address is required' });
@@ -4539,6 +4572,9 @@ app.post('/api/allocations/currently-occupied/send-csv', async (req, res) => {
         a.status, 
         a.start_date, 
         a.end_date,
+        a.accommodation_category,
+        a.sai_connect_id,
+        a.sai_connect_age,
         a.created_at
       FROM allocations a
       LEFT JOIN locations l ON a.location_id = l.id
@@ -4553,7 +4589,7 @@ app.post('/api/allocations/currently-occupied/send-csv', async (req, res) => {
     // Generate CSV
     const columns = [
       'id', 'name', 'phone', 'gender', 'location_name', 'tent_name', 'block_name', 'bed_number',
-      'start_date', 'end_date', 'status', 'created_at'
+      'start_date', 'end_date', 'status', 'accommodation_category', 'sai_connect_id', 'sai_connect_age', 'created_at'
     ];
 
     const headers = columns.join(',');
@@ -5037,7 +5073,7 @@ app.post('/api/photo-view-url', async (req, res) => {
 app.patch('/api/allocations/:id', async (req, res) => {
   try {
     const user = getUserFromRequest(req);
-    if (!user) return res.status(401).json({ error: 'unauthorized' });
+    if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
 
     const { id } = req.params;
     const { name, phone, emergencyPhone, gender, startDate, endDate, personPhotoKey, aadhaarPhotoKey } = req.body;
@@ -5053,6 +5089,15 @@ app.patch('/api/allocations/:id', async (req, res) => {
     }
 
     const current = existing.rows[0];
+    if (!canAccessAllocationLocation(user, current.location_id)) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+
+    validateSaiProfileEditPermission({
+      user,
+      current,
+      updates: { name, phone, gender },
+    });
 
     // If gender is being updated, validate gender restrictions
     if (gender !== undefined && gender !== current.gender) {
@@ -5129,6 +5174,9 @@ app.patch('/api/allocations/:id', async (req, res) => {
 
     res.json({ ok: true, allocation: result.rows[0] });
   } catch (e) {
+    if (e instanceof AccommodationEligibilityError) {
+      return handleAccommodationError(res, e, 'update_failed');
+    }
     console.error(e);
     res.status(500).json({ error: 'update_failed' });
   }

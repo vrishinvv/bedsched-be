@@ -1,5 +1,12 @@
 export const ACCOMMODATION_CATEGORIES = Object.freeze(['delegate', 'sevadal', 'devotee']);
 
+export function canAccessAllocationLocation(user, locationId) {
+  if (user?.role === 'admin') return true;
+  return user?.role === 'location_user'
+    && Number.isFinite(Number(user.locationId))
+    && Number(user.locationId) === Number(locationId);
+}
+
 export class AccommodationEligibilityError extends Error {
   constructor(code, message, field = 'accommodationCategory') {
     super(message);
