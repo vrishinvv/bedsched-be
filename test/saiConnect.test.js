@@ -3,6 +3,7 @@ import http from 'node:http';
 import test from 'node:test';
 
 import {
+  canPersistSaiConnectIdentity,
   createSaiVerificationToken,
   lookupSaiConnectMember,
   verifySaiVerificationToken,
@@ -93,25 +94,57 @@ test('treats a valid participant without requested registrations as not register
   assert.deepEqual(result, {
     outcome: 'not_registered',
     identifier: '427199',
+    saiConnectId: '427199',
     message: 'Participant not registered.',
   });
+});
+
+test('distinguishes valid unregistered identities from invalid or unapproved identifiers', async () => {
+  for (const [message, expectedOutcome] of [
+    ['Invalid Sai connect ID.', 'invalid'],
+    ['Sai Connect ID not approved.', 'not_approved'],
+  ]) {
+    const result = await withServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ status: 'error', data: null, message }));
+    }, (endpoint) => lookupSaiConnectMember({
+      endpoint,
+      bearerToken: 'test-token',
+      identifier: '427199',
+      eventCategoryMap,
+    }));
+
+    assert.deepEqual(result, {
+      outcome: expectedOutcome,
+      identifier: '427199',
+      message,
+    });
+    assert.equal(canPersistSaiConnectIdentity(result), false);
+  }
+
+  assert.equal(canPersistSaiConnectIdentity({ outcome: 'not_registered' }), true);
+  assert.equal(canPersistSaiConnectIdentity({ outcome: 'matched' }), true);
 });
 
 test('issues a short-lived signed verification token that preserves both categories', () => {
   const secret = 'test-secret-that-is-long-and-random-enough-for-hmac';
   const token = createSaiVerificationToken({
+    outcome: 'matched',
     identifier: '427199',
     saiConnectId: '427199',
     fullName: 'Ramesh Kumar',
+    mobileNo: '9876543210',
     age: 35,
     gender: 'Female',
     verifiedCategories: ['delegate', 'sevadal'],
   }, secret);
 
   assert.deepEqual(verifySaiVerificationToken(token, secret), {
+    outcome: 'matched',
     identifier: '427199',
     saiConnectId: '427199',
     fullName: 'Ramesh Kumar',
+    mobileNo: '9876543210',
     age: 35,
     gender: 'Female',
     verifiedCategories: ['delegate', 'sevadal'],

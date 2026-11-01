@@ -5,6 +5,8 @@ import {
   AccommodationEligibilityError,
   resolveMandatoryLookupCategory,
   resolveAllocationGender,
+  resolveSaiIdentityPersistence,
+  resolveSaiProfileForAllocation,
   resolveVerifiedCategory,
   resolveUnverifiedCategory,
   validateAdminCategoryChange,
@@ -14,6 +16,7 @@ import {
   validateCaretakerTarget,
   validateGenderAllowedInBlock,
   validateSaiIdentityAvailable,
+  validateSaiProfileEditPermission,
 } from '../common/accommodationEligibility.js';
 
 test('Sai-verified gender is authoritative for an allocation', () => {
@@ -72,6 +75,124 @@ test('a completed lookup without registration resolves to Devotee', () => {
       verifiedCategories: [],
     }
   );
+});
+
+test('persists only valid Sai Connect identities, including valid people with no event registration', () => {
+  assert.deepEqual(resolveSaiIdentityPersistence({
+    verification: {
+      outcome: 'not_registered',
+      identifier: '800717',
+      saiConnectId: '800717',
+    },
+    categorySource: 'default',
+  }), {
+    lookupIdentifier: '800717',
+    saiConnectId: '800717',
+    age: null,
+    verified: true,
+  });
+
+  assert.deepEqual(resolveSaiIdentityPersistence({
+    verification: { outcome: 'invalid', identifier: '123456' },
+    categorySource: 'default',
+  }), {
+    lookupIdentifier: null,
+    saiConnectId: null,
+    age: null,
+    verified: false,
+  });
+});
+
+test('Sai-sourced profile fields are authoritative for location users but editable by admins', () => {
+  const verification = {
+    outcome: 'matched',
+    fullName: 'Sai Name',
+    mobileNo: '9876543210',
+    gender: 'Female',
+    verifiedCategories: ['delegate'],
+  };
+
+  assert.deepEqual(resolveSaiProfileForAllocation({
+    user: { role: 'location_user' },
+    verification,
+    submittedName: 'Changed Name',
+    submittedPhone: '9999999999',
+    submittedGender: 'Male',
+  }), {
+    name: 'Sai Name',
+    phone: '9876543210',
+    verifiedGender: 'Female',
+  });
+
+  assert.deepEqual(resolveSaiProfileForAllocation({
+    user: { role: 'admin' },
+    verification,
+    submittedName: 'Changed Name',
+    submittedPhone: '9999999999',
+    submittedGender: 'Male',
+  }), {
+    name: 'Changed Name',
+    phone: '9999999999',
+    verifiedGender: null,
+  });
+});
+
+test('location users cannot change an existing Sai-sourced profile while admins can', () => {
+  assert.throws(
+    () => validateSaiProfileEditPermission({
+      user: { role: 'location_user' },
+      current: {
+        category_source: 'sai_connect',
+        name: 'Sai Name',
+        phone: '9876543210',
+        gender: 'Female',
+      },
+      updates: { name: 'Changed Name' },
+    }),
+    (error) => error instanceof AccommodationEligibilityError
+      && error.code === 'sai_profile_locked'
+  );
+
+  assert.doesNotThrow(() => validateSaiProfileEditPermission({
+    user: { role: 'location_user' },
+    current: {
+      category_source: 'sai_connect',
+      name: 'Sai Name',
+      phone: '9876543210',
+      gender: 'Female',
+    },
+    updates: { name: 'Sai Name', phone: '9876543210', gender: 'Female' },
+  }));
+
+  assert.doesNotThrow(() => validateSaiProfileEditPermission({
+    user: { role: 'admin' },
+    current: { category_source: 'sai_connect', name: 'Sai Name' },
+    updates: { name: 'Changed Name' },
+  }));
+
+  assert.throws(
+    () => validateSaiProfileEditPermission({
+      user: { role: 'location_user' },
+      current: {
+        category_source: 'manual',
+        verified_categories: ['delegate'],
+        name: 'Admin Adjusted Sai Name',
+      },
+      updates: { name: 'Location User Change' },
+    }),
+    (error) => error instanceof AccommodationEligibilityError
+      && error.code === 'sai_profile_locked'
+  );
+
+  assert.doesNotThrow(() => validateSaiProfileEditPermission({
+    user: { role: 'location_user' },
+    current: {
+      category_source: 'default',
+      verified_categories: [],
+      name: 'Valid Unregistered Devotee',
+    },
+    updates: { name: 'Corrected Devotee Name' },
+  }));
 });
 
 test('a caretaker may skip Sai Connect, but verified caretaker categories are preserved', () => {

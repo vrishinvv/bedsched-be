@@ -64,6 +64,72 @@ export function resolveUnverifiedCategory() {
   };
 }
 
+export function resolveSaiIdentityPersistence({ verification, categorySource } = {}) {
+  const verified = Boolean(verification) && (
+    categorySource === 'sai_connect'
+    || verification.outcome === 'matched'
+    || verification.outcome === 'not_registered'
+  );
+  if (!verified) {
+    return {
+      lookupIdentifier: null,
+      saiConnectId: null,
+      age: null,
+      verified: false,
+    };
+  }
+  return {
+    lookupIdentifier: String(verification.identifier || '').trim() || null,
+    saiConnectId: String(verification.saiConnectId || '').trim() || null,
+    age: Number.isInteger(verification.age) ? verification.age : null,
+    verified: true,
+  };
+}
+
+export function resolveSaiProfileForAllocation({
+  user,
+  verification,
+  submittedName,
+  submittedPhone,
+} = {}) {
+  const isMatched = verification?.outcome === 'matched'
+    || (Array.isArray(verification?.verifiedCategories) && verification.verifiedCategories.length > 0);
+  const mustUseVerifiedProfile = user?.role !== 'admin' && isMatched;
+  const verifiedPhone = /^\d{10}$/.test(String(verification?.mobileNo || ''))
+    ? String(verification.mobileNo)
+    : null;
+  return {
+    name: mustUseVerifiedProfile && String(verification?.fullName || '').trim()
+      ? String(verification.fullName).trim()
+      : String(submittedName || '').trim(),
+    phone: mustUseVerifiedProfile && verifiedPhone ? verifiedPhone : (submittedPhone || null),
+    verifiedGender: mustUseVerifiedProfile ? verification?.gender || null : null,
+  };
+}
+
+export function validateSaiProfileEditPermission({ user, current, updates } = {}) {
+  const hasVerifiedSaiProfile = current?.category_source === 'sai_connect'
+    || (Array.isArray(current?.verified_categories) && current.verified_categories.length > 0);
+  if (user?.role === 'admin' || !hasVerifiedSaiProfile) return;
+  const changed = (
+    updates?.name !== undefined
+    && String(updates.name || '').trim() !== String(current.name || '').trim()
+  ) || (
+    updates?.phone !== undefined
+    && String(updates.phone || '').trim() !== String(current.phone || '').trim()
+  ) || (
+    updates?.gender !== undefined
+    && normalizePersonGender(updates.gender) !== normalizePersonGender(current.gender)
+  );
+  if (changed) {
+    fail(
+      'sai_profile_locked',
+      'Sai Connect profile fields can only be changed by an administrator.',
+      'saiConnectId'
+    );
+  }
+}
+
 export function resolveMandatoryLookupCategory({
   verification,
   requestedCategory,

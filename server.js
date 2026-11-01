@@ -29,6 +29,8 @@ import {
   formatExistingAllocationAddress,
   resolveAllocationGender,
   resolveMandatoryLookupCategory,
+  resolveSaiIdentityPersistence,
+  resolveSaiProfileForAllocation,
   validateAccommodationCategoryEditPermission,
   validateAdminCategoryChange,
   validateBulkSaiIdentityAbsent,
@@ -36,9 +38,11 @@ import {
   validateCaretakerTarget,
   validateGenderAllowedInBlock,
   validateSaiIdentityAvailable,
+  validateSaiProfileEditPermission,
 } from './common/accommodationEligibility.js';
 import {
   SaiConnectError,
+  canPersistSaiConnectIdentity,
   createSaiVerificationToken,
   lookupSaiConnectMember,
   verifySaiVerificationToken,
@@ -249,12 +253,25 @@ app.post('/api/sai-connect/lookup', async (req, res) => {
     });
 
     if (result.outcome !== 'matched') {
+      const validIdentifier = canPersistSaiConnectIdentity(result);
+      const existingAllocation = validIdentifier
+        ? await findExistingSaiAllocation(execQuery, result.saiConnectId, result.identifier || identifier)
+        : null;
+      const existingAllocationAddress = formatExistingAllocationAddress(existingAllocation);
       return res.json({
         matched: false,
         outcome: result.outcome,
         message: result.message,
+        validIdentifier,
+        clearIdentifier: !validIdentifier,
         defaultCategory: 'devotee',
-        verificationToken: createSaiVerificationToken(result, config.jwtSecret),
+        existingAllocation: presentExistingSaiAllocation(existingAllocation),
+        allocationConflictMessage: existingAllocation
+          ? existingAllocationAddress
+            ? `This Sai Connect ID is already booked at ${existingAllocationAddress}.`
+            : 'This Sai Connect ID is already booked.'
+          : null,
+        ...(validIdentifier ? { verificationToken: createSaiVerificationToken(result, config.jwtSecret) } : {}),
       });
     }
 
@@ -5145,7 +5162,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       caretakerForAllocationId,
     } = req.body || {};
     const isCaretaker = caretakerForAllocationId !== undefined && caretakerForAllocationId !== null && caretakerForAllocationId !== '';
-    if (!String(name || '').trim() || (!isCaretaker && (!startDate || !endDate))) {
+    if (!isCaretaker && (!startDate || !endDate)) {
       return res.status(400).json({ error: 'missing_required_fields' });
     }
 
@@ -5156,9 +5173,18 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
     const verification = saiVerificationToken
       ? verifySaiVerificationToken(saiVerificationToken, config.jwtSecret)
       : null;
+    const saiProfile = resolveSaiProfileForAllocation({
+      user,
+      verification,
+      submittedName: name,
+      submittedPhone: phone,
+    });
+    if (!saiProfile.name) {
+      return res.status(400).json({ error: 'missing_required_fields' });
+    }
     const normalizedGender = resolveAllocationGender({
       submittedGender: gender,
-      verifiedGender: verification?.gender,
+      verifiedGender: saiProfile.verifiedGender,
       isCaretaker,
     });
 
@@ -5180,15 +5206,13 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
         isCaretaker,
         lookupRequired: !block.allowed_categories.includes('devotee'),
       });
-      const verifiedSaiLookupIdentifier = category.categorySource === 'sai_connect'
-        ? verification?.identifier
-        : null;
-      const verifiedSaiConnectId = category.categorySource === 'sai_connect'
-        ? verification?.saiConnectId || null
-        : null;
-      const verifiedSaiAge = category.categorySource === 'sai_connect'
-        ? verification?.age ?? null
-        : null;
+      const saiIdentity = resolveSaiIdentityPersistence({
+        verification,
+        categorySource: category.categorySource,
+      });
+      const verifiedSaiLookupIdentifier = saiIdentity.lookupIdentifier;
+      const verifiedSaiConnectId = saiIdentity.saiConnectId;
+      const verifiedSaiAge = saiIdentity.age;
       const saiIdentityLockKey = verifiedSaiConnectId || verifiedSaiLookupIdentifier;
       if (saiIdentityLockKey) {
         await client.query(
@@ -5290,8 +5314,8 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
         tentIndex,
         blockIndex,
         bedNumber,
-        String(name).trim(),
-        phone || verification?.mobileNo || null,
+        saiProfile.name,
+        saiProfile.phone,
         normalizedGender,
         effectiveStartDate,
         effectiveEndDate,
@@ -5301,7 +5325,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
         category.accommodationCategory,
         category.categorySource,
         category.verifiedCategories,
-        verifiedSaiLookupIdentifier ? new Date() : null,
+        saiIdentity.verified ? new Date() : null,
         verifiedSaiConnectId,
         verifiedSaiLookupIdentifier,
         verifiedSaiAge,
@@ -5599,6 +5623,12 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
       accommodationCategory,
     } = req.body || {};
 
+    validateSaiProfileEditPermission({
+      user,
+      current,
+      updates: { name, phone, gender },
+    });
+
     // Build dynamic UPDATE query
     const updates = [];
     const values = [];
@@ -5666,8 +5696,6 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
       values.push(nextCategory);
       updates.push(`category_source = $${paramIndex++}`);
       values.push('manual');
-      updates.push(`verified_categories = $${paramIndex++}`);
-      values.push([]);
     }
 
     if (updates.length === 0) {
@@ -5910,6 +5938,10 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/batch-edit', async (
     const locationId = Number(req.params.id);
     const tentIndex = Number(req.params.tent);
     const blockIndex = Number(req.params.block);
+    const user = getUserFromRequest(req);
+    if (user?.role === 'location_user' && Number(user.locationId) !== locationId) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
     const bedNumbers = Array.isArray(req.body?.bedNumbers) ? req.body.bedNumbers.map(Number).filter(n=>Number.isFinite(n)) : [];
     if (bedNumbers.length === 0) return res.status(400).json({ error: 'no_beds' });
 
@@ -5943,6 +5975,30 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/batch-edit', async (
         await validateGenderRestriction(locationId, tentIndex, blockIndex, normalizedGender);
       } catch (e) {
         return res.status(400).json({ error: 'gender_restriction_violation', message: e.message });
+      }
+    }
+
+    if (name !== undefined || phone !== undefined || normalizedGender !== undefined) {
+      const currentAllocations = await execQuery(`
+        SELECT DISTINCT ON (a.bed_number)
+          a.bed_number, a.name, a.phone, a.gender, a.category_source, a.verified_categories
+        FROM allocations a
+        WHERE a.block_id = $1
+          AND a.bed_number = ANY($2::int[])
+          AND a.deleted_at IS NULL
+          AND a.end_date >= ${todaySQL}
+        ORDER BY a.bed_number, a.created_at DESC
+      `, [blockId, bedNumbers]);
+      try {
+        for (const current of currentAllocations.rows) {
+          validateSaiProfileEditPermission({
+            user,
+            current,
+            updates: { name, phone, gender: normalizedGender },
+          });
+        }
+      } catch (error) {
+        return res.status(403).json({ error: error.code, message: error.message });
       }
     }
 
