@@ -25,7 +25,7 @@ test('buildSplits2026Plan builds the exact 5 locations and 17,377 total beds', (
       { name: 'New Block B', shortcode: 'nbb', capacity: 1580, tents: 5 },
       { name: 'Shivam Enclave', shortcode: 'she', capacity: 5800, tents: 5 },
       { name: 'Sundaram Enclave', shortcode: 'sue', capacity: 6397, tents: 11 },
-      { name: 'Sathyam Enclave', shortcode: 'sae', capacity: 1800, tents: 2 },
+      { name: 'Dharmakshetra Enclave', shortcode: 'de', capacity: 1800, tents: 2 },
     ]
   );
 
@@ -102,7 +102,7 @@ test('New Block B maps Floor 1 to Room 0, 4, 5, 6, 7 and Floors 2â€“5 to Room 0â
   }
 });
 
-test('Shivam, Sundaram, and Sathyam Enclaves match strict gender and category tags from the 2026 sheet', () => {
+test('Shivam, Sundaram, and Dharmakshetra Enclaves match strict gender and category tags from the 2026 sheet', () => {
   const plan = buildSplits2026Plan();
   const shivam = plan.find((l) => l.name === 'Shivam Enclave');
   assert.deepEqual(
@@ -134,9 +134,9 @@ test('Shivam, Sundaram, and Sathyam Enclaves match strict gender and category ta
     ]
   );
 
-  const sathyam = plan.find((l) => l.name === 'Sathyam Enclave');
+  const dharmakshetra = plan.find((l) => l.name === 'Dharmakshetra Enclave');
   assert.deepEqual(
-    sathyam.tents.map((t) => [t.name, t.size, t.blocks[0].genderRestriction, t.blocks[0].allowedCategories]),
+    dharmakshetra.tents.map((t) => [t.name, t.size, t.blocks[0].genderRestriction, t.blocks[0].allowedCategories]),
     [
       ['Tent 1', 900, 'both', ['delegate']],
       ['Tent 2', 900, 'female_only', ['sevadal']],

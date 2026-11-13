@@ -149,9 +149,9 @@ export function buildSplits2026Plan() {
       ],
     },
     {
-      name: 'Sathyam Enclave',
-      shortcode: 'sae',
-      landmark: 'Sathyam Enclave',
+      name: 'Dharmakshetra Enclave',
+      shortcode: 'de',
+      landmark: 'Sai Hira Hall',
       tents: [
         buildSubdividedTent(1, 900, 'both', ['delegate']),
         buildSubdividedTent(2, 900, 'female_only', ['sevadal']),
