@@ -4,16 +4,22 @@ import test from 'node:test';
 import {
   AccommodationEligibilityError,
   canAccessAllocationLocation,
+  isValidIsoDateString,
+  normalizeDateString,
   resolveMandatoryLookupCategory,
   resolveAllocationGender,
+  resolveSaiIdentityLookupCriteria,
   resolveSaiIdentityPersistence,
   resolveSaiProfileForAllocation,
   resolveVerifiedCategory,
   resolveUnverifiedCategory,
   validateAdminCategoryChange,
   validateAccommodationCategoryEditPermission,
+  validateAllocationDateRange,
   validateCategoryAllowedInBlock,
   validateBulkSaiIdentityAbsent,
+  validateCaretakerDateEditAllowed,
+  validateCaretakerDeallocationAllowed,
   validateCaretakerTarget,
   validateGenderAllowedInBlock,
   validateSaiIdentityAvailable,
@@ -420,4 +426,198 @@ test('a caretaker must link to an active delegate in the same block with no care
       (error) => error instanceof AccommodationEligibilityError && error.code === code
     );
   }
+});
+
+test('admin allocations fall back to Sai-verified name and phone when submitted fields are null or blank', () => {
+  const verification = {
+    outcome: 'matched',
+    fullName: 'Verified Caretaker',
+    mobileNo: '9876543210',
+    gender: 'Male',
+    verifiedCategories: ['sevadal'],
+  };
+
+  assert.deepEqual(resolveSaiProfileForAllocation({
+    user: { role: 'admin' },
+    verification,
+    submittedName: 'Verified Caretaker',
+    submittedPhone: null,
+  }), {
+    name: 'Verified Caretaker',
+    phone: '9876543210',
+    verifiedGender: null,
+  });
+
+  assert.deepEqual(resolveSaiProfileForAllocation({
+    user: { role: 'admin' },
+    verification,
+    submittedName: '',
+    submittedPhone: '   ',
+  }), {
+    name: 'Verified Caretaker',
+    phone: '9876543210',
+    verifiedGender: null,
+  });
+});
+
+test('resolveSaiIdentityLookupCriteria normalizes Sai Connect ID, lookup identifier, and mobile number for cross-identifier duplicate prevention', () => {
+  assert.deepEqual(resolveSaiIdentityLookupCriteria({
+    saiConnectId: ' 808675 ',
+    lookupIdentifier: '808675',
+    mobileNo: '9876543210',
+  }), {
+    saiConnectId: '808675',
+    lookupIdentifier: '808675',
+    mobileNo: '9876543210',
+    hasCriteria: true,
+    lockKeys: ['808675', '9876543210'],
+  });
+
+  assert.deepEqual(resolveSaiIdentityLookupCriteria({
+    saiConnectId: null,
+    lookupIdentifier: '9876543210',
+    mobileNo: '9876543210',
+  }), {
+    saiConnectId: null,
+    lookupIdentifier: '9876543210',
+    mobileNo: '9876543210',
+    hasCriteria: true,
+    lockKeys: ['9876543210'],
+  });
+
+  assert.deepEqual(resolveSaiIdentityLookupCriteria({}), {
+    saiConnectId: null,
+    lookupIdentifier: null,
+    mobileNo: null,
+    hasCriteria: false,
+    lockKeys: [],
+  });
+});
+
+test('deallocating a delegate with an active caretaker is blocked unless both are deallocated together', () => {
+  assert.throws(
+    () => validateCaretakerDeallocationAllowed({
+      targetIds: [101],
+      activeCaretakers: [{ id: 202, caretaker_for_allocation_id: 101 }],
+      batchMode: false,
+    }),
+    (error) => error instanceof AccommodationEligibilityError
+      && error.code === 'delegate_has_caretaker'
+      && error.message === 'Remove the linked caretaker before removing this Delegate.'
+  );
+
+  assert.throws(
+    () => validateCaretakerDeallocationAllowed({
+      targetIds: [101, 102],
+      activeCaretakers: [{ id: 202, caretaker_for_allocation_id: 101 }],
+      batchMode: true,
+    }),
+    (error) => error instanceof AccommodationEligibilityError
+      && error.code === 'delegate_has_caretaker'
+      && error.message === 'Include the linked caretaker when deallocating a Delegate.'
+  );
+
+  assert.doesNotThrow(() => validateCaretakerDeallocationAllowed({
+    targetIds: [101, 202],
+    activeCaretakers: [{ id: 202, caretaker_for_allocation_id: 101 }],
+    batchMode: true,
+  }));
+});
+
+test('caretaker stay dates cannot be edited independently of the linked delegate', () => {
+  assert.throws(
+    () => validateCaretakerDateEditAllowed({
+      isCaretaker: true,
+      currentStartDate: '2026-11-05',
+      currentEndDate: '2026-11-24',
+      nextEndDate: '2026-11-20',
+    }),
+    (error) => error instanceof AccommodationEligibilityError
+      && error.code === 'caretaker_dates_locked'
+      && error.message === 'Caretaker stay dates follow the linked Delegate and cannot be edited independently.'
+  );
+
+  assert.doesNotThrow(() => validateCaretakerDateEditAllowed({
+    isCaretaker: true,
+    currentStartDate: '2026-11-05',
+    currentEndDate: '2026-11-24',
+    nextStartDate: '2026-11-05',
+    nextEndDate: '2026-11-24',
+  }));
+
+  assert.doesNotThrow(() => validateCaretakerDateEditAllowed({
+    isCaretaker: false,
+    currentStartDate: '2026-11-05',
+    currentEndDate: '2026-11-24',
+    nextEndDate: '2026-11-20',
+  }));
+});
+
+test('admin editing an existing delegate without changing category succeeds, while downgrading a delegate with an active caretaker is blocked', () => {
+  assert.equal(
+    validateAdminCategoryChange('delegate', { currentCategory: 'delegate', hasActiveCaretaker: false }),
+    'delegate'
+  );
+  assert.equal(
+    validateAdminCategoryChange('delegate', { currentCategory: 'delegate', hasActiveCaretaker: true }),
+    'delegate'
+  );
+  assert.equal(
+    validateAdminCategoryChange('sevadal', { currentCategory: 'delegate', hasActiveCaretaker: false }),
+    'sevadal'
+  );
+  assert.throws(
+    () => validateAdminCategoryChange('sevadal', { currentCategory: 'delegate', hasActiveCaretaker: true }),
+    (error) => error instanceof AccommodationEligibilityError
+      && error.code === 'delegate_has_caretaker'
+      && error.message === 'Remove the linked caretaker before changing this Delegate’s category.'
+  );
+  assert.throws(
+    () => validateAdminCategoryChange('devotee', { currentCategory: 'delegate', hasActiveCaretaker: true }),
+    (error) => error instanceof AccommodationEligibilityError
+      && error.code === 'delegate_has_caretaker'
+  );
+});
+
+test('local-midnight Date objects from pg DATE columns normalize without off-by-one timezone shifts', () => {
+  const localMidnightDate = new Date(2026, 10, 15, 0, 0, 0, 0);
+  const utcIsoDate = new Date('2026-11-15');
+  assert.equal(normalizeDateString(localMidnightDate), '2026-11-15');
+  assert.equal(normalizeDateString(utcIsoDate), '2026-11-15');
+  assert.equal(normalizeDateString('2026-11-15'), '2026-11-15');
+
+  assert.doesNotThrow(() => validateCaretakerDateEditAllowed({
+    isCaretaker: true,
+    currentStartDate: new Date(2026, 10, 15, 0, 0, 0, 0),
+    currentEndDate: new Date(2026, 10, 20, 0, 0, 0, 0),
+    nextStartDate: '2026-11-15',
+    nextEndDate: '2026-11-20',
+  }));
+});
+
+test('allocation date range validation accepts same-day and ordered ranges while rejecting reversed or malformed dates', () => {
+  assert.equal(isValidIsoDateString('2026-11-15'), true);
+  assert.equal(isValidIsoDateString('2026-02-31'), false);
+  assert.equal(isValidIsoDateString('15-11-2026'), false);
+
+  assert.deepEqual(
+    validateAllocationDateRange({ startDate: '2026-11-15', endDate: '2026-11-15' }),
+    { startDate: '2026-11-15', endDate: '2026-11-15' }
+  );
+  assert.deepEqual(
+    validateAllocationDateRange({ startDate: '2026-11-15', endDate: '2026-11-20' }),
+    { startDate: '2026-11-15', endDate: '2026-11-20' }
+  );
+
+  assert.throws(
+    () => validateAllocationDateRange({ startDate: '2026-11-20', endDate: '2026-11-15' }),
+    (error) => error instanceof AccommodationEligibilityError
+      && error.code === 'invalid_date_range'
+      && error.message === 'End date must be on or after start date.'
+  );
+  assert.throws(
+    () => validateAllocationDateRange({ startDate: '2026-02-31', endDate: '2026-11-20' }),
+    (error) => error instanceof AccommodationEligibilityError
+      && error.code === 'invalid_date_range'
+  );
 });

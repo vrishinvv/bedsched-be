@@ -2,6 +2,7 @@ import pg from 'pg'
 import { config } from "./configs.js"
 import { runInTransaction } from './transactions.js'
 import { resolveDatabaseSsl } from './databaseConfig.js'
+import { ensureSchemaMigrations } from './schemaMigrations.js'
 
 const { Pool } = pg
 
@@ -54,6 +55,7 @@ process.on('SIGINT', () => {
 })();
 
 async function execQuery(text, params = []) {
+  await ensureSchemaMigrations(db);
   const startTime = Date.now();
   let client;
   try {
@@ -95,6 +97,7 @@ async function execQuery(text, params = []) {
 }
 
 async function withTransaction(operation) {
+  await ensureSchemaMigrations(db);
   return runInTransaction(db, operation);
 }
 

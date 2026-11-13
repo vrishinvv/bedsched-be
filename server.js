@@ -5,10 +5,11 @@ import cookieParser from 'cookie-parser';
 import crypto from 'crypto';
 import multer from 'multer';
 import { createAuthToken, getUserFromRequest as readAuthenticatedUser } from './common/auth.js';
-import { parseCsvContent } from './common/csvImport.js';
+import { parseCsvContent, validateCsvAllocationRow } from './common/csvImport.js';
 import { config } from './common/configs.js';
 import { execQuery, withTransaction } from './common/db.js';
 import { isCronAuthorized, isSeedAllowed } from './common/runtimeGuards.js';
+import { applySplits2026 } from './common/splits2026.js';
 import {
   UserValidationError,
   hashPassword,
@@ -30,11 +31,15 @@ import {
   formatExistingAllocationAddress,
   resolveAllocationGender,
   resolveMandatoryLookupCategory,
+  resolveSaiIdentityLookupCriteria,
   resolveSaiIdentityPersistence,
   resolveSaiProfileForAllocation,
   validateAccommodationCategoryEditPermission,
   validateAdminCategoryChange,
+  validateAllocationDateRange,
   validateBulkSaiIdentityAbsent,
+  validateCaretakerDateEditAllowed,
+  validateCaretakerDeallocationAllowed,
   validateCategoryAllowedInBlock,
   validateCaretakerTarget,
   validateGenderAllowedInBlock,
@@ -83,16 +88,35 @@ const existingSaiAllocationSelect = `
   JOIN locations l ON l.id = a.location_id
   JOIN tents t ON t.id = a.tent_id
   JOIN blocks b ON b.id = a.block_id
-  WHERE (a.sai_connect_id = $1 OR a.sai_lookup_identifier = $2)
+  WHERE (
+      ($1::text IS NOT NULL AND a.sai_connect_id = $1)
+      OR ($2::text IS NOT NULL AND a.sai_lookup_identifier = $2)
+      OR ($3::text IS NOT NULL AND (a.phone = $3 OR a.sai_lookup_identifier = $3))
+    )
     AND a.category_verified_at IS NOT NULL
     AND a.deleted_at IS NULL
+    AND a.end_date >= ${todaySQL}
+    AND (
+      a.status = 'confirmed'
+      OR (a.status = 'reserved' AND (a.reserved_expires_at IS NULL OR a.reserved_expires_at > ${nowIST}))
+    )
 `;
 
-async function findExistingSaiAllocation(query, saiConnectId, lookupIdentifier, { forUpdate = false } = {}) {
-  if (!saiConnectId && !lookupIdentifier) return null;
+async function findExistingSaiAllocation(
+  query,
+  saiConnectId,
+  lookupIdentifier,
+  { forUpdate = false, mobileNo = null } = {}
+) {
+  const criteria = resolveSaiIdentityLookupCriteria({
+    saiConnectId,
+    lookupIdentifier,
+    mobileNo,
+  });
+  if (!criteria.hasCriteria) return null;
   const result = await query(
     `${existingSaiAllocationSelect} LIMIT 1${forUpdate ? ' FOR UPDATE OF a' : ''}`,
-    [saiConnectId || null, lookupIdentifier || null]
+    [criteria.saiConnectId, criteria.lookupIdentifier, criteria.mobileNo]
   );
   return result.rows[0] || null;
 }
@@ -137,6 +161,12 @@ function handleStructureError(res, error, fallbackCode) {
 function handleAccommodationError(res, error, fallbackCode = 'accommodation_failed') {
   if (error instanceof AccommodationEligibilityError || error instanceof SaiConnectError) {
     return res.status(400).json({ error: error.code, message: error.message, field: error.field });
+  }
+  if (error?.code === '22000' || error?.code === '22007' || error?.code === '22008') {
+    return res.status(400).json({
+      error: 'invalid_date_range',
+      message: 'End date must be on or after start date.',
+    });
   }
   if (error?.code === '23505' && error?.constraint === 'idx_allocations_one_active_caretaker') {
     return res.status(409).json({
@@ -257,7 +287,9 @@ app.post('/api/sai-connect/lookup', async (req, res) => {
     if (result.outcome !== 'matched') {
       const validIdentifier = canPersistSaiConnectIdentity(result);
       const existingAllocation = validIdentifier
-        ? await findExistingSaiAllocation(execQuery, result.saiConnectId, result.identifier || identifier)
+        ? await findExistingSaiAllocation(execQuery, result.saiConnectId, result.identifier || identifier, {
+          mobileNo: result.mobileNo,
+        })
         : null;
       const existingAllocationAddress = formatExistingAllocationAddress(existingAllocation);
       return res.json({
@@ -280,7 +312,8 @@ app.post('/api/sai-connect/lookup', async (req, res) => {
     const existingAllocation = await findExistingSaiAllocation(
       execQuery,
       result.saiConnectId,
-      result.identifier || identifier
+      result.identifier || identifier,
+      { mobileNo: result.mobileNo }
     );
     const existingAllocationAddress = formatExistingAllocationAddress(existingAllocation);
     const allocationConflictMessage = existingAllocation
@@ -364,7 +397,21 @@ app.get('/api/health', (req, res) => {
 // Debug endpoint to check allocation dates in a block
 app.get('/api/debug/block-allocations/:blockId', async (req, res) => {
   try {
+    const user = getUserFromRequest(req);
     const blockId = Number(req.params.blockId);
+    if (!Number.isInteger(blockId) || blockId <= 0) {
+      return res.status(400).json({ error: 'invalid_block_id' });
+    }
+    const blockScope = await execQuery(
+      'SELECT t.location_id FROM blocks b JOIN tents t ON t.id = b.tent_id WHERE b.id = $1',
+      [blockId]
+    );
+    if (!blockScope.rowCount) {
+      return res.status(404).json({ error: 'block_not_found' });
+    }
+    if (!canAccessAllocationLocation(user, blockScope.rows[0].location_id)) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
     
     const result = await execQuery(`
       SELECT 
@@ -461,262 +508,13 @@ app.post('/api/seed', async (req, res) => {
   try {
     const seedResult = await withTransaction(async (client) => {
       const query = client.query.bind(client);
-    
-      console.log('[SEED] Starting database seed...');
-    
-    // Clear existing data in reverse dependency order
-    await query('DELETE FROM audit_logs');
-    await query('DELETE FROM allocations');
-    await query('DELETE FROM blocks');
-    await query('DELETE FROM tents');
-    await query('DELETE FROM users');
-    await query('DELETE FROM locations');
-    
-    console.log('[SEED] Cleared all existing data');
-
-    // Helper function to distribute beds into blocks
-    function createBlocks(tentSize) {
-      const blocks = [];
-      let remaining = tentSize;
-      let blockIndex = 1;
-      
-      while (remaining > 0) {
-        if (remaining < 100) {
-          // Merge small remainder into last block
-          if (blocks.length > 0) {
-            blocks[blocks.length - 1] += remaining;
-          } else {
-            blocks.push(remaining); // Edge case: tiny tent
-          }
-          break;
-        } else if (tentSize < 200) {
-          // Small tent: use 100 beds/block
-          const blockSize = Math.min(100, remaining);
-          blocks.push(blockSize);
-          remaining -= blockSize;
-        } else {
-          // Large tent: use 250 beds/block
-          const blockSize = Math.min(250, remaining);
-          blocks.push(blockSize);
-          remaining -= blockSize;
-        }
-      }
-      
-      return blocks;
-    }
-
-    // Location data with shortcodes for user generation
-    const locationData = [
-      { name: 'Anand Vilas Enclave', shortcode: 'ave', capacity: 850, tents: 1, gender: 'both', landmark: 'Chaitanya Jyoti' },
-      { name: 'Brindavan Enclave', shortcode: 'be', capacity: 2100, tents: 2, gender: 'both', landmark: 'Electricity Board' },
-      { name: 'Sai Sruthi Enclave', shortcode: 'sse', capacity: 1800, tents: 1, gender: 'both', landmark: 'APSRTC Bus Depot' },
-      { name: 'Dharmakshetra Enclave', shortcode: 'de', capacity: 1400, tents: 2, gender: 'both', landmark: 'Sai Hira Hall' },
-      { name: 'Shivam Enclave', shortcode: 'she', capacity: 4000, tents: 3, gender: 'both', landmark: 'West South' },
-      { name: 'Sundaram Enclave', shortcode: 'sue', capacity: 6000, tents: 7, gender: 'both', landmark: 'West North' },
-      { name: 'New Block B Basement', shortcode: 'nbbb', capacity: 650, tents: 1, tentName: 'Basement', blocksPerTent: 7, gender: 'female_only', landmark: 'New Block B Basement' },
-      { name: 'New Block A', shortcode: 'nba', capacity: 950, tents: 1, tentName: 'First Floor', blocksPerTent: 6, gender: 'female_only', landmark: 'New Block A' },
-      { name: 'New Block B', shortcode: 'nbb', capacity: 480, tents: 1, tentName: 'First Floor', blocksPerTent: 3, gender: 'male_only', landmark: 'New Block B' }
-    ];
-
-    console.log('[SEED] Creating locations...');
-    
-    // Batch insert all locations
-    const locationValues = locationData.map((_, i) => 
-      `($${i * 2 + 1}, $${i * 2 + 2})`
-    ).join(', ');
-    const locationParams = locationData.flatMap(loc => [loc.name, loc.capacity]);
-    
-    const locResult = await query(`
-      INSERT INTO locations(name, capacity) 
-      VALUES ${locationValues}
-      RETURNING id, name
-    `, locationParams);
-    
-    // Map results back with original data
-    const locationInserts = locResult.rows.map((row, i) => ({
-      ...locationData[i],
-      id: row.id
-    }));
-    
-    console.log(`[SEED] Created ${locationInserts.length} locations`);
-
-    // Create tents and blocks
-    let totalTents = 0;
-    let totalBlocks = 0;
-    
-    // Helper to generate tent name
-    const getTentName = (loc, tentIndex, totalTents) => {
-      if (loc.tentName) return loc.tentName; // Specific name provided
-      const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-      return `Tent ${letters[tentIndex - 1]}`;
-    };
-    
-    // Helper to generate block name
-    const getBlockName = (blockIndex) => {
-      return `Block ${blockIndex}`;
-    };
-    
-    // Prepare all tent data
-    const allTentData = [];
-    const allBlockData = [];
-    
-    for (const loc of locationInserts) {
-      let remainingCapacity = loc.capacity;
-      
-      for (let tentIndex = 1; tentIndex <= loc.tents; tentIndex++) {
-        // Distribute capacity evenly, giving any remainder to the last tent
-        let tentSize;
-        if (tentIndex === loc.tents) {
-          tentSize = remainingCapacity; // Last tent gets all remaining
-        } else {
-          tentSize = Math.floor(loc.capacity / loc.tents);
-          remainingCapacity -= tentSize;
-        }
-        
-        allTentData.push({
-          location_id: loc.id,
-          location_name: loc.name,
-          tent_index: tentIndex,
-          tent_name: getTentName(loc, tentIndex, loc.tents),
-          size: tentSize,
-          gender: loc.gender,
-          blocks_per_tent: loc.blocksPerTent // For special locations
-        });
-      }
-    }
-    
-    // Batch insert all tents
-    if (allTentData.length > 0) {
-      const tentValues = allTentData.map((_, i) => 
-        `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${i * 4 + 4})`
-      ).join(', ');
-      const tentParams = allTentData.flatMap(t => [t.location_id, t.tent_index, t.tent_name, t.size]);
-      
-      const tentResult = await query(`
-        INSERT INTO tents(location_id, tent_index, name, size) 
-        VALUES ${tentValues}
-        RETURNING id, location_id, tent_index, name, size
-      `, tentParams);
-      
-      totalTents = tentResult.rows.length;
-      
-      // Prepare block data for each tent
-      for (let i = 0; i < tentResult.rows.length; i++) {
-        const tent = tentResult.rows[i];
-        const tentData = allTentData[i];
-        
-        // If blocksPerTent is specified, create exact number of blocks with equal distribution
-        let blockSizes;
-        if (tentData.blocks_per_tent) {
-          const blocksCount = tentData.blocks_per_tent;
-          const baseSize = Math.floor(tent.size / blocksCount);
-          const remainder = tent.size % blocksCount;
-          blockSizes = [];
-          for (let j = 0; j < blocksCount; j++) {
-            // Distribute remainder across first blocks
-            blockSizes.push(baseSize + (j < remainder ? 1 : 0));
-          }
-        } else {
-          // Use default block creation logic
-          blockSizes = createBlocks(tent.size);
-        }
-        
-        for (let blockIndex = 0; blockIndex < blockSizes.length; blockIndex++) {
-          allBlockData.push({
-            location_id: tent.location_id,
-            tent_id: tent.id,
-            tent_index: tent.tent_index,
-            block_index: blockIndex + 1,
-            block_name: getBlockName(blockIndex + 1),
-            size: blockSizes[blockIndex],
-            gender: tentData.gender
-          });
-        }
-      }
-      
-      // Batch insert all blocks
-      if (allBlockData.length > 0) {
-        const blockValues = allBlockData.map((_, i) => 
-          `($${i * 7 + 1}, $${i * 7 + 2}, $${i * 7 + 3}, $${i * 7 + 4}, $${i * 7 + 5}, $${i * 7 + 6}, $${i * 7 + 7})`
-        ).join(', ');
-        const blockParams = allBlockData.flatMap(b => 
-          [b.location_id, b.tent_id, b.tent_index, b.block_index, b.block_name, b.size, b.gender]
-        );
-        
-        await query(`
-          INSERT INTO blocks(location_id, tent_id, tent_index, block_index, name, size, gender_restriction)
-          VALUES ${blockValues}
-        `, blockParams);
-        
-        totalBlocks = allBlockData.length;
-      }
-    }
-    
-    console.log(`[SEED] Created ${totalTents} tents and ${totalBlocks} blocks`);
-
-    // Create 20 users for each location (username = password) - BATCH INSERT
-    console.log('[SEED] Creating location users...');
-    
-    const userValues = [];
-    const userParams = [];
-    let paramIndex = 1;
-    
-    for (const loc of locationInserts) {
-      for (let i = 1; i <= 20; i++) {
-        const username = `${loc.shortcode}_${i}`;
-        const password = username; // username = password
-        
-        userValues.push(`($${paramIndex}, $${paramIndex + 1}, $${paramIndex + 2}, $${paramIndex + 3})`);
-        userParams.push(username, password, 'location_user', loc.id);
-        paramIndex += 4;
-      }
-      
-      console.log(`[SEED] Prepared 20 users for ${loc.name} (${loc.shortcode}_1 to ${loc.shortcode}_20, password = username)`);
-    }
-    
-    // Batch insert all users at once
-    await query(`
-      INSERT INTO users(username, password, role, location_id) 
-      VALUES ${userValues.join(', ')}
-    `, userParams);
-    
-    console.log(`[SEED] Created ${locationInserts.length * 20} users in batch`);
-
-    // Recreate admin users (they were deleted during seed)
-    await query(`
-      INSERT INTO users(username, password, role)
-      VALUES ('admin', 'admin', 'admin'), ('dashboard', 'dashboard', 'dashboard')
-      ON CONFLICT (username) DO NOTHING
-    `);
-    console.log('[SEED] Recreated admin and dashboard users');
-
-    console.log('[SEED] No dummy allocations created - clean slate ready!');
-
-    // Get summary
-    const summary = await query(`
-      SELECT 
-        l.name,
-        l.capacity,
-        COUNT(DISTINCT t.id) as tent_count,
-        COUNT(DISTINCT b.id) as block_count
-      FROM locations l
-      LEFT JOIN tents t ON t.location_id = l.id
-      LEFT JOIN blocks b ON b.tent_id = t.id
-      GROUP BY l.id, l.name, l.capacity
-      ORDER BY l.id
-    `);
-
+      console.log('[SEED] Starting 2026 database seed...');
+      const applied = await applySplits2026(query);
       return {
         success: true,
-        message: 'Database seeded successfully',
-        summary: summary.rows,
-        credentials: locationInserts.flatMap(loc =>
-          Array.from({ length: 20 }, (_, i) => ({
-            location: loc.name,
-            username: `${loc.shortcode}_${i + 1}`,
-            password: `${loc.shortcode}_${i + 1}` // username = password
-          }))
-        )
+        message: 'Database seeded successfully with 2026 splits',
+        summary: applied.summary,
+        credentials: applied.credentials,
       };
     });
 
@@ -743,6 +541,10 @@ app.get('/api/locations', async (_req, res) => {
 // GET /api/locations/:id -> { id, name, capacity, beds: { "1": {...} } }
 app.get('/api/locations/:id', async (req, res) => {
   try {
+    const user = getUserFromRequest(req);
+    if (!canAccessAllocationLocation(user, req.params.id)) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
     const loc = await getLocationDetail(req.params.id);
     if (!loc) return res.status(404).json({ error: 'location_not_found' });
     console.log(loc);
@@ -756,6 +558,10 @@ app.get('/api/locations/:id', async (req, res) => {
 // PATCH /api/locations/:id  body: { capacity }
 app.patch('/api/locations/:id', async (req, res) => {
   try {
+    const user = getUserFromRequest(req);
+    if (!canManageAccommodationStructure(user)) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
     const id = req.params.id;
     const { capacity } = req.body || {};
     if (!Number.isFinite(Number(capacity))) {
@@ -781,12 +587,17 @@ app.post('/api/locations/:id/beds/:bedNumber/allocate', async (req, res) => {
   try {
     const id = Number(req.params.id);
     const bedNumber = Number(req.params.bedNumber);
+    const user = getUserFromRequest(req);
+    if (!canAccessAllocationLocation(user, id)) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
     await validateBedWithinCapacity(id, bedNumber);
 
     const { name, phone, gender, startDate, endDate, emergencyPhone, personPhotoKey, aadhaarPhotoKey } = req.body || {};
     if (!name || !startDate || !endDate) {
       return res.status(400).json({ error: 'missing_required_fields' });
     }
+    validateAllocationDateRange({ startDate, endDate });
     validateRequiredBookingPhotos({
       photosRequired: config.requireBookingPhotos,
       personPhotoKey,
@@ -884,11 +695,15 @@ app.patch('/api/locations/:id/beds/:bedNumber', async (req, res) => {
     const id = Number(req.params.id);
     const bedNumber = Number(req.params.bedNumber);
     if (!Number.isFinite(bedNumber)) return res.status(400).json({ error: 'invalid_bed_number' });
+    const user = getUserFromRequest(req);
+    if (!canAccessAllocationLocation(user, id)) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
     await validateBedWithinCapacity(id, bedNumber);
 
     // find current active allocation
     const findQ = `
-      SELECT id, name, phone, gender, 
+      SELECT id, name, phone, gender, category_source, verified_categories, caretaker_for_allocation_id,
              TO_CHAR(start_date, 'YYYY-MM-DD') as start_date,
              TO_CHAR(end_date, 'YYYY-MM-DD') as end_date
       FROM allocations
@@ -905,6 +720,19 @@ app.patch('/api/locations/:id/beds/:bedNumber', async (req, res) => {
     const current = active.rows[0];
     const { name, phone, gender, startDate, endDate } = req.body || {};
 
+    validateSaiProfileEditPermission({
+      user,
+      current,
+      updates: { name, phone, gender },
+    });
+    validateCaretakerDateEditAllowed({
+      isCaretaker: Boolean(current.caretaker_for_allocation_id),
+      currentStartDate: current.start_date,
+      currentEndDate: current.end_date,
+      nextStartDate: startDate,
+      nextEndDate: endDate,
+    });
+
     // Use current values as defaults for missing fields
     const newName = name !== undefined ? name : current.name;
     const newPhone = phone !== undefined ? phone : current.phone;
@@ -915,6 +743,7 @@ app.patch('/api/locations/:id/beds/:bedNumber', async (req, res) => {
     ) : current.gender;
     const newStartDate = startDate !== undefined ? startDate : current.start_date;
     const newEndDate = endDate !== undefined ? endDate : current.end_date;
+    validateAllocationDateRange({ startDate: newStartDate, endDate: newEndDate });
 
     // Cleanup: soft-delete expired reservations on this bed (only if not the current allocation)
     try {
@@ -939,30 +768,26 @@ app.patch('/api/locations/:id/beds/:bedNumber', async (req, res) => {
     }
 
     await withTransaction(async (client) => {
-      // Soft delete current allocation
       await client.query(
-        `UPDATE allocations SET deleted_at = NOW() WHERE id = $1`,
-        [current.id]
+        `UPDATE allocations
+         SET name = $1, phone = $2, gender = $3, start_date = $4, end_date = $5, updated_at = NOW()
+         WHERE id = $6`,
+        [newName, newPhone, newGender, newStartDate, newEndDate, current.id]
       );
-
-      // Create new allocation with updated values
-      const insertQ = `
-        INSERT INTO allocations(location_id, bed_number, name, phone, gender, start_date, end_date)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        RETURNING id
-      `;
-      await client.query(insertQ, [
-        id,
-        bedNumber,
-        newName,
-        newPhone,
-        newGender,
-        newStartDate,
-        newEndDate
-      ]);
+      if ((startDate !== undefined || endDate !== undefined) && !current.caretaker_for_allocation_id) {
+        await client.query(
+          `UPDATE allocations
+           SET start_date = $1, end_date = $2, updated_at = NOW()
+           WHERE caretaker_for_allocation_id = $3 AND deleted_at IS NULL`,
+          [newStartDate, newEndDate, current.id]
+        );
+      }
     });
     res.json({ ok: true });
   } catch (e) {
+    if (e instanceof AccommodationEligibilityError) {
+      return handleAccommodationError(res, e, 'edit_failed');
+    }
     console.error('[EDIT ERROR]', {
       error: e.message,
       code: e.code,
@@ -985,27 +810,49 @@ app.patch('/api/locations/:id/beds/:bedNumber', async (req, res) => {
 // DELETE /api/locations/:id/beds/:bedNumber (soft delete current active allocation)
 app.delete('/api/locations/:id/beds/:bedNumber', async (req, res) => {
   try {
+    const user = getUserFromRequest(req);
     const id = Number(req.params.id);
     const bedNumber = Number(req.params.bedNumber);
+    if (!canAccessAllocationLocation(user, id)) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
     await validateBedWithinCapacity(id, bedNumber);
 
-    const delQ = `
+    const activeRes = await execQuery(`
+      SELECT id FROM allocations
+      WHERE location_id = $1
+        AND bed_number = $2
+        AND deleted_at IS NULL
+        AND end_date >= ${todaySQL}
+      ORDER BY created_at DESC
+      LIMIT 1
+    `, [id, bedNumber]);
+    if (activeRes.rowCount === 0) return res.status(404).json({ error: 'no_active_allocation' });
+    const allocationId = Number(activeRes.rows[0].id);
+
+    const caretakerRes = await execQuery(`
+      SELECT id, caretaker_for_allocation_id
+      FROM allocations
+      WHERE caretaker_for_allocation_id = $1 AND deleted_at IS NULL AND end_date >= ${todaySQL}
+      LIMIT 1
+    `, [allocationId]);
+    validateCaretakerDeallocationAllowed({
+      targetIds: [allocationId],
+      activeCaretakers: caretakerRes.rows,
+      batchMode: false,
+    });
+
+    await execQuery(`
       UPDATE allocations 
       SET deleted_at = NOW(), updated_at = NOW()
-      WHERE id IN (
-        SELECT id FROM allocations
-        WHERE location_id = $1
-          AND bed_number = $2
-          AND deleted_at IS NULL
-          AND end_date >= ${todaySQL}
-        ORDER BY created_at DESC
-        LIMIT 1
-      )
-    `;
-    const r = await execQuery(delQ, [id, bedNumber]);
-    if (r.rowCount === 0) return res.status(404).json({ error: 'no_active_allocation' });
+      WHERE id = $1
+    `, [allocationId]);
+    await logAudit(req, 'deallocate', 'allocation', allocationId, { locationId: id, bedNumber, reason: 'not_specified' });
     res.json({ ok: true });
   } catch (e) {
+    if (e instanceof AccommodationEligibilityError) {
+      return handleAccommodationError(res, e, 'deallocate_failed');
+    }
     console.error(e);
     res.status(500).json({ error: 'deallocate_failed' });
   }
@@ -1041,7 +888,7 @@ app.get('/api/allocations/table-view', async (req, res) => {
     const offset = (Number(page) - 1) * Number(limit);
     
     // Validate sortField to prevent SQL injection
-    const allowedSortFields = ['name', 'phone', 'start_date', 'end_date', 'created_at', 'updated_at'];
+    const allowedSortFields = ['name', 'phone', 'start_date', 'end_date', 'created_at', 'updated_at', 'status'];
     const validSortField = allowedSortFields.includes(sortField) ? sortField : 'updated_at';
     const validSortOrder = sortOrder?.toLowerCase() === 'asc' ? 'ASC' : 'DESC';
 
@@ -1052,20 +899,20 @@ app.get('/api/allocations/table-view', async (req, res) => {
 
     // Search filter
     if (search) {
-      whereConditions.push(`(LOWER(a.name) LIKE $${paramCounter} OR a.phone LIKE $${paramCounter} OR a.sai_connect_id LIKE $${paramCounter})`);
+      whereConditions.push(`(LOWER(a.name) LIKE $${paramCounter} OR a.phone LIKE $${paramCounter} OR a.sai_connect_id LIKE $${paramCounter} OR a.sai_lookup_identifier LIKE $${paramCounter})`);
       params.push(`%${search.toLowerCase()}%`);
       paramCounter++;
     }
 
-    // Date range filters - filter by record creation date
+    // Date range filters - filter by stay start_date and end_date
     if (startDate) {
-      whereConditions.push(`DATE(a.created_at) >= $${paramCounter}`);
+      whereConditions.push(`a.start_date >= $${paramCounter}::date`);
       params.push(startDate);
       paramCounter++;
     }
 
     if (endDate) {
-      whereConditions.push(`DATE(a.created_at) <= $${paramCounter}`);
+      whereConditions.push(`a.end_date <= $${paramCounter}::date`);
       params.push(endDate);
       paramCounter++;
     }
@@ -1103,13 +950,11 @@ app.get('/api/allocations/table-view', async (req, res) => {
       const statuses = status.split(',').map(s => s.trim());
       const statusConditions = [];
       
-      const today = new Date().toISOString().split('T')[0];
-      
       if (statuses.includes('active')) {
-        statusConditions.push(`(a.deleted_at IS NULL AND a.end_date >= '${today}')`);
+        statusConditions.push(`(a.deleted_at IS NULL AND a.end_date >= ${todaySQL})`);
       }
       if (statuses.includes('expired')) {
-        statusConditions.push(`(a.deleted_at IS NULL AND a.end_date < '${today}')`);
+        statusConditions.push(`(a.deleted_at IS NULL AND a.end_date < ${todaySQL})`);
       }
       if (statuses.includes('left_early')) {
         statusConditions.push(`(a.deleted_at IS NOT NULL AND EXISTS (
@@ -1153,7 +998,21 @@ app.get('/api/allocations/table-view', async (req, res) => {
       }
     }
 
-    const whereClause = whereConditions.join(' AND ');
+    if (allocatedBy) {
+      whereConditions.push(`LOWER(COALESCE((
+        SELECT al_c.username
+        FROM audit_logs al_c
+        WHERE al_c.entity_type = 'allocation'
+          AND al_c.entity_id = a.id
+          AND al_c.action IN ('allocate', 'bulk_allocate', 'smart_reserve')
+        ORDER BY al_c.created_at ASC
+        LIMIT 1
+      ), 'Unknown')) = $${paramCounter}`);
+      params.push(allocatedBy.toLowerCase());
+      paramCounter++;
+    }
+
+    const whereClause = whereConditions.length > 0 ? whereConditions.join(' AND ') : '1=1';
 
     const countQuery = `
       SELECT COUNT(*) as total
@@ -1162,6 +1021,14 @@ app.get('/api/allocations/table-view', async (req, res) => {
     `;
     const countResult = await execQuery(countQuery, params);
     const total = Number(countResult.rows[0]?.total || 0);
+
+    const orderByExpression = validSortField === 'status'
+      ? `CASE
+          WHEN a.deleted_at IS NULL AND a.end_date >= ${todaySQL} THEN 1
+          WHEN a.deleted_at IS NULL AND a.end_date < ${todaySQL} THEN 2
+          ELSE 3
+         END`
+      : `a.${validSortField}`;
 
     const dataQuery = `
       SELECT 
@@ -1174,6 +1041,9 @@ app.get('/api/allocations/table-view', async (req, res) => {
         a.verified_categories,
         a.sai_connect_id,
         a.sai_connect_age,
+        a.caretaker_for_allocation_id,
+        delegate.name AS caretaker_for_name,
+        delegate.bed_number AS caretaker_for_bed,
         a.start_date,
         a.end_date,
         a.created_at,
@@ -1205,6 +1075,7 @@ app.get('/api/allocations/table-view', async (req, res) => {
       JOIN blocks b ON a.block_id = b.id
       JOIN tents t ON b.tent_id = t.id
       JOIN locations l ON t.location_id = l.id
+      LEFT JOIN allocations delegate ON delegate.id = a.caretaker_for_allocation_id
       LEFT JOIN LATERAL (
         SELECT username
         FROM audit_logs
@@ -1215,14 +1086,9 @@ app.get('/api/allocations/table-view', async (req, res) => {
         LIMIT 1
       ) creator ON true
       WHERE ${whereClause}
-      ${allocatedBy ? `AND LOWER(creator.username) = $${paramCounter}` : ''}
-      ORDER BY a.${validSortField} ${validSortOrder}
-      LIMIT $${paramCounter + (allocatedBy ? 1 : 0)} OFFSET $${paramCounter + (allocatedBy ? 2 : 1)}
+      ORDER BY ${orderByExpression} ${validSortOrder}
+      LIMIT $${paramCounter} OFFSET $${paramCounter + 1}
     `;
-    if (allocatedBy) {
-      params.push(allocatedBy.toLowerCase());
-      paramCounter++;
-    }
     params.push(Number(limit), offset);
     const dataResult = await execQuery(dataQuery, params);
 
@@ -1866,7 +1732,7 @@ app.post('/api/allocations/send-csv', async (req, res) => {
     } = filters || {};
 
     // Validate sortField to prevent SQL injection
-    const allowedSortFields = ['name', 'phone', 'start_date', 'end_date', 'created_at', 'updated_at'];
+    const allowedSortFields = ['name', 'phone', 'start_date', 'end_date', 'created_at', 'updated_at', 'status'];
     const validSortField = allowedSortFields.includes(sortField) ? sortField : 'updated_at';
     const validSortOrder = sortOrder?.toLowerCase() === 'asc' ? 'ASC' : 'DESC';
 
@@ -1876,19 +1742,19 @@ app.post('/api/allocations/send-csv', async (req, res) => {
     let paramCounter = 1;
 
     if (search) {
-      whereConditions.push(`(LOWER(a.name) LIKE $${paramCounter} OR a.phone LIKE $${paramCounter} OR a.sai_connect_id LIKE $${paramCounter})`);
+      whereConditions.push(`(LOWER(a.name) LIKE $${paramCounter} OR a.phone LIKE $${paramCounter} OR a.sai_connect_id LIKE $${paramCounter} OR a.sai_lookup_identifier LIKE $${paramCounter})`);
       params.push(`%${search.toLowerCase()}%`);
       paramCounter++;
     }
 
     if (startDate) {
-      whereConditions.push(`DATE(a.created_at) >= $${paramCounter}`);
+      whereConditions.push(`a.start_date >= $${paramCounter}::date`);
       params.push(startDate);
       paramCounter++;
     }
 
     if (endDate) {
-      whereConditions.push(`DATE(a.created_at) <= $${paramCounter}`);
+      whereConditions.push(`a.end_date <= $${paramCounter}::date`);
       params.push(endDate);
       paramCounter++;
     }
@@ -1920,13 +1786,12 @@ app.post('/api/allocations/send-csv', async (req, res) => {
     if (status) {
       const statuses = status.split(',').map(s => s.trim());
       const statusConditions = [];
-      const today = new Date().toISOString().split('T')[0];
       
       if (statuses.includes('active')) {
-        statusConditions.push(`(a.deleted_at IS NULL AND a.end_date >= '${today}')`);
+        statusConditions.push(`(a.deleted_at IS NULL AND a.end_date >= ${todaySQL})`);
       }
       if (statuses.includes('expired')) {
-        statusConditions.push(`(a.deleted_at IS NULL AND a.end_date < '${today}')`);
+        statusConditions.push(`(a.deleted_at IS NULL AND a.end_date < ${todaySQL})`);
       }
       if (statuses.includes('left_early')) {
         statusConditions.push(`(a.deleted_at IS NOT NULL AND EXISTS (
@@ -1972,6 +1837,14 @@ app.post('/api/allocations/send-csv', async (req, res) => {
 
     const whereClause = whereConditions.length > 0 ? whereConditions.join(' AND ') : '1=1';
 
+    const orderByExpression = validSortField === 'status'
+      ? `CASE
+          WHEN a.deleted_at IS NULL AND a.end_date >= ${todaySQL} THEN 1
+          WHEN a.deleted_at IS NULL AND a.end_date < ${todaySQL} THEN 2
+          ELSE 3
+         END`
+      : `a.${validSortField}`;
+
     // Fetch ALL data (no pagination)
     const dataQuery = `
       SELECT 
@@ -1984,6 +1857,9 @@ app.post('/api/allocations/send-csv', async (req, res) => {
         a.verified_categories,
         a.sai_connect_id,
         a.sai_connect_age,
+        a.caretaker_for_allocation_id,
+        delegate.name AS caretaker_for_name,
+        delegate.bed_number AS caretaker_for_bed,
         a.start_date,
         a.end_date,
         a.created_at,
@@ -2015,6 +1891,7 @@ app.post('/api/allocations/send-csv', async (req, res) => {
       JOIN blocks b ON a.block_id = b.id
       JOIN tents t ON b.tent_id = t.id
       JOIN locations l ON t.location_id = l.id
+      LEFT JOIN allocations delegate ON delegate.id = a.caretaker_for_allocation_id
       LEFT JOIN LATERAL (
         SELECT username
         FROM audit_logs
@@ -2025,8 +1902,8 @@ app.post('/api/allocations/send-csv', async (req, res) => {
         LIMIT 1
       ) creator ON true
       WHERE ${whereClause}
-      ${allocatedBy ? `AND LOWER(creator.username) = $${paramCounter}` : ''}
-      ORDER BY a.${validSortField} ${validSortOrder}
+      ${allocatedBy ? `AND LOWER(COALESCE(creator.username, 'Unknown')) = $${paramCounter}` : ''}
+      ORDER BY ${orderByExpression} ${validSortOrder}
     `;
     
     if (allocatedBy) {
@@ -2171,6 +2048,9 @@ app.get('/api/allocations/historical-deallocations', async (req, res) => {
         a.verified_categories,
         a.sai_connect_id,
         a.sai_connect_age,
+        a.caretaker_for_allocation_id,
+        delegate.name AS caretaker_for_name,
+        delegate.bed_number AS caretaker_for_bed,
         a.start_date,
         a.end_date,
         a.bed_number,
@@ -2181,18 +2061,25 @@ app.get('/api/allocations/historical-deallocations', async (req, res) => {
         t.name as tent_name,
         b.block_index,
         b.name as block_name,
-        COALESCE(al.details->>'reason', 'not_specified') as reason,
+        COALESCE(al.reason, 'not_specified') as reason,
         u.username as deallocated_by
       FROM allocations a
       JOIN blocks b ON a.block_id = b.id
       JOIN tents t ON b.tent_id = t.id
       JOIN locations l ON t.location_id = l.id
-      LEFT JOIN audit_logs al ON al.action = 'deallocate' 
-        AND al.entity_type = 'allocation' 
-        AND al.entity_id = a.id
+      LEFT JOIN allocations delegate ON delegate.id = a.caretaker_for_allocation_id
+      LEFT JOIN LATERAL (
+        SELECT details->>'reason' AS reason, user_id
+        FROM audit_logs
+        WHERE action = 'deallocate'
+          AND entity_type = 'allocation'
+          AND entity_id = a.id
+        ORDER BY created_at DESC
+        LIMIT 1
+      ) al ON true
       LEFT JOIN users u ON al.user_id = u.id
       WHERE a.deleted_at IS NOT NULL
-        AND DATE(a.deleted_at) = $1
+        AND (a.deleted_at AT TIME ZONE 'Asia/Kolkata')::date = $1::date
         ${filterConditions}
       ORDER BY a.deleted_at DESC
     `;
@@ -2213,6 +2100,9 @@ app.get('/api/allocations/historical-deallocations', async (req, res) => {
         a.verified_categories,
         a.sai_connect_id,
         a.sai_connect_age,
+        a.caretaker_for_allocation_id,
+        delegate.name AS caretaker_for_name,
+        delegate.bed_number AS caretaker_for_bed,
         a.start_date,
         a.end_date,
         a.bed_number,
@@ -2226,6 +2116,7 @@ app.get('/api/allocations/historical-deallocations', async (req, res) => {
       JOIN blocks b ON a.block_id = b.id
       JOIN tents t ON b.tent_id = t.id
       JOIN locations l ON t.location_id = l.id
+      LEFT JOIN allocations delegate ON delegate.id = a.caretaker_for_allocation_id
       WHERE a.deleted_at IS NULL
         AND DATE(a.end_date) = $1
         AND a.status = 'confirmed'
@@ -2273,7 +2164,7 @@ app.post('/api/allocations/historical-deallocations/send-csv', async (req, res) 
     }
 
     // Build WHERE conditions for filters
-    let manualWhereConditions = ['a.deleted_at IS NOT NULL', 'DATE(a.deleted_at) = $1'];
+    let manualWhereConditions = ['a.deleted_at IS NOT NULL', "(a.deleted_at AT TIME ZONE 'Asia/Kolkata')::date = $1::date"];
     let expiredWhereConditions = ['a.deleted_at IS NULL', 'DATE(a.end_date) = $1', "a.status = 'confirmed'"];
     let params = [date];
     let paramCounter = 2;
@@ -2312,6 +2203,7 @@ app.post('/api/allocations/historical-deallocations/send-csv', async (req, res) 
         a.verified_categories,
         a.sai_connect_id,
         a.sai_connect_age,
+        a.caretaker_for_allocation_id,
         a.start_date,
         a.end_date,
         a.bed_number,
@@ -2322,15 +2214,21 @@ app.post('/api/allocations/historical-deallocations/send-csv', async (req, res) 
         t.name as tent_name,
         b.block_index,
         b.name as block_name,
-        COALESCE(al.details->>'reason', 'not_specified') as reason,
+        COALESCE(al.reason, 'not_specified') as reason,
         u.username as deallocated_by
       FROM allocations a
       JOIN blocks b ON a.block_id = b.id
       JOIN tents t ON b.tent_id = t.id
       JOIN locations l ON t.location_id = l.id
-      LEFT JOIN audit_logs al ON al.action = 'deallocate' 
-        AND al.entity_type = 'allocation' 
-        AND al.entity_id = a.id
+      LEFT JOIN LATERAL (
+        SELECT details->>'reason' AS reason, user_id
+        FROM audit_logs
+        WHERE action = 'deallocate'
+          AND entity_type = 'allocation'
+          AND entity_id = a.id
+        ORDER BY created_at DESC
+        LIMIT 1
+      ) al ON true
       LEFT JOIN users u ON al.user_id = u.id
       WHERE ${manualWhereClause}
       ORDER BY a.deleted_at DESC
@@ -2523,7 +2421,9 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
         a.caretaker_for_allocation_id,
         EXISTS (
           SELECT 1 FROM allocations caretaker
-          WHERE caretaker.caretaker_for_allocation_id = a.id AND caretaker.deleted_at IS NULL
+          WHERE caretaker.caretaker_for_allocation_id = a.id
+            AND caretaker.deleted_at IS NULL
+            AND caretaker.end_date >= ${todaySQL}
         ) AS has_caretaker,
         a.created_at,
         l.name as location_name,
@@ -2540,6 +2440,12 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
     }
 
     const allocation = allocationQuery.rows[0];
+    if (!canAccessAllocationLocation(user, allocation.location_id)) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
+    if (location_id && !canAccessAllocationLocation(user, location_id)) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
     const linkedState = validateLinkedReallocationTarget({
       currentBlockId: allocation.current_block_id,
       targetBlockId: allocation.current_block_id,
@@ -2759,7 +2665,10 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
         WHERE a.block_id = $1
           AND a.id != $4
           AND a.deleted_at IS NULL
-          AND a.status = 'confirmed'
+          AND (
+            a.status = 'confirmed'
+            OR (a.status = 'reserved' AND (a.reserved_expires_at IS NULL OR a.reserved_expires_at > ${nowIST}))
+          )
           AND (
             (a.start_date <= $2 AND a.end_date >= $2) OR
             (a.start_date <= $3 AND a.end_date >= $3) OR
@@ -2851,7 +2760,9 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
         a.caretaker_for_allocation_id,
         EXISTS (
           SELECT 1 FROM allocations caretaker
-          WHERE caretaker.caretaker_for_allocation_id = a.id AND caretaker.deleted_at IS NULL
+          WHERE caretaker.caretaker_for_allocation_id = a.id
+            AND caretaker.deleted_at IS NULL
+            AND caretaker.end_date >= ${todaySQL}
         ) AS has_caretaker,
         l.name as location_name,
         t.tent_index,
@@ -2922,6 +2833,23 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
       genderRestriction: newBlock.gender_restriction,
     });
 
+    if (Number(oldAllocation.block_id) === Number(newBlockId) && Number(oldAllocation.bed_number) === Number(newBedNumber)) {
+      return res.status(400).json({
+        error: 'same_bed_selected',
+        message: 'Please select a different bed to reallocate.',
+      });
+    }
+
+    await execQuery(`
+      UPDATE allocations
+      SET deleted_at = NOW(), updated_at = NOW()
+      WHERE block_id = $1
+        AND bed_number = $2
+        AND status = 'reserved'
+        AND deleted_at IS NULL
+        AND ((reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW()) OR end_date < ${todaySQL})
+    `, [newBlockId, newBedNumber]);
+
     // Check if new bed is available for the date range (excluding the current allocation being moved)
     const availabilityCheck = await execQuery(`
       SELECT id, name, start_date, end_date
@@ -2931,8 +2859,11 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
         AND id != $3
         AND deleted_at IS NULL
         AND (
-          (start_date, end_date) OVERLAPS ($4::date, $5::date)
+          status = 'confirmed'
+          OR (status = 'reserved' AND (reserved_expires_at IS NULL OR reserved_expires_at > ${nowIST}))
         )
+        AND start_date <= $5::date
+        AND end_date >= $4::date
       LIMIT 1
     `, [newBlockId, newBedNumber, allocationId, oldAllocation.start_date, oldAllocation.end_date]);
 
@@ -3317,6 +3248,10 @@ app.listen(config.port, () => {
 // GET /api/locations/:id/tents
 app.get('/api/locations/:id/tents', async (req, res) => {
   try {
+    const user = getUserFromRequest(req);
+    if (!canAccessAllocationLocation(user, req.params.id)) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
     const data = await getLocationTents(req.params.id);
     if (!data) return res.status(404).json({ error: 'location_not_found' });
     res.json(data);
@@ -3329,6 +3264,10 @@ app.get('/api/locations/:id/tents', async (req, res) => {
 // GET /api/locations/:id/tents/:tent/blocks
 app.get('/api/locations/:id/tents/:tent/blocks', async (req, res) => {
   try {
+    const user = getUserFromRequest(req);
+    if (!canAccessAllocationLocation(user, req.params.id)) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
     const data = await getTentBlocks(req.params.id, Number(req.params.tent));
     if (!data) return res.status(404).json({ error: 'tent_not_found' });
     
@@ -3464,6 +3403,10 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block', async (req, res) => {
 // GET /api/locations/:id/tents/:tent/blocks/:block
 app.get('/api/locations/:id/tents/:tent/blocks/:block', async (req, res) => {
   try {
+    const user = getUserFromRequest(req);
+    if (!canAccessAllocationLocation(user, req.params.id)) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
     const data = await getBlockDetail(
       req.params.id, 
       Number(req.params.tent), 
@@ -3506,9 +3449,7 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
     }
 
     // Validate date range
-    if (new Date(startDate) > new Date(endDate)) {
-      return res.status(400).json({ error: 'invalid_date_range', message: 'start_date must be before or equal to end_date' });
-    }
+    validateAllocationDateRange({ startDate, endDate });
 
     const totalCount = Number(maleCount) + Number(femaleCount);
     if (totalCount <= 0) {
@@ -3941,6 +3882,9 @@ app.post('/api/allocations/smart-reserve', async (req, res) => {
       items: finalPlan.items.map(i=>({ locationId: i.locationId, tentIndex: i.tentIndex, blockIndex: i.blockIndex, bedNumber: i.bedNumber, gender: i.gender }))
     });
   } catch (e) {
+    if (e instanceof AccommodationEligibilityError) {
+      return handleAccommodationError(res, e, 'smart_reserve_failed');
+    }
     console.error('[SMART-RESERVE ERROR]', {
       error: e.message,
       code: e.code,
@@ -3989,6 +3933,9 @@ app.get('/api/allocations/by-phone/:phone', async (req, res) => {
         a.verified_categories,
         a.sai_connect_id,
         a.sai_connect_age,
+        a.caretaker_for_allocation_id,
+        delegate.name AS caretaker_for_name,
+        delegate.bed_number AS caretaker_for_bed,
         a.person_photo_key,
         a.aadhaar_photo_key,
         a.deleted_at,
@@ -4000,7 +3947,8 @@ app.get('/api/allocations/by-phone/:phone', async (req, res) => {
       JOIN locations l ON l.id = a.location_id
       LEFT JOIN tents t ON t.location_id = a.location_id AND t.tent_index = a.tent_index
       LEFT JOIN blocks b ON b.tent_id = a.tent_id AND b.block_index = a.block_index
-      WHERE (a.phone = $1 OR a.sai_connect_id = $1)
+      LEFT JOIN allocations delegate ON delegate.id = a.caretaker_for_allocation_id
+      WHERE (a.phone = $1 OR a.sai_connect_id = $1 OR a.sai_lookup_identifier = $1)
         ${locationScope}
         AND a.end_date >= ${todaySQL}
       ORDER BY a.created_at DESC
@@ -4033,7 +3981,11 @@ app.get('/api/allocations/by-phone/:phone', async (req, res) => {
 
 async function findPhoneAllocationTargets({ phone, batchId, allocationIds, user }) {
   const params = [phone];
-  const conditions = ['(phone = $1 OR sai_connect_id = $1)', 'deleted_at IS NULL'];
+  const conditions = [
+    '(phone = $1 OR sai_connect_id = $1 OR sai_lookup_identifier = $1)',
+    'deleted_at IS NULL',
+    `end_date >= ${todaySQL}`,
+  ];
   if (batchId) {
     conditions.push(`batch_id = $${params.push(batchId)}`);
   }
@@ -4046,7 +3998,11 @@ async function findPhoneAllocationTargets({ phone, batchId, allocationIds, user 
     conditions.push(`location_id = $${params.push(Number(user.locationId))}`);
   }
   const result = await execQuery(`
-    SELECT id, name, phone, gender, location_id, category_source, verified_categories
+    SELECT id, name, phone, gender, location_id, tent_index, block_index, bed_number,
+           category_source, verified_categories,
+           caretaker_for_allocation_id,
+           TO_CHAR(start_date, 'YYYY-MM-DD') AS start_date,
+           TO_CHAR(end_date, 'YYYY-MM-DD') AS end_date
     FROM allocations
     WHERE ${conditions.join(' AND ')}
     ORDER BY id
@@ -4068,10 +4024,16 @@ app.get('/api/allocations/by-phone', async (req, res) => {
       : '';
     const rows = await execQuery(`
       SELECT id, batch_id, status, reserved_expires_at, location_id, tent_index, block_index,
-             bed_number, name, phone, gender, start_date, end_date, emergency_phone,
-             accommodation_category, category_source, verified_categories, sai_connect_id, sai_connect_age
+             bed_number, name, phone, gender,
+             TO_CHAR(start_date, 'YYYY-MM-DD') AS start_date,
+             TO_CHAR(end_date, 'YYYY-MM-DD') AS end_date,
+             emergency_phone,
+             accommodation_category, category_source, verified_categories, sai_connect_id, sai_connect_age,
+             caretaker_for_allocation_id
       FROM allocations
-      WHERE (phone = $1 OR sai_connect_id = $1) AND deleted_at IS NULL
+      WHERE (phone = $1 OR sai_connect_id = $1 OR sai_lookup_identifier = $1)
+        AND deleted_at IS NULL
+        AND end_date >= ${todaySQL}
         ${locationScope}
       ORDER BY batch_id NULLS LAST, created_at DESC
     `, params);
@@ -4087,6 +4049,7 @@ app.get('/api/allocations/by-phone', async (req, res) => {
         accommodationCategory: r.accommodation_category, categorySource: r.category_source,
         verifiedCategories: r.verified_categories || [], saiConnectId: r.sai_connect_id,
         saiConnectAge: r.sai_connect_age == null ? null : Number(r.sai_connect_age),
+        caretakerForAllocationId: r.caretaker_for_allocation_id == null ? null : Number(r.caretaker_for_allocation_id),
       });
       batches[key].statuses.add(r.status);
       if (r.status === 'reserved' && r.reserved_expires_at && (!batches[key].expiresAt || batches[key].expiresAt < r.reserved_expires_at)) {
@@ -4189,15 +4152,45 @@ app.patch('/api/allocations/by-phone/update-end-date', async (req, res) => {
     if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
     const { phone, endDate, batchId, allocationIds } = req.body || {};
     if (!phone || !endDate) return res.status(400).json({ error: 'missing_fields' });
+    validateAllocationDateRange({ startDate: endDate, endDate });
 
     const targets = await findPhoneAllocationTargets({ phone, batchId, allocationIds, user });
     const targetIds = targets.map((target) => Number(target.id));
+    const targetIdSet = new Set(targetIds);
+    for (const target of targets) {
+      if (target.caretaker_for_allocation_id && !targetIdSet.has(Number(target.caretaker_for_allocation_id))) {
+        validateCaretakerDateEditAllowed({
+          isCaretaker: true,
+          currentStartDate: target.start_date,
+          currentEndDate: target.end_date,
+          nextEndDate: endDate,
+        });
+      }
+      validateAllocationDateRange({
+        startDate: target.start_date,
+        endDate,
+      });
+    }
+
     const r = targetIds.length > 0
-      ? await execQuery('UPDATE allocations SET end_date = $1, updated_at = NOW() WHERE id = ANY($2::bigint[])', [endDate, targetIds])
+      ? await withTransaction(async (client) => {
+          const updated = await client.query(
+            'UPDATE allocations SET end_date = $1, updated_at = NOW() WHERE id = ANY($2::bigint[])',
+            [endDate, targetIds]
+          );
+          await client.query(
+            'UPDATE allocations SET end_date = $1, updated_at = NOW() WHERE caretaker_for_allocation_id = ANY($2::bigint[]) AND deleted_at IS NULL',
+            [endDate, targetIds]
+          );
+          return updated;
+        })
       : { rowCount: 0 };
     await logAudit(req, 'update_end_date', 'allocation', null, { phone, endDate, batchId, allocationIds, updated: r.rowCount });
     res.json({ ok: true, updated: r.rowCount });
   } catch (e) {
+    if (e instanceof AccommodationEligibilityError) {
+      return handleAccommodationError(res, e, 'update_end_date_failed');
+    }
     console.error(e);
     if (e.code === '23P01') return res.status(409).json({ error: 'overlap_after_update' });
     res.status(500).json({ error: 'update_end_date_failed' });
@@ -4215,6 +4208,21 @@ app.post('/api/allocations/by-phone/deallocate', async (req, res) => {
 
     const targets = await findPhoneAllocationTargets({ phone, batchId, allocationIds, user });
     const targetIds = targets.map((target) => Number(target.id));
+    if (targetIds.length > 0) {
+      const caretakerRows = await execQuery(
+        `SELECT id, caretaker_for_allocation_id
+         FROM allocations
+         WHERE caretaker_for_allocation_id = ANY($1::bigint[])
+           AND deleted_at IS NULL
+           AND end_date >= ${todaySQL}`,
+        [targetIds]
+      );
+      validateCaretakerDeallocationAllowed({
+        targetIds,
+        activeCaretakers: caretakerRows.rows,
+        batchMode: targetIds.length > 1,
+      });
+    }
     const allocationsToDelete = { rows: targets };
     const r = targetIds.length > 0
       ? await execQuery('UPDATE allocations SET deleted_at = NOW(), updated_at = NOW() WHERE id = ANY($1::bigint[])', [targetIds])
@@ -4223,22 +4231,22 @@ app.post('/api/allocations/by-phone/deallocate', async (req, res) => {
     // Create audit log entries for each deallocated allocation
     if (allocationsToDelete.rows.length > 0) {
       for (const alloc of allocationsToDelete.rows) {
-        await execQuery(
-          `INSERT INTO audit_logs (user_id, action, entity_type, entity_id, details, created_at)
-           VALUES ($1, $2, $3, $4, $5, NOW())`,
-          [
-            user.id,
-            'deallocate',
-            'allocation',
-            alloc.id,
-            JSON.stringify({ reason: reason || 'not_specified', phone })
-          ]
-        );
+        await logAudit(req, 'deallocate', 'allocation', alloc.id, {
+          reason: reason || 'not_specified',
+          phone,
+          locationId: alloc.location_id,
+          tentIndex: alloc.tent_index,
+          blockIndex: alloc.block_index,
+          bedNumber: alloc.bed_number,
+        });
       }
     }
 
     res.json({ ok: true, deallocated: r.rowCount });
   } catch (e) {
+    if (e instanceof AccommodationEligibilityError) {
+      return handleAccommodationError(res, e, 'deallocate_failed');
+    }
     console.error(e);
     res.status(500).json({ error: 'deallocate_failed' });
   }
@@ -4262,7 +4270,7 @@ app.get('/api/allocations/departures', async (req, res) => {
     const validSortOrder = sortOrder?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
 
     // Build WHERE conditions
-    let whereConditions = ['a.deleted_at IS NULL', 'a.end_date = $1'];
+    let whereConditions = ['a.deleted_at IS NULL', "a.status = 'confirmed'", 'a.end_date = $1'];
     let params = [date];
     let paramCounter = 2;
 
@@ -4300,11 +4308,15 @@ app.get('/api/allocations/departures', async (req, res) => {
              a.tent_index, t.name as tent_name, a.block_index, b.name as block_name, 
              a.bed_number, a.gender, a.status, a.start_date, a.end_date,
              a.accommodation_category, a.category_source, a.verified_categories,
-             a.sai_connect_id, a.sai_connect_age
+             a.sai_connect_id, a.sai_connect_age,
+             a.caretaker_for_allocation_id,
+             delegate.name AS caretaker_for_name,
+             delegate.bed_number AS caretaker_for_bed
       FROM allocations a
       LEFT JOIN locations l ON a.location_id = l.id
       LEFT JOIN tents t ON a.location_id = t.location_id AND a.tent_index = t.tent_index
       LEFT JOIN blocks b ON t.id = b.tent_id AND a.block_index = b.block_index
+      LEFT JOIN allocations delegate ON delegate.id = a.caretaker_for_allocation_id
       WHERE ${whereClause}
       ORDER BY ${validSortField === 'location_name' ? 'l.name' : 'a.' + validSortField} ${validSortOrder}
       LIMIT $${paramCounter} OFFSET $${paramCounter + 1}
@@ -4347,7 +4359,7 @@ app.post('/api/allocations/departures/send-csv', async (req, res) => {
     const validSortOrder = sortOrder?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
 
     // Build WHERE conditions
-    let whereConditions = ['a.deleted_at IS NULL', 'a.end_date = $1'];
+    let whereConditions = ['a.deleted_at IS NULL', "a.status = 'confirmed'", 'a.end_date = $1'];
     let params = [date];
     let paramCounter = 2;
 
@@ -4389,6 +4401,7 @@ app.post('/api/allocations/departures/send-csv', async (req, res) => {
         a.accommodation_category,
         a.sai_connect_id,
         a.sai_connect_age,
+        a.caretaker_for_allocation_id,
         a.created_at
       FROM allocations a
       LEFT JOIN locations l ON a.location_id = l.id
@@ -4537,11 +4550,15 @@ app.get('/api/allocations/currently-occupied', async (req, res) => {
              a.tent_index, t.name as tent_name, a.block_index, b.name as block_name, 
              a.bed_number, a.gender, a.status, a.start_date, a.end_date,
              a.accommodation_category, a.category_source, a.verified_categories,
-             a.sai_connect_id, a.sai_connect_age
+             a.sai_connect_id, a.sai_connect_age,
+             a.caretaker_for_allocation_id,
+             delegate.name AS caretaker_for_name,
+             delegate.bed_number AS caretaker_for_bed
       FROM allocations a
       LEFT JOIN locations l ON a.location_id = l.id
       LEFT JOIN tents t ON a.location_id = t.location_id AND a.tent_index = t.tent_index
       LEFT JOIN blocks b ON t.id = b.tent_id AND a.block_index = b.block_index
+      LEFT JOIN allocations delegate ON delegate.id = a.caretaker_for_allocation_id
       WHERE ${whereClause}
       ORDER BY ${validSortField === 'location_name' ? 'l.name' : 'a.' + validSortField} ${validSortOrder}
       LIMIT $${paramCounter} OFFSET $${paramCounter + 1}
@@ -4833,6 +4850,20 @@ app.get('/api/admin/analytics', async (req, res) => {
       GROUP BY LOWER(a.gender)
     `, params);
 
+    // 2b. Category breakdown
+    const categoryResult = await execQuery(`
+      SELECT
+        CASE
+          WHEN a.caretaker_for_allocation_id IS NOT NULL THEN 'caretaker'
+          ELSE COALESCE(LOWER(a.accommodation_category), 'devotee')
+        END AS category,
+        COUNT(*) AS count
+      FROM allocations a
+      WHERE ${whereClause}
+        ${exclusionSubquery}
+      GROUP BY 1
+    `, params);
+
     // 3. Daily allocations timeline
     const dailyAllocationsResult = await execQuery(`
       SELECT 
@@ -4876,19 +4907,25 @@ app.get('/api/admin/analytics', async (req, res) => {
     }
 
     if (locationId) {
-      deallocConditions.push(`(al.details->>'locationId')::int = $${deallocParamCounter}`);
+      deallocConditions.push(
+        `COALESCE(a_d.location_id, CASE WHEN (al.details->>'locationId') ~ '^[0-9]+$' THEN (al.details->>'locationId')::int END) = $${deallocParamCounter}::int`
+      );
       deallocParams.push(locationId);
       deallocParamCounter++;
     }
 
     if (tentIndex) {
-      deallocConditions.push(`(al.details->>'tentIndex')::int = $${deallocParamCounter}`);
+      deallocConditions.push(
+        `COALESCE(a_d.tent_index, CASE WHEN (al.details->>'tentIndex') ~ '^[0-9]+$' THEN (al.details->>'tentIndex')::int END) = $${deallocParamCounter}::int`
+      );
       deallocParams.push(tentIndex);
       deallocParamCounter++;
     }
 
     if (blockIndex) {
-      deallocConditions.push(`(al.details->>'blockIndex')::int = $${deallocParamCounter}`);
+      deallocConditions.push(
+        `COALESCE(a_d.block_index, CASE WHEN (al.details->>'blockIndex') ~ '^[0-9]+$' THEN (al.details->>'blockIndex')::int END) = $${deallocParamCounter}::int`
+      );
       deallocParams.push(blockIndex);
       deallocParamCounter++;
     }
@@ -4901,6 +4938,7 @@ app.get('/api/admin/analytics', async (req, res) => {
         COALESCE(al.details->>'reason', 'not_specified') as reason,
         COUNT(*) as count
       FROM audit_logs al
+      LEFT JOIN allocations a_d ON a_d.id = al.entity_id
       WHERE ${deallocWhereClause}
       GROUP BY DATE(al.created_at), al.details->>'reason'
       ORDER BY date, reason
@@ -4940,6 +4978,7 @@ app.get('/api/admin/analytics', async (req, res) => {
       data: {
         totalAllocations: parseInt(totalResult.rows[0]?.total || 0),
         genderBreakdown: genderResult.rows,
+        categoryBreakdown: categoryResult.rows,
         dailyAllocations: dailyAllocationsResult.rows,
         dailyDepartures: dailyDeparturesResult.rows,
         dailyDeallocations: dailyDeallocationsResult.rows,
@@ -4957,14 +4996,21 @@ app.get('/api/allocations/reserved-active', async (_req, res) => {
   try {
     const user = getUserFromRequest(_req);
     if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
+    const params = [];
+    const locationFilter = user.role === 'location_user' && user.locationId
+      ? `AND a.location_id = $${params.push(Number(user.locationId))}`
+      : '';
     const rows = await execQuery(`
       SELECT a.id, a.batch_id, a.phone, a.name, a.location_id, l.name as location_name, a.tent_index, a.block_index, a.bed_number, 
              a.reserved_expires_at, a.start_date, a.end_date, a.gender
       FROM allocations a
       LEFT JOIN locations l ON a.location_id = l.id
-      WHERE a.deleted_at IS NULL AND a.status = 'reserved' AND (a.reserved_expires_at IS NULL OR a.reserved_expires_at > NOW())
+      WHERE a.deleted_at IS NULL
+        AND a.status = 'reserved'
+        AND (a.reserved_expires_at IS NULL OR a.reserved_expires_at > NOW())
+        ${locationFilter}
       ORDER BY a.location_id, a.tent_index, a.block_index, a.batch_id, a.created_at
-    `);
+    `, params);
     res.json({ ok: true, items: rows.rows });
   } catch (e) {
     console.error(e);
@@ -4983,10 +5029,15 @@ app.post('/api/allocations/confirm', async (req, res) => {
 
     const confirmedIds = await withTransaction(async (client) => {
       // Select target rows (reserved and not expired)
+      const selectParams = [batchId];
+      const locationClause = user.role === 'location_user'
+        ? `AND location_id = $${selectParams.push(Number(user.locationId))}`
+        : '';
       const target = await client.query(`
         SELECT id FROM allocations
         WHERE batch_id = $1 AND status = 'reserved' AND (reserved_expires_at IS NULL OR reserved_expires_at > NOW())
-      `, [batchId]);
+          ${locationClause}
+      `, selectParams);
 
       let ids = target.rows.map(r=>r.id);
       if (Array.isArray(allocationIds) && allocationIds.length) {
@@ -5061,6 +5112,9 @@ app.post('/api/upload-url', async (req, res) => {
     if (!photoType || !locationId) {
       return res.status(400).json({ error: 'missing_required_fields' });
     }
+    if (!canAccessAllocationLocation(user, locationId)) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
 
     if (photoType !== 'person' && photoType !== 'aadhaar') {
       return res.status(400).json({ error: 'invalid_photo_type' });
@@ -5132,7 +5186,11 @@ app.patch('/api/allocations/:id', async (req, res) => {
 
     // Validate allocation exists and is not deleted
     const existing = await execQuery(
-      'SELECT * FROM allocations WHERE id = $1 AND deleted_at IS NULL',
+      `SELECT *,
+              TO_CHAR(start_date, 'YYYY-MM-DD') AS start_date_str,
+              TO_CHAR(end_date, 'YYYY-MM-DD') AS end_date_str
+       FROM allocations
+       WHERE id = $1 AND deleted_at IS NULL`,
       [id]
     );
 
@@ -5150,6 +5208,20 @@ app.patch('/api/allocations/:id', async (req, res) => {
       current,
       updates: { name, phone, gender },
     });
+
+    validateCaretakerDateEditAllowed({
+      isCaretaker: Boolean(current.caretaker_for_allocation_id),
+      currentStartDate: current.start_date_str,
+      currentEndDate: current.end_date_str,
+      nextStartDate: startDate,
+      nextEndDate: endDate,
+    });
+    if (startDate !== undefined || endDate !== undefined) {
+      validateAllocationDateRange({
+        startDate: startDate ?? current.start_date_str,
+        endDate: endDate ?? current.end_date_str,
+      });
+    }
 
     // If gender is being updated, validate gender restrictions
     if (gender !== undefined && gender !== current.gender) {
@@ -5217,7 +5289,17 @@ app.patch('/api/allocations/:id', async (req, res) => {
       RETURNING *
     `;
 
-    const result = await execQuery(query, values);
+    const result = await withTransaction(async (client) => {
+      const updated = await client.query(query, values);
+      if ((startDate !== undefined || endDate !== undefined) && !current.caretaker_for_allocation_id) {
+        await client.query(`
+          UPDATE allocations
+          SET start_date = $1, end_date = $2, updated_at = NOW()
+          WHERE caretaker_for_allocation_id = $3 AND deleted_at IS NULL
+        `, [updated.rows[0].start_date, updated.rows[0].end_date, current.id]);
+      }
+      return updated;
+    });
 
     await logAudit(req, 'update', 'allocation', id, { 
       updated_fields: Object.keys(req.body),
@@ -5228,6 +5310,13 @@ app.patch('/api/allocations/:id', async (req, res) => {
   } catch (e) {
     if (e instanceof AccommodationEligibilityError) {
       return handleAccommodationError(res, e, 'update_failed');
+    }
+    if (e.code === '23P01') {
+      return res.status(409).json({
+        error: 'overlapping_allocation',
+        message: 'Cannot update: The new dates conflict with an existing booking',
+        detail: e.detail,
+      });
     }
     console.error(e);
     res.status(500).json({ error: 'update_failed' });
@@ -5272,8 +5361,8 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       return res.status(400).json({ error: 'missing_required_fields' });
     }
 
-    if (!isCaretaker && new Date(startDate) > new Date(endDate)) {
-      return res.status(400).json({ error: 'invalid_date_range', message: 'start_date must be before or equal to end_date' });
+    if (!isCaretaker) {
+      validateAllocationDateRange({ startDate, endDate });
     }
 
     const verification = saiVerificationToken
@@ -5319,20 +5408,26 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       const verifiedSaiLookupIdentifier = saiIdentity.lookupIdentifier;
       const verifiedSaiConnectId = saiIdentity.saiConnectId;
       const verifiedSaiAge = saiIdentity.age;
-      const saiIdentityLockKey = verifiedSaiConnectId || verifiedSaiLookupIdentifier;
-      if (saiIdentityLockKey) {
-        await client.query(
-          'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
-          [saiIdentityLockKey]
-        );
+      const saiCriteria = resolveSaiIdentityLookupCriteria({
+        saiConnectId: verifiedSaiConnectId,
+        lookupIdentifier: verifiedSaiLookupIdentifier,
+        mobileNo: saiIdentity.verified ? verification?.mobileNo : null,
+      });
+      if (saiCriteria.hasCriteria) {
+        for (const lockKey of saiCriteria.lockKeys) {
+          await client.query(
+            'SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+            [lockKey]
+          );
+        }
         const existingIdentity = await findExistingSaiAllocation(
           client.query.bind(client),
-          verifiedSaiConnectId,
-          verifiedSaiLookupIdentifier,
-          { forUpdate: true }
+          saiCriteria.saiConnectId,
+          saiCriteria.lookupIdentifier,
+          { forUpdate: true, mobileNo: saiCriteria.mobileNo }
         );
         validateSaiIdentityAvailable({
-          identifier: saiIdentityLockKey,
+          identifier: verifiedSaiConnectId || verifiedSaiLookupIdentifier || saiCriteria.mobileNo,
           existingAllocation: existingIdentity,
         });
       }
@@ -5365,9 +5460,11 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       let effectiveStartDate = startDate;
       let effectiveEndDate = endDate;
       let delegateAllocationId = null;
+      let caretakerForName = null;
+      let caretakerForBedNumber = null;
       if (isCaretaker) {
         const targetResult = await client.query(`
-          SELECT id, block_id, accommodation_category, start_date, end_date, deleted_at
+          SELECT id, block_id, accommodation_category, start_date, end_date, deleted_at, name, bed_number
           FROM allocations
           WHERE id = $1
             AND deleted_at IS NULL
@@ -5375,9 +5472,18 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
             AND end_date >= ${todaySQL}
           FOR UPDATE
         `, [Number(caretakerForAllocationId)]);
+        await client.query(`
+          UPDATE allocations
+          SET deleted_at = NOW(), updated_at = NOW()
+          WHERE caretaker_for_allocation_id = $1
+            AND deleted_at IS NULL
+            AND end_date < ${todaySQL}
+        `, [Number(caretakerForAllocationId)]);
         const caretakerResult = await client.query(`
           SELECT id FROM allocations
-          WHERE caretaker_for_allocation_id = $1 AND deleted_at IS NULL
+          WHERE caretaker_for_allocation_id = $1
+            AND deleted_at IS NULL
+            AND end_date >= ${todaySQL}
           LIMIT 1
         `, [Number(caretakerForAllocationId)]);
         const target = validateCaretakerTarget({
@@ -5388,6 +5494,8 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
         effectiveStartDate = target.startDate;
         effectiveEndDate = target.endDate;
         delegateAllocationId = target.delegateAllocationId;
+        caretakerForName = targetResult.rows[0]?.name || null;
+        caretakerForBedNumber = targetResult.rows[0]?.bed_number ?? null;
       }
 
       validateCategoryAllowedInBlock({
@@ -5409,7 +5517,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
           $18,$19,$20,$21,$22
         )
         RETURNING id, name, phone, gender, accommodation_category, category_source,
-                  sai_connect_id, sai_connect_age, caretaker_for_allocation_id,
+                  verified_categories, sai_connect_id, sai_connect_age, caretaker_for_allocation_id,
                   TO_CHAR(start_date, 'YYYY-MM-DD') AS start_date,
                   TO_CHAR(end_date, 'YYYY-MM-DD') AS end_date,
                   emergency_phone, person_photo_key, aadhaar_photo_key, status
@@ -5437,7 +5545,11 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
         verifiedSaiAge,
         delegateAllocationId,
       ]);
-      return insertResult.rows[0];
+      return {
+        ...insertResult.rows[0],
+        caretaker_for_name: caretakerForName,
+        caretaker_for_bed_number: caretakerForBedNumber,
+      };
     });
 
     const allocationId = allocation.id;
@@ -5464,9 +5576,12 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
       aadhaarPhotoKey: allocation.aadhaar_photo_key,
       accommodationCategory: allocation.accommodation_category,
       categorySource: allocation.category_source,
+      verifiedCategories: allocation.verified_categories || [],
       saiConnectId: allocation.sai_connect_id,
       saiConnectAge: allocation.sai_connect_age,
       caretakerForAllocationId: allocation.caretaker_for_allocation_id,
+      caretakerForName: allocation.caretaker_for_name,
+      caretakerForBedNumber: allocation.caretaker_for_bed_number,
     };
 
     console.log(`[ALLOCATE] Total time: ${Date.now() - startTime}ms`);
@@ -5505,6 +5620,10 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
     const locationId = Number(req.params.id);
     const tentIndex = Number(req.params.tent);
     const blockIndex = Number(req.params.block);
+    const user = getUserFromRequest(req);
+    if (user?.role === 'location_user' && Number(user.locationId) !== locationId) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
     validateBulkSaiIdentityAbsent(req.body);
     
     const { name, phone, maleCount, femaleCount, startDate, endDate, emergencyPhone } = req.body || {};
@@ -5514,9 +5633,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
     }
 
     // Validate date range
-    if (new Date(startDate) > new Date(endDate)) {
-      return res.status(400).json({ error: 'invalid_date_range', message: 'start_date must be before or equal to end_date' });
-    }
+    validateAllocationDateRange({ startDate, endDate });
 
     const totalCount = (maleCount || 0) + (femaleCount || 0);
     if (totalCount <= 0) {
@@ -5735,6 +5852,20 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
       updates: { name, phone, gender },
     });
 
+    validateCaretakerDateEditAllowed({
+      isCaretaker: Boolean(current.caretaker_for_allocation_id),
+      currentStartDate: current.start_date,
+      currentEndDate: current.end_date,
+      nextStartDate: startDate,
+      nextEndDate: endDate,
+    });
+    if (startDate !== undefined || endDate !== undefined) {
+      validateAllocationDateRange({
+        startDate: startDate ?? current.start_date,
+        endDate: endDate ?? current.end_date,
+      });
+    }
+
     // Build dynamic UPDATE query
     const updates = [];
     const values = [];
@@ -5785,13 +5916,27 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
       updates.push(`aadhaar_photo_key = $${paramIndex++}`);
       values.push(aadhaarPhotoKey);
     }
-    if (accommodationCategory !== undefined) {
+    if (accommodationCategory !== undefined && accommodationCategory !== current.accommodation_category) {
       try {
         validateAccommodationCategoryEditPermission(user);
       } catch {
         return res.status(403).json({ error: 'forbidden', message: 'Only an administrator can change accommodation category.' });
       }
-      const nextCategory = validateAdminCategoryChange(accommodationCategory);
+      let hasActiveCaretaker = false;
+      if (current.accommodation_category === 'delegate') {
+        const caretakerCheck = await execQuery(`
+          SELECT id FROM allocations
+          WHERE caretaker_for_allocation_id = $1
+            AND deleted_at IS NULL
+            AND end_date >= ${todaySQL}
+          LIMIT 1
+        `, [current.id]);
+        hasActiveCaretaker = caretakerCheck.rowCount > 0;
+      }
+      const nextCategory = validateAdminCategoryChange(accommodationCategory, {
+        currentCategory: current.accommodation_category,
+        hasActiveCaretaker,
+      });
       const blockResult = await execQuery('SELECT allowed_categories FROM blocks WHERE id = $1', [blockId]);
       validateCategoryAllowedInBlock({
         accommodationCategory: nextCategory,
@@ -5837,7 +5982,8 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
                 TO_CHAR(start_date, 'YYYY-MM-DD') as start_date,
                 TO_CHAR(end_date, 'YYYY-MM-DD') as end_date,
                 person_photo_key, aadhaar_photo_key, status,
-                accommodation_category, category_source, caretaker_for_allocation_id
+                accommodation_category, category_source, verified_categories,
+                sai_connect_id, sai_connect_age, caretaker_for_allocation_id
     `;
     
     const result = await withTransaction(async (client) => {
@@ -5852,6 +5998,16 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
       return updated;
     });
     const updatedAllocation = result.rows[0];
+    let caretakerForName = null;
+    let caretakerForBedNumber = null;
+    if (updatedAllocation.caretaker_for_allocation_id) {
+      const delegateRes = await execQuery(
+        'SELECT name, bed_number FROM allocations WHERE id = $1',
+        [updatedAllocation.caretaker_for_allocation_id]
+      );
+      caretakerForName = delegateRes.rows[0]?.name || null;
+      caretakerForBedNumber = delegateRes.rows[0]?.bed_number ?? null;
+    }
     console.log(`[EDIT] UPDATE: ${Date.now() - t3}ms`);
 
     // Log audit in background (non-blocking)
@@ -5874,7 +6030,12 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
       aadhaarPhotoKey: updatedAllocation.aadhaar_photo_key,
       accommodationCategory: updatedAllocation.accommodation_category,
       categorySource: updatedAllocation.category_source,
+      verifiedCategories: updatedAllocation.verified_categories || [],
+      saiConnectId: updatedAllocation.sai_connect_id,
+      saiConnectAge: updatedAllocation.sai_connect_age,
       caretakerForAllocationId: updatedAllocation.caretaker_for_allocation_id,
+      caretakerForName,
+      caretakerForBedNumber,
     };
 
     console.log(`[EDIT] Total time: ${Date.now() - startTime}ms`);
@@ -5911,6 +6072,10 @@ app.delete('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async
     const tentIndex = Number(req.params.tent);
     const blockIndex = Number(req.params.block);
     const bedNumber = Number(req.params.bedNumber);
+    const user = getUserFromRequest(req);
+    if (user?.role === 'location_user' && Number(user.locationId) !== locationId) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
     const { wasOccupied, reason } = req.body || {}; // Get wasOccupied flag and reason from request body (default to empty object)
     
     const blockId = await validateBedWithinBlock(locationId, tentIndex, blockIndex, bedNumber);
@@ -5932,7 +6097,9 @@ app.delete('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async
     const caretakerResult = await execQuery(`
       SELECT id
       FROM allocations
-      WHERE caretaker_for_allocation_id = $1 AND deleted_at IS NULL
+      WHERE caretaker_for_allocation_id = $1
+        AND deleted_at IS NULL
+        AND end_date >= ${todaySQL}
       LIMIT 1
     `, [allocationId]);
     if (caretakerResult.rowCount > 0) {
@@ -5963,6 +6130,10 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/deallocate-batch', a
     const locationId = Number(req.params.id);
     const tentIndex = Number(req.params.tent);
     const blockIndex = Number(req.params.block);
+    const user = getUserFromRequest(req);
+    if (user?.role === 'location_user' && Number(user.locationId) !== locationId) {
+      return res.status(403).json({ error: 'forbidden' });
+    }
     const bedNumbers = Array.isArray(req.body?.bedNumbers) ? req.body.bedNumbers.map(Number).filter(n=>Number.isFinite(n)) : [];
     if (bedNumbers.length === 0) return res.status(400).json({ error: 'no_beds' });
 
@@ -5992,6 +6163,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/deallocate-batch', a
       FROM latest delegate
       JOIN allocations caretaker ON caretaker.caretaker_for_allocation_id = delegate.id
       WHERE caretaker.deleted_at IS NULL
+        AND caretaker.end_date >= ${todaySQL}
         AND caretaker.id NOT IN (SELECT id FROM latest)
       LIMIT 1
     `, [blockId, bedNumbers]);
@@ -6084,10 +6256,17 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/batch-edit', async (
       }
     }
 
-    if (name !== undefined || phone !== undefined || normalizedGender !== undefined) {
+    if (start_date !== undefined && end_date !== undefined) {
+      validateAllocationDateRange({ startDate: start_date, endDate: end_date });
+    }
+
+    if (name !== undefined || phone !== undefined || normalizedGender !== undefined || start_date !== undefined || end_date !== undefined) {
       const currentAllocations = await execQuery(`
         SELECT DISTINCT ON (a.bed_number)
-          a.bed_number, a.name, a.phone, a.gender, a.category_source, a.verified_categories
+          a.id, a.bed_number, a.name, a.phone, a.gender, a.category_source, a.verified_categories,
+          a.caretaker_for_allocation_id,
+          TO_CHAR(a.start_date, 'YYYY-MM-DD') AS start_date,
+          TO_CHAR(a.end_date, 'YYYY-MM-DD') AS end_date
         FROM allocations a
         WHERE a.block_id = $1
           AND a.bed_number = ANY($2::int[])
@@ -6095,6 +6274,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/batch-edit', async (
           AND a.end_date >= ${todaySQL}
         ORDER BY a.bed_number, a.created_at DESC
       `, [blockId, bedNumbers]);
+      const selectedIds = new Set(currentAllocations.rows.map((row) => Number(row.id)));
       try {
         for (const current of currentAllocations.rows) {
           validateSaiProfileEditPermission({
@@ -6102,9 +6282,24 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/batch-edit', async (
             current,
             updates: { name, phone, gender: normalizedGender },
           });
+          if (current.caretaker_for_allocation_id && !selectedIds.has(Number(current.caretaker_for_allocation_id))) {
+            validateCaretakerDateEditAllowed({
+              isCaretaker: true,
+              currentStartDate: current.start_date,
+              currentEndDate: current.end_date,
+              nextStartDate: start_date,
+              nextEndDate: end_date,
+            });
+          }
+          if (start_date !== undefined || end_date !== undefined) {
+            validateAllocationDateRange({
+              startDate: start_date ?? current.start_date,
+              endDate: end_date ?? current.end_date,
+            });
+          }
         }
       } catch (error) {
-        return res.status(403).json({ error: error.code, message: error.message });
+        return handleAccommodationError(res, error, 'batch_edit_failed');
       }
     }
 
@@ -6155,7 +6350,13 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/batch-edit', async (
         SET ${setClauses.join(', ')}
         FROM latest l
         WHERE a.id = l.id
-        RETURNING l.bed_number
+        RETURNING a.id, l.bed_number, a.start_date, a.end_date
+      ), sync_caretakers AS (
+        UPDATE allocations c
+        SET start_date = u.start_date, end_date = u.end_date, updated_at = NOW()
+        FROM upd u
+        WHERE c.caretaker_for_allocation_id = u.id
+          AND c.deleted_at IS NULL
       )
       SELECT 
         (SELECT COUNT(*) FROM upd) AS success,
@@ -6167,6 +6368,16 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/batch-edit', async (
     await logAudit(req, 'batch_edit', 'batch', blockId, { locationId, tentIndex, blockIndex, bedNumbers, updates, success: Number(row.success || 0), failed: errors.length });
     res.json({ ok: true, success: Number(row.success || 0), errors });
   } catch (e) {
+    if (e instanceof AccommodationEligibilityError) {
+      return handleAccommodationError(res, e, 'batch_edit_failed');
+    }
+    if (e.code === '23P01') {
+      return res.status(409).json({
+        error: 'overlapping_allocation',
+        message: 'Cannot update: The new dates conflict with an existing booking',
+        detail: e.detail,
+      });
+    }
     console.error(e);
     res.status(500).json({ error: 'batch_edit_failed' });
   }
@@ -6201,6 +6412,9 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/bulk-import-csv',
       const locationId = Number(req.params.id);
       const tentIndex = Number(req.params.tent);
       const blockIndex = Number(req.params.block);
+      if (user.role === 'location_user' && Number(user.locationId) !== locationId) {
+        return res.status(403).json({ error: 'forbidden' });
+      }
 
       if (!req.file) {
         return res.status(400).json({ error: 'no_csv_file', message: 'CSV file is required' });
@@ -6266,41 +6480,10 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/bulk-import-csv',
         const rowNum = i + 2; // Account for header row
 
         try {
-          // Extract and validate fields
-          const name = row['Name']?.trim();
-          const gender = row['Gender']?.trim();
-          const phone = row['Phone']?.trim();
-          const emergencyPhone = row['Emergency Phone']?.trim() || null;
-          const startDate = row['Start date']?.trim();
-          const endDate = row['End date']?.trim();
-
-          // Validate required fields
-          if (!name) throw new Error('Name is required');
-          if (!phone) throw new Error('Phone is required');
-          if (!startDate) throw new Error('Start date is required');
-          if (!endDate) throw new Error('End date is required');
-
-          // Normalize gender
-          const validGenders = ['Male', 'Female', 'Other'];
-          const normalizedGender = validGenders.find(g => g.toLowerCase() === gender?.toLowerCase()) || 'Other';
-
-          // Validate gender restriction
-          if (genderRestriction === 'male_only' && normalizedGender.toLowerCase() !== 'male') {
-            throw new Error('Block is male-only');
-          }
-          if (genderRestriction === 'female_only' && normalizedGender.toLowerCase() !== 'female') {
-            throw new Error('Block is female-only');
-          }
-
-          // Add to batch for insertion
+          const validatedRow = validateCsvAllocationRow(row, { genderRestriction });
           allocationsToInsert.push({
             rowNum,
-            name,
-            phone,
-            emergencyPhone,
-            gender: normalizedGender,
-            startDate,
-            endDate
+            ...validatedRow,
           });
 
         } catch (rowErr) {
@@ -6321,6 +6504,24 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/bulk-import-csv',
           message: 'No valid records to import',
           results
         });
+      }
+
+      // Soft-delete expired reservations in this block before selecting/inserting beds
+      // so the GiST overlap exclusion constraint (WHERE deleted_at IS NULL) does not conflict
+      try {
+        await execQuery(`
+          UPDATE allocations
+          SET deleted_at = NOW(), updated_at = NOW()
+          WHERE block_id = $1
+            AND status = 'reserved'
+            AND deleted_at IS NULL
+            AND (
+              (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
+              OR end_date < ${todaySQL}
+            )
+        `, [blockId]);
+      } catch (cleanupErr) {
+        console.error('[CSV-IMPORT] Cleanup error:', cleanupErr.message);
       }
 
       // Find available beds for all allocations
@@ -6458,6 +6659,13 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/bulk-import-csv',
       });
 
     } catch (e) {
+      if (e?.code === '23P01') {
+        return res.status(409).json({
+          error: 'overlapping_allocation',
+          message: 'One or more beds in this block already have conflicting bookings for the selected dates.',
+          detail: e.detail,
+        });
+      }
       console.error('[CSV-IMPORT] Error:', e);
       res.status(500).json({ error: 'csv_import_failed', message: e.message });
     }

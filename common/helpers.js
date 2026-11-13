@@ -180,6 +180,22 @@ export async function validateBedWithinCapacity(locationId, bedNumber) {
 // ...existing code...
 
 export async function getLocationTents(locationId) {
+  try {
+    await execQuery(`
+      UPDATE allocations
+      SET deleted_at = NOW(), updated_at = NOW()
+      WHERE location_id = $1
+        AND deleted_at IS NULL
+        AND status = 'reserved'
+        AND (
+          (reserved_expires_at IS NOT NULL AND reserved_expires_at <= NOW())
+          OR end_date < ${todaySQL}
+        )
+    `, [locationId]);
+  } catch (cleanupErr) {
+    console.error('[getLocationTents] Cleanup error:', cleanupErr.message);
+  }
+
   // Validate location exists
   const locRes = await execQuery(`SELECT id, name, capacity FROM locations WHERE id = $1`, [locationId]);
   if (locRes.rowCount === 0) return null;

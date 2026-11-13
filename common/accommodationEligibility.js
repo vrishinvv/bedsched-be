@@ -102,16 +102,132 @@ export function resolveSaiProfileForAllocation({
   const isMatched = verification?.outcome === 'matched'
     || (Array.isArray(verification?.verifiedCategories) && verification.verifiedCategories.length > 0);
   const mustUseVerifiedProfile = user?.role !== 'admin' && isMatched;
-  const verifiedPhone = /^\d{10}$/.test(String(verification?.mobileNo || ''))
-    ? String(verification.mobileNo)
+  const verifiedName = isMatched ? String(verification?.fullName || '').trim() : '';
+  const verifiedPhone = isMatched && /^\d{10}$/.test(String(verification?.mobileNo || '').trim())
+    ? String(verification.mobileNo).trim()
     : null;
+  const cleanSubmittedName = String(submittedName || '').trim();
+  const cleanSubmittedPhone = String(submittedPhone || '').trim();
   return {
-    name: mustUseVerifiedProfile && String(verification?.fullName || '').trim()
-      ? String(verification.fullName).trim()
-      : String(submittedName || '').trim(),
-    phone: mustUseVerifiedProfile && verifiedPhone ? verifiedPhone : (submittedPhone || null),
+    name: mustUseVerifiedProfile && verifiedName
+      ? verifiedName
+      : (cleanSubmittedName || verifiedName),
+    phone: mustUseVerifiedProfile && verifiedPhone
+      ? verifiedPhone
+      : (cleanSubmittedPhone || verifiedPhone || null),
     verifiedGender: mustUseVerifiedProfile ? verification?.gender || null : null,
   };
+}
+
+export function resolveSaiIdentityLookupCriteria({
+  saiConnectId,
+  lookupIdentifier,
+  mobileNo,
+} = {}) {
+  const cleanSaiId = String(saiConnectId || '').trim() || null;
+  const cleanLookup = String(lookupIdentifier || '').trim() || null;
+  const rawMobile = String(mobileNo || '').replace(/\D/g, '');
+  const lookupDigits = String(cleanLookup || '').replace(/\D/g, '');
+  const cleanMobile = /^\d{10}$/.test(rawMobile)
+    ? rawMobile
+    : (/^\d{10}$/.test(lookupDigits) && lookupDigits === cleanLookup ? lookupDigits : null);
+  const lockKeys = Array.from(
+    new Set([cleanSaiId, cleanLookup, cleanMobile].filter(Boolean))
+  ).sort();
+  return {
+    saiConnectId: cleanSaiId,
+    lookupIdentifier: cleanLookup,
+    mobileNo: cleanMobile,
+    hasCriteria: Boolean(cleanSaiId || cleanLookup || cleanMobile),
+    lockKeys,
+  };
+}
+
+export function validateCaretakerDeallocationAllowed({
+  targetIds = [],
+  activeCaretakers = [],
+  batchMode = false,
+} = {}) {
+  const targetSet = new Set(targetIds.map((id) => Number(id)));
+  const orphaned = activeCaretakers.find((row) => {
+    const caretakerId = Number(row.id ?? row.caretaker_id ?? row.caretakerId);
+    const delegateId = Number(row.caretaker_for_allocation_id ?? row.delegate_id ?? row.delegateId);
+    return targetSet.has(delegateId) && !targetSet.has(caretakerId);
+  });
+  if (orphaned) {
+    fail(
+      'delegate_has_caretaker',
+      batchMode
+        ? 'Include the linked caretaker when deallocating a Delegate.'
+        : 'Remove the linked caretaker before removing this Delegate.',
+      'caretakerForAllocationId'
+    );
+  }
+}
+
+export function normalizeDateString(val) {
+  if (!val) return '';
+  if (val instanceof Date) {
+    if (Number.isNaN(val.getTime())) return '';
+    if (
+      val.getHours() === 0
+      && val.getMinutes() === 0
+      && val.getSeconds() === 0
+      && val.getMilliseconds() === 0
+    ) {
+      const y = val.getFullYear();
+      const m = String(val.getMonth() + 1).padStart(2, '0');
+      const d = String(val.getDate()).padStart(2, '0');
+      return `${y}-${m}-${d}`;
+    }
+    return val.toISOString().slice(0, 10);
+  }
+  return String(val).trim().slice(0, 10);
+}
+
+export function isValidIsoDateString(value) {
+  const str = String(value ?? '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(str)) return false;
+  const [year, month, day] = str.split('-').map(Number);
+  const utc = new Date(Date.UTC(year, month - 1, day));
+  return (
+    utc.getUTCFullYear() === year
+    && utc.getUTCMonth() === month - 1
+    && utc.getUTCDate() === day
+  );
+}
+
+export function validateAllocationDateRange({ startDate, endDate } = {}) {
+  const start = normalizeDateString(startDate);
+  const end = normalizeDateString(endDate);
+  if (!isValidIsoDateString(start) || !isValidIsoDateString(end)) {
+    fail('invalid_date_range', 'Enter valid start and end dates in YYYY-MM-DD format.', 'startDate');
+  }
+  if (start > end) {
+    fail('invalid_date_range', 'End date must be on or after start date.', 'endDate');
+  }
+  return { startDate: start, endDate: end };
+}
+
+export function validateCaretakerDateEditAllowed({
+  isCaretaker = false,
+  currentStartDate,
+  currentEndDate,
+  nextStartDate,
+  nextEndDate,
+} = {}) {
+  if (!isCaretaker) return;
+  const startChanged = nextStartDate !== undefined
+    && normalizeDateString(nextStartDate) !== normalizeDateString(currentStartDate);
+  const endChanged = nextEndDate !== undefined
+    && normalizeDateString(nextEndDate) !== normalizeDateString(currentEndDate);
+  if (startChanged || endChanged) {
+    fail(
+      'caretaker_dates_locked',
+      'Caretaker stay dates follow the linked Delegate and cannot be edited independently.',
+      'startDate'
+    );
+  }
 }
 
 export function validateSaiProfileEditPermission({ user, current, updates } = {}) {
@@ -214,7 +330,13 @@ export function resolveVerifiedCategory({ verifiedCategories, requestedCategory 
   };
 }
 
-export function validateAdminCategoryChange(value) {
+export function validateAdminCategoryChange(value, { currentCategory = null, hasActiveCaretaker = false } = {}) {
+  if (currentCategory && value === currentCategory) {
+    return value;
+  }
+  if (currentCategory === 'delegate' && value !== 'delegate' && hasActiveCaretaker) {
+    fail('delegate_has_caretaker', 'Remove the linked caretaker before changing this Delegate’s category.');
+  }
   if (value === 'delegate') {
     fail('delegate_requires_verification', 'Delegate status requires Sai Connect verification.');
   }
