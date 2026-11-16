@@ -79,6 +79,7 @@ const existingSaiAllocationSelect = `
     a.id,
     a.location_id,
     a.bed_number,
+    a.sai_connect_id,
     l.name AS location_name,
     t.tent_index,
     t.name AS tent_name,
@@ -118,7 +119,21 @@ async function findExistingSaiAllocation(
     `${existingSaiAllocationSelect} LIMIT 1${forUpdate ? ' FOR UPDATE OF a' : ''}`,
     [criteria.saiConnectId, criteria.lookupIdentifier, criteria.mobileNo]
   );
-  return result.rows[0] || null;
+  const match = result.rows[0] || null;
+
+  // Cross-validate: if both the lookup and the matched allocation have
+  // a sai_connect_id but they differ, the match was a phone-number
+  // coincidence (e.g. family members sharing a phone) — not a duplicate.
+  if (
+    match
+    && criteria.saiConnectId
+    && match.sai_connect_id
+    && match.sai_connect_id !== criteria.saiConnectId
+  ) {
+    return null;
+  }
+
+  return match;
 }
 
 function presentExistingSaiAllocation(allocation) {
