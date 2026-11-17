@@ -4879,6 +4879,51 @@ app.get('/api/admin/analytics', async (req, res) => {
       GROUP BY 1
     `, params);
 
+    // 2c. Category split by gender. This is the source for the plain-language
+    // category comparison on the dashboard, so gender is normalized once here.
+    const categoryGenderResult = await execQuery(`
+      SELECT
+        CASE
+          WHEN a.caretaker_for_allocation_id IS NOT NULL THEN 'caretaker'
+          ELSE COALESCE(LOWER(a.accommodation_category), 'devotee')
+        END AS category,
+        CASE
+          WHEN LOWER(a.gender) = 'male' THEN 'male'
+          WHEN LOWER(a.gender) = 'female' THEN 'female'
+          ELSE 'other'
+        END AS gender,
+        COUNT(*) AS count
+      FROM allocations a
+      WHERE ${whereClause}
+        ${exclusionSubquery}
+      GROUP BY 1, 2
+      ORDER BY 1, 2
+    `, params);
+
+    // 2d. The same split at location grain powers the location comparison and
+    // each location's category-by-gender detail without extra browser requests.
+    const locationCategoryGenderResult = await execQuery(`
+      SELECT
+        a.location_id,
+        COALESCE(l.name, 'Unknown location') AS location_name,
+        CASE
+          WHEN a.caretaker_for_allocation_id IS NOT NULL THEN 'caretaker'
+          ELSE COALESCE(LOWER(a.accommodation_category), 'devotee')
+        END AS category,
+        CASE
+          WHEN LOWER(a.gender) = 'male' THEN 'male'
+          WHEN LOWER(a.gender) = 'female' THEN 'female'
+          ELSE 'other'
+        END AS gender,
+        COUNT(*) AS count
+      FROM allocations a
+      LEFT JOIN locations l ON l.id = a.location_id
+      WHERE ${whereClause}
+        ${exclusionSubquery}
+      GROUP BY a.location_id, l.name, 3, 4
+      ORDER BY l.name, 3, 4
+    `, params);
+
     // 3. Daily allocations timeline
     const dailyAllocationsResult = await execQuery(`
       SELECT 
@@ -4986,6 +5031,25 @@ app.get('/api/admin/analytics', async (req, res) => {
       ORDER BY date, username
     `, params);
 
+    const allocatorTotals = Array.from(userAllocationsResult.rows.reduce((totals, row) => {
+      const username = row.username || 'Unknown';
+      const current = totals.get(username) || {
+        username,
+        count: 0,
+        locationNames: new Set(),
+      };
+      current.count += Number(row.count || 0);
+      if (row.location_name) current.locationNames.add(row.location_name);
+      totals.set(username, current);
+      return totals;
+    }, new Map()).values())
+      .map((row) => ({
+        username: row.username,
+        count: row.count,
+        locationNames: Array.from(row.locationNames).sort(),
+      }))
+      .sort((a, b) => b.count - a.count || a.username.localeCompare(b.username));
+
     await logAudit(req, 'view_analytics', 'report', null, { filters: req.query });
 
     res.json({
@@ -4994,10 +5058,13 @@ app.get('/api/admin/analytics', async (req, res) => {
         totalAllocations: parseInt(totalResult.rows[0]?.total || 0),
         genderBreakdown: genderResult.rows,
         categoryBreakdown: categoryResult.rows,
+        categoryGenderBreakdown: categoryGenderResult.rows,
+        locationCategoryGenderBreakdown: locationCategoryGenderResult.rows,
         dailyAllocations: dailyAllocationsResult.rows,
         dailyDepartures: dailyDeparturesResult.rows,
         dailyDeallocations: dailyDeallocationsResult.rows,
-        userAllocations: userAllocationsResult.rows
+        userAllocations: userAllocationsResult.rows,
+        allocatorTotals,
       }
     });
   } catch (e) {
