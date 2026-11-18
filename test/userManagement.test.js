@@ -21,6 +21,25 @@ test('normalizes a valid location user payload', () => {
       password: 'safe-password',
       role: 'location_user',
       locationId: 61,
+      locationIds: [61],
+    }
+  );
+});
+
+test('normalizes multiple locations for a shared location user', () => {
+  assert.deepEqual(
+    validateCreateUserInput({
+      username: 'dir_1',
+      password: 'safe-password',
+      role: 'location_user',
+      locationIds: ['9', 3, '9', 7],
+    }),
+    {
+      username: 'dir_1',
+      password: 'safe-password',
+      role: 'location_user',
+      locationId: 3,
+      locationIds: [3, 7, 9],
     }
   );
 });
@@ -33,6 +52,7 @@ test('allows global roles without a location', () => {
       role,
     });
     assert.equal(result.locationId, null);
+    assert.deepEqual(result.locationIds, []);
   }
 });
 

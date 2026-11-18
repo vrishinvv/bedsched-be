@@ -71,6 +71,7 @@ import {
 } from './common/helpers.js';
 import { generateUploadUrl, generateViewUrl } from './common/s3.js';
 import { validateLinkedReallocationTarget } from './common/reallocationEligibility.js';
+import { getAccessibleLocationIds, resolveLocationAccessScope } from './common/locationAccess.js';
 
 const app = express();
 
@@ -255,6 +256,17 @@ function getUserFromRequest(req) {
   return readAuthenticatedUser(req, config.jwtSecret);
 }
 
+function locationScopeClause(user, requestedLocationId, params, column = 'a.location_id') {
+  const scope = resolveLocationAccessScope(user, requestedLocationId);
+  if (scope.forbidden) return { forbidden: true, clause: '' };
+  if (scope.locationIds === null) return { forbidden: false, clause: '' };
+  params.push(scope.locationIds);
+  return {
+    forbidden: false,
+    clause: `${column} = ANY($${params.length}::int[])`,
+  };
+}
+
 // Global guard for API routes, excluding auth/health/seed.
 // The seed route has its own production hard-stop so an empty development
 // database can still be initialized without existing credentials.
@@ -369,10 +381,24 @@ app.post('/api/auth/login', async (req, res) => {
     const { username, password } = req.body || {};
     if (!username || !password) return res.status(400).json({ error: 'missing_credentials' });
 
-    const r = await execQuery(
-      `SELECT id, username, password, role, location_id FROM users WHERE username = $1 LIMIT 1`,
-      [username]
-    );
+    const r = await execQuery(`
+      SELECT
+        u.id,
+        u.username,
+        u.password,
+        u.role,
+        u.location_id,
+        COALESCE(
+          ARRAY_AGG(ula.location_id ORDER BY ula.location_id)
+            FILTER (WHERE ula.location_id IS NOT NULL),
+          ARRAY[]::INTEGER[]
+        ) AS location_ids
+      FROM users u
+      LEFT JOIN user_location_access ula ON ula.user_id = u.id
+      WHERE u.username = $1
+      GROUP BY u.id, u.username, u.password, u.role, u.location_id
+      LIMIT 1
+    `, [username]);
     if (!r.rowCount) return res.status(401).json({ error: 'invalid_credentials' });
     const u = r.rows[0];
     if (!(await verifyPassword(password, u.password))) {
@@ -381,7 +407,16 @@ app.post('/api/auth/login', async (req, res) => {
 
     const token = createAuthToken(u, config.jwtSecret);
     await logAudit(req, 'login', 'auth', u.id, { username: u.username, role: u.role });
-    res.json({ ok: true, user: { username: u.username, role: u.role, locationId: u.location_id }, token });
+    res.json({
+      ok: true,
+      user: {
+        username: u.username,
+        role: u.role,
+        locationId: u.location_id,
+        locationIds: u.location_ids,
+      },
+      token,
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'login_failed' });
@@ -545,8 +580,11 @@ app.post('/api/seed', async (req, res) => {
 app.get('/api/locations', async (_req, res) => {
   try {
     const data = await getLocationsWithStats();
-    
-    res.json(data);
+    const user = getUserFromRequest(_req);
+    const accessible = user?.role === 'location_user'
+      ? new Set(getAccessibleLocationIds(user).map(String))
+      : null;
+    res.json(accessible ? data.filter((location) => accessible.has(String(location.id))) : data);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'fetch_locations_failed' });
@@ -895,11 +933,6 @@ app.get('/api/allocations/table-view', async (req, res) => {
       block_index = ''
     } = req.query;
 
-    // Force location_user to only see their location's data
-    if (user.role === 'location_user' && user.locationId) {
-      location_id = String(user.locationId);
-    }
-    
     const offset = (Number(page) - 1) * Number(limit);
     
     // Validate sortField to prevent SQL injection
@@ -939,12 +972,11 @@ app.get('/api/allocations/table-view', async (req, res) => {
       paramCounter++;
     }
 
-    // Location filter
-    if (location_id) {
-      whereConditions.push(`a.location_id = $${paramCounter}`);
-      params.push(location_id);
-      paramCounter++;
-    }
+    // Location filter and authorization scope
+    const locationScope = locationScopeClause(user, location_id, params, 'a.location_id');
+    if (locationScope.forbidden) return res.status(403).json({ error: 'forbidden' });
+    if (locationScope.clause) whereConditions.push(locationScope.clause);
+    paramCounter = params.length + 1;
 
     // Tent filter
     if (tent_index) {
@@ -1150,10 +1182,21 @@ app.get('/api/admin/users', async (req, res) => {
         u.username,
         u.role,
         u.location_id,
-        l.name AS location_name,
+        COALESCE(
+          ARRAY_AGG(ula.location_id ORDER BY ula.location_id)
+            FILTER (WHERE ula.location_id IS NOT NULL),
+          ARRAY[]::INTEGER[]
+        ) AS location_ids,
+        COALESCE(
+          ARRAY_AGG(l.name ORDER BY l.name)
+            FILTER (WHERE l.name IS NOT NULL),
+          ARRAY[]::TEXT[]
+        ) AS location_names,
         u.created_at
       FROM users u
-      LEFT JOIN locations l ON l.id = u.location_id
+      LEFT JOIN user_location_access ula ON ula.user_id = u.id
+      LEFT JOIN locations l ON l.id = ula.location_id
+      GROUP BY u.id, u.username, u.role, u.location_id, u.created_at
       ORDER BY LOWER(u.username), u.id
     `);
 
@@ -1173,34 +1216,51 @@ app.post('/api/admin/users', async (req, res) => {
 
     const input = validateCreateUserInput(req.body);
 
-    if (input.locationId !== null) {
-      const location = await execQuery('SELECT id FROM locations WHERE id = $1', [input.locationId]);
-      if (!location.rowCount) {
+    if (input.locationIds.length > 0) {
+      const locations = await execQuery(
+        'SELECT id FROM locations WHERE id = ANY($1::int[])',
+        [input.locationIds]
+      );
+      if (locations.rowCount !== input.locationIds.length) {
         return res.status(400).json({
           error: 'invalid_location',
-          message: 'The selected location does not exist.',
-          field: 'locationId',
+          message: 'One or more selected locations do not exist.',
+          field: 'locationIds',
         });
       }
     }
 
     const passwordHash = await hashPassword(input.password);
-    const result = await execQuery(`
-      WITH inserted AS (
+    const createdUser = await withTransaction(async (client) => {
+      const inserted = await client.query(`
         INSERT INTO users (username, password, role, location_id)
         VALUES ($1, $2, $3, $4)
         RETURNING id, username, role, location_id, created_at
-      )
-      SELECT inserted.*, locations.name AS location_name
-      FROM inserted
-      LEFT JOIN locations ON locations.id = inserted.location_id
-    `, [input.username, passwordHash, input.role, input.locationId]);
-
-    const createdUser = result.rows[0];
+      `, [input.username, passwordHash, input.role, input.locationId]);
+      const userRow = inserted.rows[0];
+      if (input.locationIds.length > 0) {
+        await client.query(`
+          INSERT INTO user_location_access(user_id, location_id)
+          SELECT $1, UNNEST($2::int[])
+          ON CONFLICT (user_id, location_id) DO NOTHING
+        `, [userRow.id, input.locationIds]);
+      }
+      const names = input.locationIds.length > 0
+        ? await client.query(
+          'SELECT name FROM locations WHERE id = ANY($1::int[]) ORDER BY name',
+          [input.locationIds]
+        )
+        : { rows: [] };
+      return {
+        ...userRow,
+        location_ids: input.locationIds,
+        location_names: names.rows.map((row) => row.name),
+      };
+    });
     await logAudit(req, 'create_user', 'user', createdUser.id, {
       createdUsername: createdUser.username,
       role: createdUser.role,
-      locationId: createdUser.location_id,
+      locationIds: createdUser.location_ids,
     });
 
     res.status(201).json({ ok: true, user: createdUser });
@@ -2025,20 +2085,17 @@ app.get('/api/allocations/historical-deallocations', async (req, res) => {
       return res.status(400).json({ error: 'missing_date', message: 'Date parameter is required' });
     }
 
-    // Force location_user to only see their location's data
-    if (user.role === 'location_user' && user.locationId) {
-      location_id = String(user.locationId);
-    }
-
     // Build WHERE conditions for filters
     let filterConditions = '';
     let filterParams = [];
     let paramCounter = 2; // Start at 2 since $1 is used for date
 
-    if (location_id) {
-      filterConditions += ` AND l.id = $${paramCounter}`;
-      filterParams.push(location_id);
-      paramCounter++;
+    const locationScope = locationScopeClause(user, location_id, filterParams, 'l.id');
+    if (locationScope.forbidden) return res.status(403).json({ error: 'forbidden' });
+    if (locationScope.clause) {
+      // filterParams are appended after the date parameter used as $1.
+      filterConditions += ` AND ${locationScope.clause.replace('$1', '$2')}`;
+      paramCounter = 3;
     }
     if (tent_index) {
       filterConditions += ` AND t.tent_index = $${paramCounter}`;
@@ -2478,14 +2535,14 @@ app.get('/api/allocations/:allocationId/reallocate-options', async (req, res) =>
           WHERE id = $1
           ORDER BY name
         `, [allocation.location_id]);
-      } else if (user.role === 'location_user' && user.locationId) {
-        // Location users can only reallocate within their location
+      } else if (user.role === 'location_user') {
+        // Location users can reallocate within any explicitly assigned location.
         locationsQuery = await execQuery(`
           SELECT id, name, capacity 
           FROM locations 
-          WHERE id = $1
+          WHERE id = ANY($1::int[])
           ORDER BY name
-        `, [user.locationId]);
+        `, [getAccessibleLocationIds(user)]);
       } else {
         // Admin can reallocate to any location
         locationsQuery = await execQuery(`
@@ -2803,14 +2860,14 @@ app.post('/api/allocations/:allocationId/reallocate', async (req, res) => {
       hasCaretaker: oldAllocation.has_caretaker,
     });
 
-    // Permission check: location_user can only reallocate within their location
-    if (user.role === 'location_user') {
-      if (user.locationId !== oldAllocation.location_id || Number(newLocationId) !== user.locationId) {
-        return res.status(403).json({ 
-          error: 'forbidden',
-          message: 'You can only reallocate within your assigned location' 
-        });
-      }
+    if (
+      !canAccessAllocationLocation(user, oldAllocation.location_id)
+      || !canAccessAllocationLocation(user, newLocationId)
+    ) {
+      return res.status(403).json({
+        error: 'forbidden',
+        message: 'You can only reallocate within your assigned locations',
+      });
     }
 
     // Verify new block exists and get tent_index
@@ -3923,9 +3980,8 @@ app.get('/api/allocations/by-phone/:phone', async (req, res) => {
 
     const { phone } = req.params;
     const searchParams = [phone];
-    const locationScope = user.role === 'location_user'
-      ? `AND a.location_id = $${searchParams.push(Number(user.locationId))}`
-      : '';
+    const locationScope = locationScopeClause(user, '', searchParams, 'a.location_id');
+    if (locationScope.forbidden) return res.status(403).json({ error: 'forbidden' });
 
     const result = await execQuery(`
       SELECT 
@@ -3964,7 +4020,7 @@ app.get('/api/allocations/by-phone/:phone', async (req, res) => {
       LEFT JOIN blocks b ON b.tent_id = a.tent_id AND b.block_index = a.block_index
       LEFT JOIN allocations delegate ON delegate.id = a.caretaker_for_allocation_id
       WHERE (a.phone = $1 OR a.sai_connect_id = $1 OR a.sai_lookup_identifier = $1)
-        ${locationScope}
+        ${locationScope.clause ? `AND ${locationScope.clause}` : ''}
         AND a.end_date >= ${todaySQL}
       ORDER BY a.created_at DESC
     `, searchParams);
@@ -4010,7 +4066,9 @@ async function findPhoneAllocationTargets({ phone, batchId, allocationIds, user 
     conditions.push(`id = ANY($${params.push(ids)}::bigint[])`);
   }
   if (user?.role === 'location_user') {
-    conditions.push(`location_id = $${params.push(Number(user.locationId))}`);
+    const scope = locationScopeClause(user, '', params, 'location_id');
+    if (scope.forbidden) return [];
+    if (scope.clause) conditions.push(scope.clause);
   }
   const result = await execQuery(`
     SELECT id, name, phone, gender, location_id, tent_index, block_index, bed_number,
@@ -4034,9 +4092,8 @@ app.get('/api/allocations/by-phone', async (req, res) => {
     if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
 
     const params = [phone];
-    const locationScope = user.role === 'location_user'
-      ? `AND location_id = $${params.push(Number(user.locationId))}`
-      : '';
+    const locationScope = locationScopeClause(user, '', params, 'location_id');
+    if (locationScope.forbidden) return res.status(403).json({ error: 'forbidden' });
     const rows = await execQuery(`
       SELECT id, batch_id, status, reserved_expires_at, location_id, tent_index, block_index,
              bed_number, name, phone, gender,
@@ -4049,7 +4106,7 @@ app.get('/api/allocations/by-phone', async (req, res) => {
       WHERE (phone = $1 OR sai_connect_id = $1 OR sai_lookup_identifier = $1)
         AND deleted_at IS NULL
         AND end_date >= ${todaySQL}
-        ${locationScope}
+        ${locationScope.clause ? `AND ${locationScope.clause}` : ''}
       ORDER BY batch_id NULLS LAST, created_at DESC
     `, params);
 
@@ -4276,7 +4333,6 @@ app.get('/api/allocations/departures', async (req, res) => {
     if (!date) return res.status(400).json({ error: 'missing_date' });
 
     const { page = 1, limit = 50, sortField = 'bed_number', sortOrder = 'asc', location_id: requestedLocationId = '', tent_index = '', block_index = '' } = req.query;
-    const location_id = user.role === 'location_user' ? String(user.locationId) : requestedLocationId;
     const offset = (Number(page) - 1) * Number(limit);
     
     // Validate sortField to prevent SQL injection
@@ -4289,11 +4345,10 @@ app.get('/api/allocations/departures', async (req, res) => {
     let params = [date];
     let paramCounter = 2;
 
-    if (location_id) {
-      whereConditions.push(`a.location_id = $${paramCounter}`);
-      params.push(location_id);
-      paramCounter++;
-    }
+    const locationScope = locationScopeClause(user, requestedLocationId, params, 'a.location_id');
+    if (locationScope.forbidden) return res.status(403).json({ error: 'forbidden' });
+    if (locationScope.clause) whereConditions.push(locationScope.clause);
+    paramCounter = params.length + 1;
     if (tent_index) {
       whereConditions.push(`a.tent_index = $${paramCounter}`);
       params.push(tent_index);
@@ -4358,7 +4413,6 @@ app.post('/api/allocations/departures/send-csv', async (req, res) => {
     if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
 
     const { email, date, sortField = 'bed_number', sortOrder = 'asc', location_id: requestedLocationId = '', tent_index = '', block_index = '' } = req.body;
-    const location_id = user.role === 'location_user' ? String(user.locationId) : requestedLocationId;
     
     if (!email || !email.includes('@')) {
       return res.status(400).json({ error: 'invalid_email', message: 'Valid email address is required' });
@@ -4378,11 +4432,10 @@ app.post('/api/allocations/departures/send-csv', async (req, res) => {
     let params = [date];
     let paramCounter = 2;
 
-    if (location_id) {
-      whereConditions.push(`a.location_id = $${paramCounter}`);
-      params.push(location_id);
-      paramCounter++;
-    }
+    const locationScope = locationScopeClause(user, requestedLocationId, params, 'a.location_id');
+    if (locationScope.forbidden) return res.status(403).json({ error: 'forbidden' });
+    if (locationScope.clause) whereConditions.push(locationScope.clause);
+    paramCounter = params.length + 1;
     if (tent_index) {
       whereConditions.push(`a.tent_index = $${paramCounter}`);
       params.push(tent_index);
@@ -4513,7 +4566,6 @@ app.get('/api/allocations/currently-occupied', async (req, res) => {
     if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
 
     const { page = 1, limit = 50, sortField = 'bed_number', sortOrder = 'asc', location_id: requestedLocationId = '', tent_index = '', block_index = '' } = req.query;
-    const location_id = user.role === 'location_user' ? String(user.locationId) : requestedLocationId;
     const offset = (Number(page) - 1) * Number(limit);
     
     // Validate sortField to prevent SQL injection
@@ -4531,11 +4583,10 @@ app.get('/api/allocations/currently-occupied', async (req, res) => {
     let params = [];
     let paramCounter = 1;
 
-    if (location_id) {
-      whereConditions.push(`a.location_id = $${paramCounter}`);
-      params.push(location_id);
-      paramCounter++;
-    }
+    const locationScope = locationScopeClause(user, requestedLocationId, params, 'a.location_id');
+    if (locationScope.forbidden) return res.status(403).json({ error: 'forbidden' });
+    if (locationScope.clause) whereConditions.push(locationScope.clause);
+    paramCounter = params.length + 1;
     if (tent_index) {
       whereConditions.push(`a.tent_index = $${paramCounter}`);
       params.push(tent_index);
@@ -4600,7 +4651,6 @@ app.post('/api/allocations/currently-occupied/send-csv', async (req, res) => {
     if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
 
     const { email, sortField = 'bed_number', sortOrder = 'asc', location_id: requestedLocationId = '', tent_index = '', block_index = '' } = req.body;
-    const location_id = user.role === 'location_user' ? String(user.locationId) : requestedLocationId;
     
     if (!email || !email.includes('@')) {
       return res.status(400).json({ error: 'invalid_email', message: 'Valid email address is required' });
@@ -4621,11 +4671,10 @@ app.post('/api/allocations/currently-occupied/send-csv', async (req, res) => {
     let params = [];
     let paramCounter = 1;
 
-    if (location_id) {
-      whereConditions.push(`a.location_id = $${paramCounter}`);
-      params.push(location_id);
-      paramCounter++;
-    }
+    const locationScope = locationScopeClause(user, requestedLocationId, params, 'a.location_id');
+    if (locationScope.forbidden) return res.status(403).json({ error: 'forbidden' });
+    if (locationScope.clause) whereConditions.push(locationScope.clause);
+    paramCounter = params.length + 1;
     if (tent_index) {
       whereConditions.push(`a.tent_index = $${paramCounter}`);
       params.push(tent_index);
@@ -5079,9 +5128,9 @@ app.get('/api/allocations/reserved-active', async (_req, res) => {
     const user = getUserFromRequest(_req);
     if (!user || !['admin', 'location_user'].includes(user.role)) return res.status(403).json({ error: 'forbidden' });
     const params = [];
-    const locationFilter = user.role === 'location_user' && user.locationId
-      ? `AND a.location_id = $${params.push(Number(user.locationId))}`
-      : '';
+    const locationScope = locationScopeClause(user, '', params, 'a.location_id');
+    if (locationScope.forbidden) return res.status(403).json({ error: 'forbidden' });
+    const locationFilter = locationScope.clause ? `AND ${locationScope.clause}` : '';
     const rows = await execQuery(`
       SELECT a.id, a.batch_id, a.phone, a.name, a.location_id, l.name as location_name, a.tent_index, a.block_index, a.bed_number, 
              a.reserved_expires_at, a.start_date, a.end_date, a.gender
@@ -5112,9 +5161,9 @@ app.post('/api/allocations/confirm', async (req, res) => {
     const confirmedIds = await withTransaction(async (client) => {
       // Select target rows (reserved and not expired)
       const selectParams = [batchId];
-      const locationClause = user.role === 'location_user'
-        ? `AND location_id = $${selectParams.push(Number(user.locationId))}`
-        : '';
+      const locationScope = locationScopeClause(user, '', selectParams, 'location_id');
+      if (locationScope.forbidden) return null;
+      const locationClause = locationScope.clause ? `AND ${locationScope.clause}` : '';
       const target = await client.query(`
         SELECT id FROM allocations
         WHERE batch_id = $1 AND status = 'reserved' AND (reserved_expires_at IS NULL OR reserved_expires_at > NOW())
@@ -5415,7 +5464,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber/allocate'
 
   try {
     const user = getUserFromRequest(req);
-    if (user?.role === 'location_user' && Number(user.locationId) !== locationId) {
+    if (!canAccessAllocationLocation(user, locationId)) {
       return res.status(403).json({ error: 'forbidden' });
     }
 
@@ -5703,7 +5752,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/bulk-allocate', asyn
     const tentIndex = Number(req.params.tent);
     const blockIndex = Number(req.params.block);
     const user = getUserFromRequest(req);
-    if (user?.role === 'location_user' && Number(user.locationId) !== locationId) {
+    if (!canAccessAllocationLocation(user, locationId)) {
       return res.status(403).json({ error: 'forbidden' });
     }
     validateBulkSaiIdentityAbsent(req.body);
@@ -5872,7 +5921,7 @@ app.patch('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async 
     const bedNumber = Number(req.params.bedNumber);
     if (!Number.isFinite(bedNumber)) return res.status(400).json({ error: 'invalid_bed_number' });
     const user = getUserFromRequest(req);
-    if (user?.role === 'location_user' && Number(user.locationId) !== locationId) {
+    if (!canAccessAllocationLocation(user, locationId)) {
       return res.status(403).json({ error: 'forbidden' });
     }
     
@@ -6155,7 +6204,7 @@ app.delete('/api/locations/:id/tents/:tent/blocks/:block/beds/:bedNumber', async
     const blockIndex = Number(req.params.block);
     const bedNumber = Number(req.params.bedNumber);
     const user = getUserFromRequest(req);
-    if (user?.role === 'location_user' && Number(user.locationId) !== locationId) {
+    if (!canAccessAllocationLocation(user, locationId)) {
       return res.status(403).json({ error: 'forbidden' });
     }
     const { wasOccupied, reason } = req.body || {}; // Get wasOccupied flag and reason from request body (default to empty object)
@@ -6213,7 +6262,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/deallocate-batch', a
     const tentIndex = Number(req.params.tent);
     const blockIndex = Number(req.params.block);
     const user = getUserFromRequest(req);
-    if (user?.role === 'location_user' && Number(user.locationId) !== locationId) {
+    if (!canAccessAllocationLocation(user, locationId)) {
       return res.status(403).json({ error: 'forbidden' });
     }
     const bedNumbers = Array.isArray(req.body?.bedNumbers) ? req.body.bedNumbers.map(Number).filter(n=>Number.isFinite(n)) : [];
@@ -6299,7 +6348,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/beds/batch-edit', async (
     const tentIndex = Number(req.params.tent);
     const blockIndex = Number(req.params.block);
     const user = getUserFromRequest(req);
-    if (user?.role === 'location_user' && Number(user.locationId) !== locationId) {
+    if (!canAccessAllocationLocation(user, locationId)) {
       return res.status(403).json({ error: 'forbidden' });
     }
     const bedNumbers = Array.isArray(req.body?.bedNumbers) ? req.body.bedNumbers.map(Number).filter(n=>Number.isFinite(n)) : [];
@@ -6494,7 +6543,7 @@ app.post('/api/locations/:id/tents/:tent/blocks/:block/bulk-import-csv',
       const locationId = Number(req.params.id);
       const tentIndex = Number(req.params.tent);
       const blockIndex = Number(req.params.block);
-      if (user.role === 'location_user' && Number(user.locationId) !== locationId) {
+      if (!canAccessAllocationLocation(user, locationId)) {
         return res.status(403).json({ error: 'forbidden' });
       }
 

@@ -336,6 +336,14 @@ export async function applySplits2026(
     );
   }
 
+  await query(`
+    INSERT INTO user_location_access(user_id, location_id)
+    SELECT id, location_id
+    FROM users
+    WHERE role = 'location_user' AND location_id IS NOT NULL
+    ON CONFLICT (user_id, location_id) DO NOTHING
+  `);
+
   const summary = await query(`
     SELECT
       l.id,

@@ -14,8 +14,23 @@ test('accepts a valid signed bearer token', () => {
 
   assert.deepEqual(
     getUserFromRequest({ headers: { authorization: `Bearer ${token}` } }, secret),
-    { id: 7, username: 'admin', role: 'admin', locationId: null },
+    { id: 7, username: 'admin', role: 'admin', locationId: null, locationIds: [] },
   );
+});
+
+test('preserves all assigned locations in signed location-user tokens', () => {
+  const token = createAuthToken(
+    { id: 4, username: 'dir_1', role: 'location_user', locationId: 3, locationIds: [3, 7, 9, 12] },
+    secret,
+  );
+
+  assert.deepEqual(verifyAuthToken(token, secret), {
+    id: 4,
+    username: 'dir_1',
+    role: 'location_user',
+    locationId: 3,
+    locationIds: [3, 7, 9, 12],
+  });
 });
 
 test('does not trust legacy unsigned identity cookies', () => {

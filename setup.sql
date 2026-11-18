@@ -126,6 +126,16 @@ CREATE TABLE IF NOT EXISTS users (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS user_location_access (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, location_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_location_access_location_id
+  ON user_location_access(location_id);
+
 -- Seed two basic users (idempotent)
 INSERT INTO users(username, password, role)
 VALUES ('admin', 'admin', 'admin')

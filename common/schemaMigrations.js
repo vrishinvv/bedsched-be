@@ -4,6 +4,22 @@
  * never fails with missing-column errors during cutover.
  */
 const IDEMPOTENT_MIGRATION_SQL = `
+CREATE TABLE IF NOT EXISTS user_location_access (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, location_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_location_access_location_id
+  ON user_location_access(location_id);
+
+INSERT INTO user_location_access(user_id, location_id)
+SELECT id, location_id
+FROM users
+WHERE role = 'location_user' AND location_id IS NOT NULL
+ON CONFLICT (user_id, location_id) DO NOTHING;
+
 ALTER TABLE blocks
   ADD COLUMN IF NOT EXISTS allowed_categories TEXT[] NOT NULL
   DEFAULT ARRAY['delegate', 'sevadal', 'devotee']::TEXT[];
@@ -174,12 +190,15 @@ export function ensureSchemaMigrations(pool) {
           WHERE (table_name = 'blocks' AND column_name IN ('allowed_categories', 'minimum_age'))
              OR (table_name = 'allocations' AND column_name IN ('accommodation_category', 'sai_connect_id', 'sai_connect_age', 'caretaker_for_allocation_id'))
         `);
-        if (check.rows[0]?.cnt === 6) {
+        const accessTable = await pool.query(`
+          SELECT to_regclass('public.user_location_access') IS NOT NULL AS exists
+        `);
+        if (check.rows[0]?.cnt === 6 && accessTable.rows[0]?.exists) {
           return true;
         }
-        console.log('[DB] Applying idempotent 2026 schema migrations (007-010)...');
+        console.log('[DB] Applying idempotent schema migrations (007-011)...');
         await pool.query(IDEMPOTENT_MIGRATION_SQL);
-        console.log('[DB] Idempotent 2026 schema migrations applied successfully');
+        console.log('[DB] Idempotent schema migrations applied successfully');
         return true;
       } catch (err) {
         migrationPromise = null;

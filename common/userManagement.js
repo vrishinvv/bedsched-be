@@ -50,23 +50,30 @@ export function validateCreateUserInput(input = {}) {
     fail('invalid_role', 'Select a valid account role.', 'role');
   }
 
-  const rawLocationId = candidate.locationId;
-  const hasLocationId = rawLocationId !== undefined && rawLocationId !== null && rawLocationId !== '';
-  const locationId = hasLocationId ? Number(rawLocationId) : null;
+  const rawLocationIds = Array.isArray(candidate.locationIds)
+    ? candidate.locationIds
+    : [candidate.locationId];
+  const hasLocationAssignment = rawLocationIds.some(
+    (value) => value !== undefined && value !== null && value !== ''
+  );
+  const locationIds = Array.from(new Set(rawLocationIds
+    .filter((value) => value !== undefined && value !== null && value !== '')
+    .map(Number)));
 
   if (role === 'location_user') {
-    if (!Number.isSafeInteger(locationId) || locationId <= 0) {
-      fail('location_required', 'A location is required for a location user.', 'locationId');
+    if (locationIds.length === 0 || locationIds.some((id) => !Number.isSafeInteger(id) || id <= 0)) {
+      fail('location_required', 'At least one location is required for a location user.', 'locationIds');
     }
-  } else if (hasLocationId) {
-    fail('location_not_allowed', 'Only location users can be assigned to a location.', 'locationId');
+  } else if (hasLocationAssignment) {
+    fail('location_not_allowed', 'Only location users can be assigned to locations.', 'locationIds');
   }
 
   return {
     username,
     password,
     role,
-    locationId: role === 'location_user' ? locationId : null,
+    locationId: role === 'location_user' ? locationIds.sort((a, b) => a - b)[0] : null,
+    locationIds: role === 'location_user' ? locationIds : [],
   };
 }
 

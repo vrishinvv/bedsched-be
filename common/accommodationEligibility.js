@@ -1,10 +1,9 @@
+import { canAccessLocation } from './locationAccess.js';
+
 export const ACCOMMODATION_CATEGORIES = Object.freeze(['delegate', 'sevadal', 'devotee']);
 
 export function canAccessAllocationLocation(user, locationId) {
-  if (user?.role === 'admin') return true;
-  return user?.role === 'location_user'
-    && Number.isFinite(Number(user.locationId))
-    && Number(user.locationId) === Number(locationId);
+  return canAccessLocation(user, locationId);
 }
 
 export class AccommodationEligibilityError extends Error {
