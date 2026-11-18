@@ -9,6 +9,7 @@ import { parseCsvContent, validateCsvAllocationRow } from './common/csvImport.js
 import { config } from './common/configs.js';
 import { execQuery, withTransaction } from './common/db.js';
 import { isCronAuthorized, isSeedAllowed } from './common/runtimeGuards.js';
+import { canViewAnalytics, isDashboardApiRequestAllowed } from './common/rolePermissions.js';
 import { applySplits2026 } from './common/splits2026.js';
 import {
   UserValidationError,
@@ -280,11 +281,9 @@ app.use((req, res, next) => {
   const user = getUserFromRequest(req);
   if (!user) return res.status(401).json({ error: 'unauthorized' });
 
-  // Dashboard role restriction: allow GET /api/locations and smart-reserve; admin can access all
+  // Dashboard role restriction: analytics is read-only; existing dashboard actions stay available.
   if (user.role === 'dashboard') {
-    const isLocationsList = req.method === 'GET' && req.path === '/api/locations';
-    const isSmartReserve = req.method === 'POST' && req.path === '/api/allocations/smart-reserve';
-    if (!isLocationsList && !isSmartReserve) {
+    if (!isDashboardApiRequestAllowed(req.method, req.path)) {
       return res.status(403).json({ error: 'forbidden' });
     }
   }
@@ -4838,7 +4837,7 @@ app.get('/api/cron/backup', async (req, res) => {
 app.get('/api/admin/analytics', async (req, res) => {
   try {
     const user = getUserFromRequest(req);
-    if (!user || user.role !== 'admin') return res.status(403).json({ error: 'forbidden' });
+    if (!canViewAnalytics(user)) return res.status(403).json({ error: 'forbidden' });
 
     const { startDate, endDate, locationId, tentIndex, blockIndex } = req.query;
 
