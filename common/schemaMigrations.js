@@ -1,9 +1,27 @@
 /**
- * Idempotent schema migration guard for migrations 007–010 so deploying
+ * Idempotent schema migration guard for migrations 007–012 so deploying
  * the 2026 accommodation-eligibility release to an older Neon database
  * never fails with missing-column errors during cutover.
  */
 const IDEMPOTENT_MIGRATION_SQL = `
+CREATE TABLE IF NOT EXISTS room_state_assignments (
+  block_id INTEGER PRIMARY KEY REFERENCES blocks(id) ON DELETE CASCADE,
+  state_code TEXT NOT NULL CHECK (
+    state_code IN (
+      'AP', 'AR', 'AS', 'BR', 'CG', 'GA', 'GJ', 'HR', 'HP', 'JH',
+      'KA', 'KL', 'MP', 'MH', 'MN', 'ML', 'MZ', 'NL', 'OD', 'PB',
+      'RJ', 'SK', 'TN', 'TS', 'TR', 'UP', 'UK', 'WB'
+    )
+  ),
+  updated_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_room_state_assignments_updated_by
+  ON room_state_assignments(updated_by)
+  WHERE updated_by IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS user_location_access (
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
@@ -193,10 +211,13 @@ export function ensureSchemaMigrations(pool) {
         const accessTable = await pool.query(`
           SELECT to_regclass('public.user_location_access') IS NOT NULL AS exists
         `);
-        if (check.rows[0]?.cnt === 6 && accessTable.rows[0]?.exists) {
+        const roomStateTable = await pool.query(`
+          SELECT to_regclass('public.room_state_assignments') IS NOT NULL AS exists
+        `);
+        if (check.rows[0]?.cnt === 6 && accessTable.rows[0]?.exists && roomStateTable.rows[0]?.exists) {
           return true;
         }
-        console.log('[DB] Applying idempotent schema migrations (007-011)...');
+        console.log('[DB] Applying idempotent schema migrations (007-012)...');
         await pool.query(IDEMPOTENT_MIGRATION_SQL);
         console.log('[DB] Idempotent schema migrations applied successfully');
         return true;

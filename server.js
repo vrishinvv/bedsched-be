@@ -73,6 +73,12 @@ import {
 import { generateUploadUrl, generateViewUrl } from './common/s3.js';
 import { validateLinkedReallocationTarget } from './common/reallocationEligibility.js';
 import { getAccessibleLocationIds, resolveLocationAccessScope } from './common/locationAccess.js';
+import {
+  INDIAN_STATES,
+  RoomStateAssignmentError,
+  getIndianState,
+  normalizeIndianStateCode,
+} from './common/roomStateAssignments.js';
 
 const app = express();
 
@@ -575,55 +581,133 @@ app.post('/api/seed', async (req, res) => {
   }
 });
 
+async function getRoomStatusSnapshot(user) {
+  const locationNames = ['North', 'South', 'East', 'West', 'New Block C'];
+  const locationIds = user.role === 'location_user' ? getAccessibleLocationIds(user) : null;
+  const { rows } = await execQuery(`
+    SELECT l.id AS location_id, l.name AS location_name,
+           t.name AS section_name, t.tent_index,
+           b.id AS room_id, b.name AS room_name, b.block_index, b.size AS capacity,
+           rsa.state_code, rsa.updated_at AS state_updated_at,
+           COUNT(a.id)::int AS people_count
+    FROM locations l
+    LEFT JOIN tents t ON t.location_id = l.id
+    LEFT JOIN blocks b ON b.tent_id = t.id
+    LEFT JOIN room_state_assignments rsa ON rsa.block_id = b.id
+    LEFT JOIN allocations a ON a.block_id = b.id
+      AND a.deleted_at IS NULL
+      AND (
+        (a.status = 'confirmed' AND a.end_date >= ${todaySQL})
+        OR (a.status = 'reserved' AND a.reserved_expires_at > ${nowIST})
+      )
+    WHERE l.name = ANY($1::text[])
+      AND ($2::int[] IS NULL OR l.id = ANY($2::int[]))
+    GROUP BY l.id, t.id, b.id, rsa.state_code, rsa.updated_at
+    ORDER BY array_position($1::text[], l.name), t.tent_index, b.block_index
+  `, [locationNames, locationIds]);
+
+  const locations = new Map();
+  for (const row of rows) {
+    if (!locations.has(row.location_id)) {
+      locations.set(row.location_id, { id: row.location_id, name: row.location_name, rooms: [] });
+    }
+    if (row.room_id === null) continue;
+    const state = getIndianState(row.state_code);
+    locations.get(row.location_id).rooms.push({
+      id: row.room_id,
+      name: row.room_name || String(row.block_index),
+      section: row.section_name || `Section ${row.tent_index}`,
+      capacity: row.capacity,
+      peopleCount: row.people_count,
+      stateCode: state?.code || null,
+      stateName: state?.name || null,
+      stateUpdatedAt: row.state_updated_at || null,
+    });
+  }
+
+  return {
+    locations: [...locations.values()],
+    states: INDIAN_STATES,
+    canEditStateAssignments: user.role === 'admin',
+    refreshedAt: new Date().toISOString(),
+  };
+}
+
 app.get('/api/room-status', async (req, res) => {
   const user = getUserFromRequest(req);
   if (!canViewRoomStatus(user)) return res.status(403).json({ error: 'forbidden' });
 
-  const locationNames = ['North', 'South', 'East', 'West', 'New Block C'];
-  const locationIds = user.role === 'location_user' ? getAccessibleLocationIds(user) : null;
-
   try {
-    // Use the pool directly: this report only reads established tables and does not need migrations.
-    const { rows } = await db.query(`
-      SELECT l.id AS location_id, l.name AS location_name,
-             t.name AS section_name, t.tent_index,
-             b.id AS room_id, b.name AS room_name, b.block_index, b.size AS capacity,
-             COUNT(a.id)::int AS people_count
-      FROM locations l
-      LEFT JOIN tents t ON t.location_id = l.id
-      LEFT JOIN blocks b ON b.tent_id = t.id
-      LEFT JOIN allocations a ON a.block_id = b.id
-        AND a.deleted_at IS NULL
-        AND (
-          (a.status = 'confirmed' AND a.end_date >= ${todaySQL})
-          OR (a.status = 'reserved' AND a.reserved_expires_at > ${nowIST})
-        )
-      WHERE l.name = ANY($1::text[])
-        AND ($2::int[] IS NULL OR l.id = ANY($2::int[]))
-      GROUP BY l.id, t.id, b.id
-      ORDER BY array_position($1::text[], l.name), t.tent_index, b.block_index
-    `, [locationNames, locationIds]);
-
-    const locations = new Map();
-    for (const row of rows) {
-      if (!locations.has(row.location_id)) {
-        locations.set(row.location_id, { id: row.location_id, name: row.location_name, rooms: [] });
-      }
-      if (row.room_id === null) continue;
-      locations.get(row.location_id).rooms.push({
-        id: row.room_id,
-        name: row.room_name || String(row.block_index),
-        section: row.section_name || `Section ${row.tent_index}`,
-        capacity: row.capacity,
-        peopleCount: row.people_count,
-      });
-    }
-
+    const snapshot = await getRoomStatusSnapshot(user);
     res.set('Cache-Control', 'no-store');
-    res.json({ locations: [...locations.values()], refreshedAt: new Date().toISOString() });
+    res.json(snapshot);
   } catch (error) {
     console.error('Room status query failed:', error);
     res.status(500).json({ error: 'room_status_failed' });
+  }
+});
+
+app.patch('/api/room-status/:blockId/state', async (req, res) => {
+  const user = getUserFromRequest(req);
+  if (!canManageAccommodationStructure(user)) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+
+  try {
+    const blockId = validateEntityId(req.params.blockId, 'blockId');
+    const stateCode = normalizeIndianStateCode(req.body?.stateCode, { allowEmpty: true });
+    const result = await withTransaction(async (client) => {
+      const blockResult = await client.query(`
+        SELECT b.id, b.name, b.block_index, l.name AS location_name
+        FROM blocks b
+        JOIN locations l ON l.id = b.location_id
+        WHERE b.id = $1
+        FOR UPDATE OF b
+      `, [blockId]);
+      if (!blockResult.rowCount) {
+        throw new StructureRequestError(404, 'room_not_found', 'Room not found.');
+      }
+
+      const previousResult = await client.query(
+        'SELECT state_code FROM room_state_assignments WHERE block_id = $1',
+        [blockId],
+      );
+      const previousStateCode = previousResult.rows[0]?.state_code || null;
+
+      if (stateCode) {
+        await client.query(`
+          INSERT INTO room_state_assignments (block_id, state_code, updated_by)
+          VALUES ($1, $2, $3)
+          ON CONFLICT (block_id) DO UPDATE
+          SET state_code = EXCLUDED.state_code,
+              updated_by = EXCLUDED.updated_by,
+              updated_at = NOW()
+        `, [blockId, stateCode, user.id || null]);
+      } else {
+        await client.query('DELETE FROM room_state_assignments WHERE block_id = $1', [blockId]);
+      }
+
+      await logAudit(req, 'update_room_state_assignment', 'block', blockId, {
+        roomName: blockResult.rows[0].name || String(blockResult.rows[0].block_index),
+        locationName: blockResult.rows[0].location_name,
+        previousStateCode,
+        stateCode,
+      }, client.query.bind(client));
+
+      return { previousStateCode };
+    });
+
+    const state = getIndianState(stateCode);
+    res.json({
+      ok: true,
+      assignment: state ? { blockId, stateCode: state.code, stateName: state.name } : null,
+      previousStateCode: result.previousStateCode,
+    });
+  } catch (error) {
+    if (error instanceof RoomStateAssignmentError) {
+      return res.status(400).json({ error: error.code, message: error.message, field: error.field });
+    }
+    return handleStructureError(res, error, 'update_room_state_assignment_failed');
   }
 });
 
