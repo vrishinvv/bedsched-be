@@ -7,9 +7,9 @@ import multer from 'multer';
 import { createAuthToken, getUserFromRequest as readAuthenticatedUser } from './common/auth.js';
 import { parseCsvContent, validateCsvAllocationRow } from './common/csvImport.js';
 import { config } from './common/configs.js';
-import { execQuery, withTransaction } from './common/db.js';
+import { db, execQuery, withTransaction } from './common/db.js';
 import { isCronAuthorized, isSeedAllowed } from './common/runtimeGuards.js';
-import { canViewAnalytics, isDashboardApiRequestAllowed } from './common/rolePermissions.js';
+import { canViewAnalytics, canViewRoomStatus, isDashboardApiRequestAllowed } from './common/rolePermissions.js';
 import { applySplits2026 } from './common/splits2026.js';
 import {
   UserValidationError,
@@ -572,6 +572,58 @@ app.post('/api/seed', async (req, res) => {
   } catch (e) {
     console.error('[SEED ERROR]', e);
     res.status(500).json({ error: 'seed_failed', message: e.message });
+  }
+});
+
+app.get('/api/room-status', async (req, res) => {
+  const user = getUserFromRequest(req);
+  if (!canViewRoomStatus(user)) return res.status(403).json({ error: 'forbidden' });
+
+  const locationNames = ['North', 'South', 'East', 'West', 'New Block C'];
+  const locationIds = user.role === 'location_user' ? getAccessibleLocationIds(user) : null;
+
+  try {
+    // Use the pool directly: this report only reads established tables and does not need migrations.
+    const { rows } = await db.query(`
+      SELECT l.id AS location_id, l.name AS location_name,
+             t.name AS section_name, t.tent_index,
+             b.id AS room_id, b.name AS room_name, b.block_index, b.size AS capacity,
+             COUNT(a.id)::int AS people_count
+      FROM locations l
+      LEFT JOIN tents t ON t.location_id = l.id
+      LEFT JOIN blocks b ON b.tent_id = t.id
+      LEFT JOIN allocations a ON a.block_id = b.id
+        AND a.deleted_at IS NULL
+        AND (
+          (a.status = 'confirmed' AND a.end_date >= ${todaySQL})
+          OR (a.status = 'reserved' AND a.reserved_expires_at > ${nowIST})
+        )
+      WHERE l.name = ANY($1::text[])
+        AND ($2::int[] IS NULL OR l.id = ANY($2::int[]))
+      GROUP BY l.id, t.id, b.id
+      ORDER BY array_position($1::text[], l.name), t.tent_index, b.block_index
+    `, [locationNames, locationIds]);
+
+    const locations = new Map();
+    for (const row of rows) {
+      if (!locations.has(row.location_id)) {
+        locations.set(row.location_id, { id: row.location_id, name: row.location_name, rooms: [] });
+      }
+      if (row.room_id === null) continue;
+      locations.get(row.location_id).rooms.push({
+        id: row.room_id,
+        name: row.room_name || String(row.block_index),
+        section: row.section_name || `Section ${row.tent_index}`,
+        capacity: row.capacity,
+        peopleCount: row.people_count,
+      });
+    }
+
+    res.set('Cache-Control', 'no-store');
+    res.json({ locations: [...locations.values()], refreshedAt: new Date().toISOString() });
+  } catch (error) {
+    console.error('Room status query failed:', error);
+    res.status(500).json({ error: 'room_status_failed' });
   }
 });
 
