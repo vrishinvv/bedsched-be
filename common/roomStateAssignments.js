@@ -1,38 +1,7 @@
-export const INDIAN_STATES = Object.freeze([
-  { code: 'AP', name: 'Andhra Pradesh' },
-  { code: 'AR', name: 'Arunachal Pradesh' },
-  { code: 'AS', name: 'Assam' },
-  { code: 'BR', name: 'Bihar' },
-  { code: 'CG', name: 'Chhattisgarh' },
-  { code: 'GA', name: 'Goa' },
-  { code: 'GJ', name: 'Gujarat' },
-  { code: 'HR', name: 'Haryana' },
-  { code: 'HP', name: 'Himachal Pradesh' },
-  { code: 'JH', name: 'Jharkhand' },
-  { code: 'KA', name: 'Karnataka' },
-  { code: 'KL', name: 'Kerala' },
-  { code: 'MP', name: 'Madhya Pradesh' },
-  { code: 'MH', name: 'Maharashtra' },
-  { code: 'MN', name: 'Manipur' },
-  { code: 'ML', name: 'Meghalaya' },
-  { code: 'MZ', name: 'Mizoram' },
-  { code: 'NL', name: 'Nagaland' },
-  { code: 'OD', name: 'Odisha' },
-  { code: 'PB', name: 'Punjab' },
-  { code: 'RJ', name: 'Rajasthan' },
-  { code: 'SK', name: 'Sikkim' },
-  { code: 'TN', name: 'Tamil Nadu' },
-  { code: 'TS', name: 'Telangana' },
-  { code: 'TR', name: 'Tripura' },
-  { code: 'UP', name: 'Uttar Pradesh' },
-  { code: 'UK', name: 'Uttarakhand' },
-  { code: 'WB', name: 'West Bengal' },
-]);
-
-const STATE_BY_CODE = new Map(INDIAN_STATES.map((state) => [state.code, state]));
+export const MAX_ROOM_STATE_OPTION_NAME_LENGTH = 100;
 
 export class RoomStateAssignmentError extends Error {
-  constructor(code, message, field = 'stateCode') {
+  constructor(code, message, field = 'stateOptionId') {
     super(message);
     this.name = 'RoomStateAssignmentError';
     this.code = code;
@@ -40,18 +9,33 @@ export class RoomStateAssignmentError extends Error {
   }
 }
 
-export function normalizeIndianStateCode(value, { allowEmpty = false } = {}) {
-  const code = typeof value === 'string' ? value.trim().toUpperCase() : '';
-  if (!code && allowEmpty) return null;
-  if (!STATE_BY_CODE.has(code)) {
+export function normalizeRoomStateOptionId(value, { allowEmpty = false } = {}) {
+  if ((value === null || value === undefined || value === '') && allowEmpty) return null;
+  const id = Number(value);
+  if (!Number.isInteger(id) || id <= 0) {
     throw new RoomStateAssignmentError(
-      'invalid_state',
-      'Select one of the 28 Indian states.',
+      'invalid_state_option',
+      'Select a valid allocated-state option.',
     );
   }
-  return code;
+  return id;
 }
 
-export function getIndianState(code) {
-  return STATE_BY_CODE.get(code) || null;
+export function normalizeRoomStateOptionName(value) {
+  const name = typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
+  if (!name) {
+    throw new RoomStateAssignmentError(
+      'invalid_state_option_name',
+      'Enter an option name.',
+      'name',
+    );
+  }
+  if (name.length > MAX_ROOM_STATE_OPTION_NAME_LENGTH) {
+    throw new RoomStateAssignmentError(
+      'invalid_state_option_name',
+      `Option names must be ${MAX_ROOM_STATE_OPTION_NAME_LENGTH} characters or fewer.`,
+      'name',
+    );
+  }
+  return name;
 }

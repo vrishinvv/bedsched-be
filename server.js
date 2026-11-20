@@ -74,10 +74,9 @@ import { generateUploadUrl, generateViewUrl } from './common/s3.js';
 import { validateLinkedReallocationTarget } from './common/reallocationEligibility.js';
 import { getAccessibleLocationIds, resolveLocationAccessScope } from './common/locationAccess.js';
 import {
-  INDIAN_STATES,
   RoomStateAssignmentError,
-  getIndianState,
-  normalizeIndianStateCode,
+  normalizeRoomStateOptionId,
+  normalizeRoomStateOptionName,
 } from './common/roomStateAssignments.js';
 
 const app = express();
@@ -584,16 +583,18 @@ app.post('/api/seed', async (req, res) => {
 async function getRoomStatusSnapshot(user) {
   const locationNames = ['North', 'South', 'East', 'West', 'New Block C'];
   const locationIds = user.role === 'location_user' ? getAccessibleLocationIds(user) : null;
-  const { rows } = await execQuery(`
+  const [{ rows }, { rows: optionRows }] = await Promise.all([execQuery(`
     SELECT l.id AS location_id, l.name AS location_name,
            t.name AS section_name, t.tent_index,
            b.id AS room_id, b.name AS room_name, b.block_index, b.size AS capacity,
-           rsa.state_code, rsa.updated_at AS state_updated_at,
+           rsa.option_id AS state_option_id, rso.name AS state_name,
+           rsa.updated_at AS state_updated_at,
            COUNT(a.id)::int AS people_count
     FROM locations l
     LEFT JOIN tents t ON t.location_id = l.id
     LEFT JOIN blocks b ON b.tent_id = t.id
     LEFT JOIN room_state_assignments rsa ON rsa.block_id = b.id
+    LEFT JOIN room_state_options rso ON rso.id = rsa.option_id
     LEFT JOIN allocations a ON a.block_id = b.id
       AND a.deleted_at IS NULL
       AND (
@@ -602,9 +603,15 @@ async function getRoomStatusSnapshot(user) {
       )
     WHERE l.name = ANY($1::text[])
       AND ($2::int[] IS NULL OR l.id = ANY($2::int[]))
-    GROUP BY l.id, t.id, b.id, rsa.state_code, rsa.updated_at
+    GROUP BY l.id, t.id, b.id, rsa.option_id, rso.name, rsa.updated_at
     ORDER BY array_position($1::text[], l.name), t.tent_index, b.block_index
-  `, [locationNames, locationIds]);
+  `, [locationNames, locationIds]), execQuery(`
+    SELECT option.id, option.name, COUNT(assignment.block_id)::int AS usage_count
+    FROM room_state_options option
+    LEFT JOIN room_state_assignments assignment ON assignment.option_id = option.id
+    GROUP BY option.id, option.name
+    ORDER BY lower(option.name), option.id
+  `)]);
 
   const locations = new Map();
   for (const row of rows) {
@@ -612,22 +619,25 @@ async function getRoomStatusSnapshot(user) {
       locations.set(row.location_id, { id: row.location_id, name: row.location_name, rooms: [] });
     }
     if (row.room_id === null) continue;
-    const state = getIndianState(row.state_code);
     locations.get(row.location_id).rooms.push({
       id: row.room_id,
       name: row.room_name || String(row.block_index),
       section: row.section_name || `Section ${row.tent_index}`,
       capacity: row.capacity,
       peopleCount: row.people_count,
-      stateCode: state?.code || null,
-      stateName: state?.name || null,
+      stateOptionId: row.state_option_id === null ? null : Number(row.state_option_id),
+      stateName: row.state_name || null,
       stateUpdatedAt: row.state_updated_at || null,
     });
   }
 
   return {
     locations: [...locations.values()],
-    states: INDIAN_STATES,
+    stateOptions: optionRows.map((option) => ({
+      id: Number(option.id),
+      name: option.name,
+      usageCount: option.usage_count,
+    })),
     canEditStateAssignments: user.role === 'admin',
     refreshedAt: new Date().toISOString(),
   };
@@ -655,7 +665,7 @@ app.patch('/api/room-status/:blockId/state', async (req, res) => {
 
   try {
     const blockId = validateEntityId(req.params.blockId, 'blockId');
-    const stateCode = normalizeIndianStateCode(req.body?.stateCode, { allowEmpty: true });
+    const stateOptionId = normalizeRoomStateOptionId(req.body?.stateOptionId, { allowEmpty: true });
     const result = await withTransaction(async (client) => {
       const blockResult = await client.query(`
         SELECT b.id, b.name, b.block_index, l.name AS location_name
@@ -668,21 +678,41 @@ app.patch('/api/room-status/:blockId/state', async (req, res) => {
         throw new StructureRequestError(404, 'room_not_found', 'Room not found.');
       }
 
-      const previousResult = await client.query(
-        'SELECT state_code FROM room_state_assignments WHERE block_id = $1',
-        [blockId],
-      );
-      const previousStateCode = previousResult.rows[0]?.state_code || null;
+      const previousResult = await client.query(`
+        SELECT assignment.option_id, option.name
+        FROM room_state_assignments assignment
+        JOIN room_state_options option ON option.id = assignment.option_id
+        WHERE assignment.block_id = $1
+      `, [blockId]);
+      const previousOption = previousResult.rowCount ? {
+        id: Number(previousResult.rows[0].option_id),
+        name: previousResult.rows[0].name,
+      } : null;
 
-      if (stateCode) {
+      let selectedOption = null;
+      if (stateOptionId) {
+        const optionResult = await client.query(
+          'SELECT id, name FROM room_state_options WHERE id = $1',
+          [stateOptionId],
+        );
+        if (!optionResult.rowCount) {
+          throw new StructureRequestError(404, 'state_option_not_found', 'Allocated-state option not found.');
+        }
+        selectedOption = {
+          id: Number(optionResult.rows[0].id),
+          name: optionResult.rows[0].name,
+        };
+      }
+
+      if (selectedOption) {
         await client.query(`
-          INSERT INTO room_state_assignments (block_id, state_code, updated_by)
+          INSERT INTO room_state_assignments (block_id, option_id, updated_by)
           VALUES ($1, $2, $3)
           ON CONFLICT (block_id) DO UPDATE
-          SET state_code = EXCLUDED.state_code,
+          SET option_id = EXCLUDED.option_id,
               updated_by = EXCLUDED.updated_by,
               updated_at = NOW()
-        `, [blockId, stateCode, user.id || null]);
+        `, [blockId, selectedOption.id, user.id || null]);
       } else {
         await client.query('DELETE FROM room_state_assignments WHERE block_id = $1', [blockId]);
       }
@@ -690,24 +720,146 @@ app.patch('/api/room-status/:blockId/state', async (req, res) => {
       await logAudit(req, 'update_room_state_assignment', 'block', blockId, {
         roomName: blockResult.rows[0].name || String(blockResult.rows[0].block_index),
         locationName: blockResult.rows[0].location_name,
-        previousStateCode,
-        stateCode,
+        previousStateOption: previousOption,
+        stateOption: selectedOption,
       }, client.query.bind(client));
 
-      return { previousStateCode };
+      return { previousOption, selectedOption };
     });
 
-    const state = getIndianState(stateCode);
     res.json({
       ok: true,
-      assignment: state ? { blockId, stateCode: state.code, stateName: state.name } : null,
-      previousStateCode: result.previousStateCode,
+      assignment: result.selectedOption ? {
+        blockId,
+        stateOptionId: result.selectedOption.id,
+        stateName: result.selectedOption.name,
+      } : null,
+      previousStateOption: result.previousOption,
     });
   } catch (error) {
     if (error instanceof RoomStateAssignmentError) {
       return res.status(400).json({ error: error.code, message: error.message, field: error.field });
     }
     return handleStructureError(res, error, 'update_room_state_assignment_failed');
+  }
+});
+
+app.post('/api/room-state-options', async (req, res) => {
+  const user = getUserFromRequest(req);
+  if (!canManageAccommodationStructure(user)) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+
+  try {
+    const name = normalizeRoomStateOptionName(req.body?.name);
+    const option = await withTransaction(async (client) => {
+      const result = await client.query(`
+        INSERT INTO room_state_options(name, created_by)
+        VALUES ($1, $2)
+        RETURNING id, name
+      `, [name, user.id || null]);
+      const created = { id: Number(result.rows[0].id), name: result.rows[0].name, usageCount: 0 };
+      await logAudit(req, 'create_room_state_option', 'room_state_option', created.id, {
+        name: created.name,
+      }, client.query.bind(client));
+      return created;
+    });
+    res.status(201).json({ ok: true, option });
+  } catch (error) {
+    if (error instanceof RoomStateAssignmentError) {
+      return res.status(400).json({ error: error.code, message: error.message, field: error.field });
+    }
+    if (error?.code === '23505') {
+      return res.status(409).json({ error: 'duplicate_state_option', message: 'That option already exists.', field: 'name' });
+    }
+    return handleStructureError(res, error, 'create_room_state_option_failed');
+  }
+});
+
+app.patch('/api/room-state-options/:optionId', async (req, res) => {
+  const user = getUserFromRequest(req);
+  if (!canManageAccommodationStructure(user)) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+
+  try {
+    const optionId = normalizeRoomStateOptionId(req.params.optionId);
+    const name = normalizeRoomStateOptionName(req.body?.name);
+    const option = await withTransaction(async (client) => {
+      const previousResult = await client.query(
+        'SELECT id, name FROM room_state_options WHERE id = $1 FOR UPDATE',
+        [optionId],
+      );
+      if (!previousResult.rowCount) {
+        throw new StructureRequestError(404, 'state_option_not_found', 'Allocated-state option not found.');
+      }
+      const result = await client.query(`
+        UPDATE room_state_options
+        SET name = $2, updated_at = NOW()
+        WHERE id = $1
+        RETURNING id, name,
+          (SELECT COUNT(*)::int FROM room_state_assignments WHERE option_id = $1) AS usage_count
+      `, [optionId, name]);
+      const updated = {
+        id: Number(result.rows[0].id),
+        name: result.rows[0].name,
+        usageCount: result.rows[0].usage_count,
+      };
+      await logAudit(req, 'update_room_state_option', 'room_state_option', optionId, {
+        previousName: previousResult.rows[0].name,
+        name: updated.name,
+      }, client.query.bind(client));
+      return updated;
+    });
+    res.json({ ok: true, option });
+  } catch (error) {
+    if (error instanceof RoomStateAssignmentError) {
+      return res.status(400).json({ error: error.code, message: error.message, field: error.field });
+    }
+    if (error?.code === '23505') {
+      return res.status(409).json({ error: 'duplicate_state_option', message: 'That option already exists.', field: 'name' });
+    }
+    return handleStructureError(res, error, 'update_room_state_option_failed');
+  }
+});
+
+app.delete('/api/room-state-options/:optionId', async (req, res) => {
+  const user = getUserFromRequest(req);
+  if (!canManageAccommodationStructure(user)) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+
+  try {
+    const optionId = normalizeRoomStateOptionId(req.params.optionId);
+    const deleted = await withTransaction(async (client) => {
+      const optionResult = await client.query(
+        'SELECT id, name FROM room_state_options WHERE id = $1 FOR UPDATE',
+        [optionId],
+      );
+      if (!optionResult.rowCount) {
+        throw new StructureRequestError(404, 'state_option_not_found', 'Allocated-state option not found.');
+      }
+      const usageResult = await client.query(
+        'SELECT COUNT(*)::int AS count FROM room_state_assignments WHERE option_id = $1',
+        [optionId],
+      );
+      const clearedAssignments = usageResult.rows[0].count;
+      await client.query('DELETE FROM room_state_options WHERE id = $1', [optionId]);
+      await logAudit(req, 'delete_room_state_option', 'room_state_option', optionId, {
+        name: optionResult.rows[0].name,
+        clearedAssignments,
+      }, client.query.bind(client));
+      return {
+        option: { id: optionId, name: optionResult.rows[0].name },
+        clearedAssignments,
+      };
+    });
+    res.json({ ok: true, deletedOption: deleted.option, clearedAssignments: deleted.clearedAssignments });
+  } catch (error) {
+    if (error instanceof RoomStateAssignmentError) {
+      return res.status(400).json({ error: error.code, message: error.message, field: error.field });
+    }
+    return handleStructureError(res, error, 'delete_room_state_option_failed');
   }
 });
 

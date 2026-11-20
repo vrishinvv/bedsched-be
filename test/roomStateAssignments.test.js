@@ -1,30 +1,38 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  INDIAN_STATES,
+  MAX_ROOM_STATE_OPTION_NAME_LENGTH,
   RoomStateAssignmentError,
-  getIndianState,
-  normalizeIndianStateCode,
+  normalizeRoomStateOptionId,
+  normalizeRoomStateOptionName,
 } from '../common/roomStateAssignments.js';
 
-test('provides the 28 Indian states without union territories', () => {
-  assert.equal(INDIAN_STATES.length, 28);
-  assert.deepEqual(getIndianState('TN'), { code: 'TN', name: 'Tamil Nadu' });
-  assert.deepEqual(getIndianState('TS'), { code: 'TS', name: 'Telangana' });
-  assert.equal(getIndianState('DL'), null);
+test('normalizes a custom option name', () => {
+  assert.equal(normalizeRoomStateOptionName('  Tamil   Nadu  '), 'Tamil Nadu');
 });
 
-test('normalizes a valid state code and permits an explicit clear', () => {
-  assert.equal(normalizeIndianStateCode(' tn '), 'TN');
-  assert.equal(normalizeIndianStateCode('', { allowEmpty: true }), null);
-  assert.equal(normalizeIndianStateCode(null, { allowEmpty: true }), null);
-});
-
-test('rejects invalid states and union territories', () => {
-  for (const value of ['DL', 'Puducherry', '', null]) {
+test('rejects blank and oversized custom option names', () => {
+  for (const value of ['', '   ', null, 'x'.repeat(MAX_ROOM_STATE_OPTION_NAME_LENGTH + 1)]) {
     assert.throws(
-      () => normalizeIndianStateCode(value),
-      (error) => error instanceof RoomStateAssignmentError && error.code === 'invalid_state',
+      () => normalizeRoomStateOptionName(value),
+      (error) => error instanceof RoomStateAssignmentError
+        && error.code === 'invalid_state_option_name'
+        && error.field === 'name',
+    );
+  }
+});
+
+test('normalizes a custom option id and permits an explicit clear', () => {
+  assert.equal(normalizeRoomStateOptionId('12'), 12);
+  assert.equal(normalizeRoomStateOptionId('', { allowEmpty: true }), null);
+  assert.equal(normalizeRoomStateOptionId(null, { allowEmpty: true }), null);
+});
+
+test('rejects invalid custom option ids', () => {
+  for (const value of [0, -1, 'abc', 1.5, null]) {
+    assert.throws(
+      () => normalizeRoomStateOptionId(value),
+      (error) => error instanceof RoomStateAssignmentError && error.code === 'invalid_state_option',
     );
   }
 });
